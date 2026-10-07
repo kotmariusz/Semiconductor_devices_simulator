@@ -1,0 +1,5 @@
+# Python packages for SemiSim 3D (Python 3.8 or newer with Tk 8.6+).
+# Tkinter itself is not a pip package: it comes with Python
+# (Ubuntu/Debian: sudo apt install python3-tk; macOS: the python.org installer).
+numpy>=1.21
+matplotlib>=3.5
