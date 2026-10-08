@@ -1,0 +1,9 @@
+# keep Unix line endings in the scripts and sources, also in a checkout made
+# on Windows (a CRLF install.sh fails in WSL with "$'\r': command not found")
+*.sh   text eol=lf
+*.py   text eol=lf
+*.c    text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.png  binary

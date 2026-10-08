@@ -1,0 +1,22 @@
+# built solver core (main.py / semibuild.py build it from semiconductor_3d.c)
+*.so
+*.dylib
+*.dll
+*.new
+.core_build.json
+build.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# launchers made by install.sh
+SemiSim3D.command
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

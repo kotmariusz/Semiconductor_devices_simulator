@@ -1,0 +1,47 @@
+# Builds the core and runs the validation battery and a GUI smoke test on
+# Ubuntu and macOS, through the same install.sh the README tells people to run.
+#
+# macOS runner minutes are free for public repositories but count 10x for
+# private ones: to save them, delete "push" from the macos job's triggers
+# (run it by hand from the Actions tab instead).
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Ubuntu (install.sh with apt packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install (packages, core build, self-test)
+        run: bash install.sh
+      - name: Core build info
+        run: python3 semibuild.py --check
+      - name: Validation (selected sections)
+        run: python3 validate.py --only 2,4,6,7,8,11,12,14,15
+      - name: GUI smoke test
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a python3 tests/gui_smoke.py
+          xvfb-run -a python3 tests/gui_smoke.py --flat
+
+  macos:
+    name: macOS (install.sh with a venv and libomp)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install (Python, venv, libomp, core build, self-test)
+        run: bash install.sh
+      - name: Core build info
+        run: .venv/bin/python semibuild.py --check
+      - name: Validation (selected sections)
+        run: .venv/bin/python validate.py --only 2,4,6,7,8,11,12,14,15
+      - name: GUI smoke test
+        run: .venv/bin/python tests/gui_smoke.py
