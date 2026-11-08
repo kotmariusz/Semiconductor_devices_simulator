@@ -109,7 +109,9 @@ _p("Fe_i (interstitial iron, Si)", "Point defects & contamination", "uniform",
    levels=[L("D", "Ev", 0.38, 5e-14, 7e-17)], density=1e12, shape="everywhere", host="Si")
 _p("FeB pair (p-Si)", "Point defects & contamination", "uniform",
    "Iron–boron pair (Fe_i paired with B in p-Si at room temperature): acceptor Ec − 0.23 eV, "
-   "σn 5e-15, σp 3e-15 cm² (Rein & Glunz, APL 82, 1054, 2003).",
+   "σn 5e-15, σp 3e-15 cm² - representative values; measured cross sections scatter widely "
+   "(Istratov et al., Appl. Phys. A 69, 13, 1999; Macdonald et al., J. Appl. Phys. 89, 7932, 2001; "
+   "Rein & Glunz, J. Appl. Phys. 98, 113711, 2005).",
    levels=[L("A", "Ec", 0.23, 5e-15, 3e-15)], density=1e12, shape="everywhere", host="Si")
 _p("Au (gold, lifetime control)", "Point defects & contamination", "uniform",
    "Substitutional gold, classic lifetime killer of fast diodes: acceptor Ec − 0.55 eV (σn 8.5e-17, "

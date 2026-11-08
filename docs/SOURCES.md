@@ -70,7 +70,7 @@ The same list is in the program under Help → Sources.
 ## Defects
 
 - A. A. Istratov, H. Hieslmair and E. R. Weber, "Iron and its complexes in silicon," Appl. Phys. A, vol. 69, no. 1, pp. 13-44, 1999 - interstitial iron.
-- S. Rein and S. W. Glunz, "Electronic properties of the metastable iron-boron pair in silicon," Appl. Phys. Lett., vol. 82, no. 7, pp. 1054-1056, 2003 - the FeB pair.
+- D. Macdonald, A. Cuevas and J. Wong-Leung, "Capture cross sections of the acceptor level of iron-boron pairs in p-type silicon by injection-level dependent lifetime measurements," J. Appl. Phys., vol. 89, no. 12, pp. 7932-7939, 2001, doi:10.1063/1.1372156, and S. Rein and S. W. Glunz, "Electronic properties of interstitial iron and iron-boron pairs determined by means of advanced lifetime spectroscopy," J. Appl. Phys., vol. 98, no. 11, 113711, 2005, doi:10.1063/1.2106017 - the FeB pair. The level is E_C - 0.26 ± 0.03 eV in Istratov et al. (above); SemiSim uses E_C - 0.23 eV, as Macdonald et al. do, and representative capture cross sections (σn 5e-15, σp 3e-15 cm²) - measured values scatter widely between these papers.
 - W. M. Bullis, "Properties of gold in silicon," Solid-State Electronics, vol. 9, no. 2, pp. 143-168, 1966 - gold.
 - K. Graff, Metal Impurities in Silicon-Device Fabrication, 2nd ed., Springer, 2000 - gold, platinum and other metals in silicon.
 - M. Seibt, M. Griess, A. A. Istratov, H. Hedemann, A. Sattler and W. Schröter, "Formation and properties of copper silicide precipitates in silicon," Phys. Status Solidi A, vol. 166, no. 1, pp. 171-182, 1998, and A. A. Istratov and E. R. Weber, "Physics of copper in silicon," J. Electrochem. Soc., vol. 149, no. 1, pp. G21-G30, 2002 - copper and Cu3Si precipitates.
