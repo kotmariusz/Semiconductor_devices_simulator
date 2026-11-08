@@ -73,8 +73,21 @@ Problems and ideas:
 - [docs/MANUAL.md](docs/MANUAL.md) - user manual (also Help, F1)
 - [docs/SOURCES.md](docs/SOURCES.md) - all sources: models, parameters, devices, tests, software
 - [CHANGELOG.md](CHANGELOG.md) - versions
+- [CITATION.cff](CITATION.cff) - how to cite SemiSim 3D
 
-## Use and sharing
+## Licence
 
-Free to use, copy, change and share for any purpose, without asking. No
-licence, no conditions, no warranty.
+[MIT](LICENSE): free to use, copy, change and share for any purpose, as long
+as the copyright and licence notice stay with it. No warranty.
+
+## How it was made
+
+Much of the code and documentation was written with the help of an AI
+assistant (Claude, by Anthropic). The physics is checked by `validate.py`
+against the theory listed in [docs/SOURCES.md](docs/SOURCES.md) - not against
+measurements of real devices (see [Status](#status)).
+
+## Citing
+
+If you use SemiSim 3D in your work, please cite it: see [CITATION.cff](CITATION.cff)
+or "Cite this repository" on the GitHub page.

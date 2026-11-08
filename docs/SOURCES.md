@@ -14,7 +14,7 @@ The same list is in the program under Help → Sources.
 - E. H. Nicollian and J. R. Brews, MOS (Metal Oxide Semiconductor) Physics and Technology, Wiley, 1982 - interface traps and oxide charge.
 - M. E. Levinshtein, S. L. Rumyantsev and M. S. Shur (eds.), Properties of Advanced Semiconductor Materials: GaN, AlN, InN, BN, SiC, SiGe, Wiley, 2001 - GaN and SiC parameters.
 - Ioffe Institute, NSM Archive - Physical Properties of Semiconductors, http://www.ioffe.ru/SVA/NSM/Semicond/ - material parameters of Si, Ge, GaAs, InP, 4H-SiC, GaN and the alloys.
-- Synopsys, Sentaurus Device User Guide - the parameter set of the Lombardi surface mobility and the form of the doping-dependent SRH lifetime.
+- Synopsys, Sentaurus Device User Guide - the T/300 K form in which the Lombardi surface-mobility parameters are written (the values are those of Lombardi et al. 1988, under Mobility) and the Scharfetter relation for the doping-dependent SRH lifetime (N_ref = 1e16 cm⁻³; the form is that of Fossum and Lee 1982, under Recombination).
 
 ## Transport equations and discretisation
 
@@ -30,7 +30,7 @@ The same list is in the program under Help → Sources.
 - N. D. Arora, J. R. Hauser and D. J. Roulston, "Electron and hole mobilities in silicon as a function of concentration and temperature," IEEE Trans. Electron Devices, vol. 29, no. 2, pp. 292-295, 1982 - doping-dependent mobility (Si parameters).
 - D. M. Caughey and R. E. Thomas, "Carrier mobilities in silicon empirically related to doping and field," Proc. IEEE, vol. 55, no. 12, pp. 2192-2193, 1967 - doping and field dependence (velocity saturation).
 - C. Canali, G. Majni, R. Minder and G. Ottaviani, "Electron and hole drift velocity measurements in silicon and their empirical relation to electric field and temperature," IEEE Trans. Electron Devices, vol. 22, no. 11, pp. 1045-1047, 1975 - Si saturation velocities and exponents.
-- C. Lombardi, S. Manzini, A. Saporito and M. Vanzi, "A physically based mobility model for numerical simulation of nonplanar devices," IEEE Trans. Computer-Aided Design, vol. 7, no. 11, pp. 1164-1171, 1988 - surface mobility.
+- C. Lombardi, S. Manzini, A. Saporito and M. Vanzi, "A physically based mobility model for numerical simulation of nonplanar devices," IEEE Trans. Computer-Aided Design, vol. 7, no. 11, pp. 1164-1171, 1988, doi:10.1109/43.9186 - surface mobility. SemiSim uses the 1988 parameters for Si with the temperature written as T/300 K, so C = C(1988)/300 K (1.74e5/300 = 580 for electrons, 8.84e5/300 = 2947 for holes). The electron values are also listed in the open-access paper A. Ciprut, A. Chelly and A. Karsenty, "Usage and limitation of standard mobility models for TCAD simulation of nanoscaled FD-SOI MOSFETs," Active and Passive Electronic Components, vol. 2015, Art. 460416, 2015, doi:10.1155/2015/460416.
 - M. Roschke and F. Schwierz, "Electron mobility models for 4H, 6H, and 3C SiC," IEEE Trans. Electron Devices, vol. 48, no. 7, pp. 1442-1447, 2001 - 4H-SiC mobility.
 
 ### Band structure and statistics

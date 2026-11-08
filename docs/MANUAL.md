@@ -6,8 +6,8 @@ every reference: [SOURCES](SOURCES.md).
 **Status.** 0.1 is the first public version and it is still being tested. The
 physics is checked against textbook theory (see Validation), not yet against
 measurements of real devices; the effects under Limitations are not modelled.
-Check important results independently. Free to use, copy, change and share -
-no licence, no warranty.
+Check important results independently. Free to use, copy, change and share
+under the MIT License ([LICENSE](../LICENSE)); no warranty.
 
 SemiSim 3D solves Poisson's equation and the electron and hole continuity
 equations (drift-diffusion, box method, Scharfetter-Gummel fluxes) in 3-D. A

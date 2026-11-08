@@ -3237,8 +3237,8 @@ SemiSim 3D 0.1 is the first public version - a test version: it is still being t
 - macOS support and the WSL2 full-screen workaround are new and have been tried on few computers so far.
 - The format of saved device files may change between versions.
 - Problems and suggestions: https://github.com/kotmariusz/Semiconductor_devices_simulator/issues - say what you did, attach the saved device (File → Save device) and the output of `python3 semibuild.py --check`.
-## Free to use
-SemiSim 3D is free to use, copy, change and share, for any purpose, without asking. There is no licence and there are no conditions - and there is no warranty of any kind: whoever uses it is responsible for how they use its results.
+## Licence
+SemiSim 3D is released under the MIT License (the LICENSE file in the SemiSim 3D folder): free to use, copy, change and share, for any purpose, as long as the copyright and licence notice stay with it. There is no warranty of any kind: whoever uses it is responsible for how they use its results.
 ## Sources
 The models, the material and defect parameters, the device structures and the test references come from the literature listed under Sources (also `docs/SOURCES.md`).
 """),
@@ -7130,7 +7130,7 @@ class App(tk.Tk):
 ## Status: test version
 - first public version, still being tested: the physics is checked against textbook theory (validate.py), not yet against measurements - check important results independently
 - project page: https://github.com/kotmariusz/Semiconductor_devices_simulator
-- free to use, copy, change and share for any purpose; no licence, no conditions, no warranty
+- MIT License: free to use, copy, change and share for any purpose; keep the copyright notice; no warranty
 - sources of the models and parameters: Help → Sources (docs/SOURCES.md)
 ## This session
 - core library: `{_SO}`{self._core_info()}

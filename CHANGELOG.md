@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- MIT licence ([LICENSE](LICENSE)) and a citation file ([CITATION.cff](CITATION.cff)).
+- docs/SOURCES.md: the Lombardi surface-mobility parameters are traced to
+  Lombardi et al. (1988), with an open-access paper that lists them.
+
 ## 0.1 (2026-10-08) - first public version (test version)
 
 The first public release. SemiSim 3D was developed privately before this
