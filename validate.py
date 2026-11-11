@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SemiSim 3D 0.1 - physics validation battery.
+SemiSim 3D 0.2 - physics validation battery.
 
 Every section builds a device directly on the C core, solves it and compares
 the result with closed-form semiconductor theory.  Each check prints PASS or
@@ -16,7 +16,7 @@ Needs main.py, semimesh.py, semidefects.py and semibuild.py in the same folder
 (main.py supplies the ctypes bindings and the mesh helpers and builds the
 core if it is missing; no window is opened).
 """
-import os, sys, time, ctypes, argparse
+import os, sys, time, ctypes, argparse, copy
 import numpy as np
 if not hasattr(np, "trapezoid"):          # NumPy < 2.0 (e.g. Ubuntu 22.04/24.04 packages)
     np.trapezoid = np.trapz
@@ -69,7 +69,7 @@ def check(sec, name, value, ref, tol, mode="rel", info=""):
 
 
 # ------------------------------------------------------------------ helpers
-def stack1d(layers, xs_m, contacts, ny=3, width=50e-9, solver=SOLV, models=0):
+def stack1d(layers, xs_m, contacts, ny=3, width=50e-9, solver=SOLV, models=0, T=300.0):
     """1-D bar along x. layers: (x0_nm, x1_nm, material, Nd_cm3, Na_cm3);
     contacts: (face, bc, V, phi_m). Returns (xs, ys, zs) in metres."""
     xs = np.asarray(xs_m, float); Nx = len(xs)
@@ -80,7 +80,7 @@ def stack1d(layers, xs_m, contacts, ny=3, width=50e-9, solver=SOLV, models=0):
     mids = {}
     for (_, _, mat, _, _) in layers:
         if mat not in mids:
-            mids[mat] = M.api_addmat(M.MATS[mat], 300.0)
+            mids[mat] = M.api_addmat(M.MATS[mat], T)
     M.api_region(0, 0, 0, Nx - 1, ny - 1, ny - 1, mids[layers[0][2]], 0.0, 0.0)
     for (x0, x1, mat, Nd, Na) in layers:
         i0, i1 = M.span_idx(xs, x0 * 1e-9, x1 * 1e-9)
@@ -1058,17 +1058,217 @@ def s16_amr_predictor():
           err, 0., 2e-5, "range", info=f"[Gummel iterations {res[0][1]} -> {res[1][1]}]")
 
 
+def _alpha_vodm(E, T=300.0):
+    """van Overstraeten - de Man ionisation coefficients of Si (1/m), E in V/m,
+    with the optical-phonon temperature factor (hbar w = 0.063 eV)."""
+    E = np.maximum(np.abs(E), 1.0)
+    g = np.tanh(0.063 / (2 * KB * 300.0 / Q)) / np.tanh(0.063 / (2 * KB * T / Q))
+    an = g * 7.03e7 * np.exp(-g * 1.231e8 / E)
+    ap = g * np.where(E < 4e7, 1.582e8 * np.exp(-g * 2.036e8 / E), 6.71e7 * np.exp(-g * 1.693e8 / E))
+    return an, ap
+
+
+def _ion_integral(x, E, T=300.0):
+    """Ionisation integral of a 1-D field: breakdown when it reaches 1."""
+    an, ap = _alpha_vodm(E, T)
+    c = np.concatenate([[0.], np.cumsum(0.5 * ((an - ap)[1:] + (an - ap)[:-1]) * np.diff(x))])
+    return float(np.trapezoid(an * np.exp(-c), x))
+
+
+def _bv_diode(Nd, Vmax, ii=True, T=300.0, step=1.0, tau=None):
+    """Abrupt Si p+(1e19)/n(Nd) diode swept in reverse in `step` V steps with impact
+    ionisation: returns (BV from the sweep, BV where the ionisation integral of
+    the simulated field reaches 1, converged points, sweep).  tau: an SRH
+    lifetime (s) - the multiplied leakage must lie above the current
+    resolution for the runaway to show where it should; a shorter lifetime
+    raises the leakage without changing the breakdown field."""
+    Wp = 1000.
+    W = np.sqrt(2 * 11.7 * EPS0 * Vmax / (Q * Nd * 1e6)) * 1e9 * 1.4 + 500.
+    Lnm = Wp + W
+    xs = M.graded_grid(Lnm, 500, [Wp])
+    stack1d([(0, Wp, "Si", 0, 1e19), (Wp, Lnm, "Si", Nd, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)],
+            models=(M.M_II if ii else 0), solver=(2000, 1000, 500, 1e-9, 1e-7, 1.0, 1.0), T=T)
+    if tau: M.api_settau(0, tau, tau)                 # material 0: the Si of the stack
+    L.api3_solve()
+    cons = [M.Con(0, 0, 1, 0, 1, 0, 0., label="A"), M.Con(1, 0, 1, 0, 1, 0, 0., label="K")]
+    Vv, Ii, br = [], [], [False]
+    def on_point(k, rec):              # the pre-breakdown branch: up to the first failed point
+        if not rec["conv"]: br[0] = True
+        if rec["conv"] and not br[0]:
+            phi = line(PHI, xs, xs[:3], xs[:3]); Vv.append(rec["V"]); Ii.append(_ion_integral(xs, -np.gradient(phi, xs), T))
+    R = M.run_sweep(cons, [0], 0., -Vmax, int(round(Vmax / step)) + 1, on_point=on_point, max_fail=2 if ii else 0)
+    A = L.api3_get_contact_A(0) * 1e4
+    J = np.abs(R["I"][:, 0]) / A; F = R["F"][:, 0] / A
+    bv, how = M.avalanche_bv(R["V"], J, R["conv"], floor=F)
+    # where the integral reaches 1 on the pre-breakdown branch: between two of
+    # its points, or extrapolated from its last two (past breakdown the solver
+    # finds the space-charge-limited avalanche branch, integral ~ 1 + 5e-4)
+    vv, ii_ = np.abs(np.array(Vv)), np.array(Ii); bv_int = float("nan")
+    if len(ii_) >= 2:
+        k = int(np.argmax(ii_ >= 1.0)) if ii_.max() >= 1.0 else len(ii_) - 1
+        k = max(k, 1)
+        bv_int = float(vv[k - 1] + (vv[k] - vv[k - 1]) * (1.0 - ii_[k - 1]) / (ii_[k] - ii_[k - 1]))
+    return (abs(bv) if bv is not None else float("nan")), bv_int, int(np.sum(R["conv"])), R
+
+
+def s17_avalanche_bjt():
+    """Impact ionisation (avalanche breakdown) and the sweep analysis behind
+    the I-V tab: the breakdown voltage of abrupt Si junctions against the
+    ionisation integral of the simulated field and Baliga's closed form, the
+    temperature coefficient, the stored-charge sums, the transit time of a
+    short-base diode (the charge-control basis of the quasi-static f_T), and
+    the Early-voltage and f_T extraction on exact curves."""
+    print("17. Avalanche breakdown (impact ionisation) and BJT analysis (f_T, Early voltage)")
+    bv300 = {}
+    for Nd, Vmax, tol_b, st, tau in ((1e16, 60., 0.06, 1.0, None), (1e17, 18., None, 0.25, 1e-8)):
+        bv, bvi, nc, _ = _bv_diode(Nd, Vmax, step=st, tau=tau); bv300[Nd] = bv
+        check(17, f"Si p+/n {Nd:.0e}: avalanche BV from the sweep vs ionisation integral = 1 on the simulated field",
+              bv, bvi, 0.03, info=f"[{nc} converged points]")
+        if tol_b:
+            check(17, f"Si p+/n {Nd:.0e}: BV vs Baliga 5.34e13 N^-3/4", bv, 5.34e13 * Nd ** -0.75, tol_b)
+    bv0, _, nc0, R0 = _bv_diode(1e16, 60., ii=False)
+    check(17, "Si p+/n 1e16 with impact ionisation off: no breakdown to 60 V (all points converge)",
+          float(nc0), float(len(R0["V"])), 0., "abs")
+    bv4, bvi4, nc4, _ = _bv_diode(1e16, 70., T=400.)
+    bv3 = bv300[1e16]
+    check(17, "Si p+/n 1e16 at 400 K: BV from the sweep vs ionisation integral = 1 (temperature factor)",
+          bv4, bvi4, 0.03, info=f"[{nc4} converged points]")
+    check(17, "Si p+/n 1e16: BV(400 K) / BV(300 K) - avalanche breakdown has a positive temperature coefficient",
+          bv4 / bv3, 1.05, 1.30, "range", info=f"[{bv3:.1f} V -> {bv4:.1f} V]")
+    # stored charge: api3_carrier_sums vs the node densities times the box volumes
+    # (a thick p+ side: electrons injected into it carry under 1 % of the current)
+    Wp, Wn = 2000., 2000.; Lnm = Wp + Wn
+    xs = M.graded_grid(Lnm, 500, [Wp])
+    ys = np.linspace(0, 50e-9, 3)
+    stack1d([(0, Wp, "Si", 0, 1e20), (Wp, Lnm, "Si", 1e18, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)])
+    L.api3_solve(); L.api3_set_contact_V(0, 0.8); L.api3_resolve()
+    sh = (3, 3, len(xs)); n = field(NN_, sh); p = field(PP, sh)
+    def dual(c):
+        m = np.concatenate(([c[0]], 0.5 * (c[1:] + c[:-1]), [c[-1]])); return np.diff(m)
+    vol = dual(ys)[:, None, None] * dual(ys)[None, :, None] * dual(xs)[None, None, :]
+    Qn, Qp = M.carrier_charge()
+    check(17, "stored hole charge: api3_carrier_sums vs sum(p dV) of the node densities", Qp,
+          Q * float((p * vol).sum()), 1e-10)
+    check(17, "stored electron charge: api3_carrier_sums vs sum(n dV)", Qn, Q * float((n * vol).sum()), 1e-10)
+    # short-base diode: excess holes Q = I W^2 / (2 D) -> tau = dQ/dI, the holes
+    # counted from the n-side edge of the depletion region (abrupt one-sided junction)
+    ni = L.api3_mat_ni(0); Vbi = VT * np.log(1e20 * 1e18 * 1e12 / ni ** 2)
+    xd = Wp * 1e-9 + np.sqrt(2 * 11.7 * EPS0 * (Vbi - 0.81 - 2 * VT) / (Q * 1e18 * 1e6))
+    nreg = xs >= xd
+    def state(V):
+        L.api3_set_contact_V(0, V); L.api3_resolve()
+        pp = line(PP, xs, xs[:3], xs[:3]); mp = line(MUP, xs, xs[:3], xs[:3])
+        return Q * np.trapezoid(np.where(nreg, pp, 0.), xs), L.api3_get_contact_I(0) / (L.api3_get_contact_A(0)), mp
+    (Q1, J1, mp), (Q2, J2, _) = state(0.80), state(0.82)
+    Dp = float(np.median(mp[nreg])) * VT
+    Wb = xs[-1] - xd
+    check(17, "short-base p+/n diode (2 um, 1e18): stored-hole transit time dQ/dJ vs W^2/(2 D_p)",
+          (Q2 - Q1) / (J2 - J1), Wb ** 2 / (2 * Dp), 0.05, info="[the charge-control basis of the quasi-static f_T]")
+    # extraction formulas on exact curves
+    Vc = np.linspace(0, 5, 26); VA = 37.5; I0 = 2e-3
+    Ic = I0 * (1 + Vc / VA) * (1 - np.exp(-Vc / 0.02))
+    ev = M.early_voltage(Vc, Ic, np.ones_like(Vc, bool))
+    check(17, "Early voltage extracted from an exact output curve I0 (1 + V/V_A)(1 - e^(-V/20 mV))",
+          ev["VA"] if ev else float("nan"), VA, 1e-3)
+    Vb = np.linspace(0.6, 0.8, 201); Is = 1e-16; Cj = 2e-13; tf = 5e-12
+    Icb = Is * np.exp(Vb / VT); Ib = Icb / 80.; Qb = Cj * Vb + tf * Icb
+    g = M.bjt_gain_ft(Vb, Ib, Icb, Qb, np.ones_like(Vb, bool))
+    fth = lambda I: (I / VT) / (2 * np.pi * (Cj + tf * I / VT))
+    check(17, "quasi-static f_T = dI_C / (2 pi dQ) on an exact charge-control model (max rel. error)",
+          float(np.max(np.abs(g["fT"] / fth(g["IcT"]) - 1))), 0., 2e-3, "range")
+    Vb2 = np.arange(0.60, 0.9001, 0.025); Ic2 = Is * np.exp(Vb2 / VT)
+    g2 = M.bjt_gain_ft(Vb2, Ic2 / 80., Ic2, Cj * Vb2 + tf * Ic2, np.ones_like(Vb2, bool))
+    check(17, "f_T on a coarse Gummel sweep (25 mV steps), placed at the interval's log-mean I_C (max rel. error)",
+          float(np.max(np.abs(g2["fT"] / fth(g2["IcT"]) - 1))), 0., 0.05, "range")
+    check(17, "current gain I_C / I_B on the same model", float(np.median(g["beta"])), 80., 1e-12)
+
+
+def _mob_core(mat, N, typ, T=300.0):
+    """Low-field mobility (cm^2/Vs) the core uses in a uniform bar of `mat`
+    doped N (cm^-3) of type n or p, read back at the middle node."""
+    xs = np.linspace(0, 1e-6, 21)
+    stack1d([(0, 1000, mat, N if typ == "n" else 0, N if typ == "p" else 0)], xs,
+            [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], T=T)
+    L.api3_solve()
+    return float(line(MUN if typ == "n" else MUP, xs, xs[:3], xs[:3])[10]) * 1e4
+
+
+def s18_parameters_analysis():
+    print("18. Material parameters (mobility tables, temperature), core limits and the I-V extraction functions")
+    # Masetti 1983 (Si, As set for electrons, B set for holes), independent of the core
+    def masetti(N, hole, T=300.):
+        if hole: m1, m2, mu1, Pc, Cr, Cs, a, b, mL = 44.9, 0., 29.0, 9.23e16, 2.23e17, 6.10e20, 0.719, 2., 470.5 * (T / 300) ** -2.2
+        else: m1, m2, mu1, Pc, Cr, Cs, a, b, mL = 52.2, 52.2, 43.4, 0., 9.68e16, 3.43e20, 0.680, 2., 1417. * (T / 300) ** -2.5
+        return m1 * np.exp(-Pc / N) + (mL - m2) / (1 + (N / Cr) ** a) - mu1 / (1 + (Cs / N) ** b)
+    for N in (1e15, 1e17, 1e19, 1e20):
+        check(18, f"Si electron mobility at {N:.0e} cm^-3 vs Masetti 1983", _mob_core("Si", N, "n"), masetti(N, False), 2e-3)
+        check(18, f"Si hole mobility at {N:.0e} cm^-3 vs Masetti 1983", _mob_core("Si", N, "p"), masetti(N, True), 2e-3)
+    check(18, "Si electron mobility at 1e15 cm^-3, 400 K (lattice term (T/300)^-2.5)",
+          _mob_core("Si", 1e15, "n", 400.), masetti(1e15, False, 400.), 2e-3)
+    mu_sic = 15.9 + (124. - 15.9) / (1 + (1e18 / 1.76e19) ** 0.34)
+    check(18, "4H-SiC hole mobility at 1e18 cm^-3 vs Schaffer et al. 1994 (124, 15.9, 1.76e19, 0.34)",
+          _mob_core("4H-SiC", 1e18, "p"), mu_sic, 2e-3)
+    # temperature: built-in voltage and n_i of a Si junction at 250 and 400 K
+    for T in (250., 400.):
+        VTT = KB * T / Q; xs = np.linspace(0, 2e-6, 201)
+        stack1d([(0, 1000, "Si", 0, 1e17), (1000, 2000, "Si", 1e17, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], T=T)
+        L.api3_solve(); ni = L.api3_mat_ni(0); phi = line(PHI, xs, xs[:3], xs[:3])
+        Eg = 1.170 - 4.73e-4 * T * T / (T + 636.)
+        ni_th = np.sqrt(2.86e25 * (T / 300) ** 1.58 * 3.10e25 * (T / 300) ** 1.85) * np.exp(-Eg / (2 * VTT))
+        check(18, f"Si n_i at {T:.0f} K vs Green's N_c, N_v and E_g(T)", ni, ni_th, 1e-6)
+        check(18, f"Si p-n built-in voltage at {T:.0f} K", phi[-1] - phi[0], VTT * np.log(1e46 / ni ** 2), 1e-4)
+    # core limits and getters
+    t = M.TEMPLATES["PN Diode"]()
+    base = t["cons"][0]
+    t["cons"] = t["cons"] + [copy.deepcopy(base) for _ in range(33 - len(t["cons"]))]
+    try: M.setup_device(t); err = ""
+    except ValueError as e: err = str(e)
+    check(18, "33 contacts: a clear error instead of a silently dropped contact", float("too many contacts" in err), 1., 1., "range")
+    M.api_init(); gphi = M._f("api3_get_phi", M.D, M.I)
+    check(18, "core getters return NaN for a bad index / before a grid exists",
+          float(all(np.isnan(v) for v in (M.api_xs(-1), M.api_ys(10**6), gphi(10**9)))), 1., 1., "range")
+    # extraction functions on exact curves
+    for T in (250., 300., 400.):
+        VTT = KB * T / Q
+        for n_true in (1.0, 1.7):
+            V = np.linspace(0.05, 0.9, 86); J0, Rs = 1e-12, 2e-3; J = np.zeros_like(V)
+            for k, v in enumerate(V):                    # J = J0 (exp((V - J Rs)/(n kT/q)) - 1), by bisection in log J
+                lo, hi = -60., 10.
+                for _ in range(200):
+                    mid = 0.5 * (lo + hi); f = np.exp(mid) - J0 * np.expm1((v - np.exp(mid) * Rs) / (n_true * VTT))
+                    lo, hi = (mid, hi) if f < 0 else (lo, mid)
+                J[k] = np.exp(0.5 * (lo + hi))
+            r = M.diode_ideality(V, J, T=T)
+            check(18, f"ideality factor from J0(exp((V-J Rs)/(n kT/q))-1), n={n_true}, {T:.0f} K, series resistance",
+                  r["n"] if r else float("nan"), n_true, 0.02)
+    Vt, k_, Vds = 0.45, 2e-4, 0.05
+    Vg = np.linspace(0, 1.5, 61)
+    Ilin = np.where(Vg >= Vt + Vds / 2, k_ * (Vg - Vt - Vds / 2) * Vds, 1e-12 * np.exp((Vg - Vt) / 0.03))
+    th = M.threshold_voltage(Vg, Ilin, Vds)
+    check(18, "V_th, linear region (V_DS = 50 mV): tangent at max g_m minus V_DS/2 on an exact curve",
+          th["Vth"] if th else float("nan"), Vt, 1e-6, "abs")
+    Isat = np.where(Vg >= Vt, 0.5 * k_ * (Vg - Vt) ** 2, 0.)
+    th = M.threshold_voltage(Vg, Isat, 1.5)
+    check(18, "V_th, saturation (V_DS = 1.5 V): sqrt(I_D) extrapolation on an exact square-law curve",
+          th["Vth"] if th else float("nan"), Vt, 1e-6, "abs")
+    rng = np.random.default_rng(1)
+    Iss = 1e-15 * 10 ** (Vg / 0.075); Iss = np.minimum(Iss, 1e-6) + 1e-14 * rng.random(len(Vg))
+    sw = M.subthreshold_swing(Vg, Iss, floor=np.full_like(Vg, 1e-14))
+    check(18, "subthreshold swing 75 mV/dec with a noisy resolution floor", sw["SS"] if sw else float("nan"), 75., 0.01)
+
+
 SECTIONS = {1: s1_equilibrium, 2: s2_reverse, 3: s3_forward, 4: s4_sic_blocking, 5: s5_hetero,
             6: s6_mos, 7: s7_nmos, 8: s8_bjt, 9: s9_templates, 10: s10_cmos_finfet,
             11: s11_tunnelling, 12: s12_mlda_lombardi, 13: s13_prism_mesh, 14: s14_metal_contacts,
-            15: s15_defects, 16: s16_amr_predictor}
+            15: s15_defects, 16: s16_amr_predictor, 17: s17_avalanche_bjt,
+            18: s18_parameters_analysis}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", default="", help="comma-separated section numbers")
     ap.add_argument("--templates", action="store_true", help="also run section 9 (all GUI templates)")
     a = ap.parse_args()
-    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16] + ([9] if a.templates else [])
+    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18] + ([9] if a.templates else [])
     T0 = time.time()
     for s in sel:
         t = time.time(); SECTIONS[s](); print(f"   ({time.time()-t:.1f} s)\n")

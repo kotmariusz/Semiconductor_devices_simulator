@@ -17,7 +17,7 @@
  *                 Anderson acceleration (depth <= 12, RAM-aware), inexact
  *                 inner solves, quasi-Fermi potentials clamped to the span of
  *                 the terminal voltages (maximum principle).
- *   Mobility    : Arora low-field + Caughey-Thomas velocity saturation per
+ *   Mobility    : Masetti (Si) / Caughey-Thomas-Arora low-field + Caughey-Thomas velocity saturation per
  *                 edge, driven by the harmonic mean of the quasi-Fermi and
  *                 electrostatic potential drops (zero at equilibrium).
  *   Continuation: adaptive steps, linear extrapolation, region-shift
@@ -92,6 +92,14 @@ typedef struct {
     double T,VT,Eg,chi,eps_r,Nc,Nv,ni;
     double mu_n_max,mu_p_max,mu_n_min,mu_p_min;
     double Nref_n,Nref_p,alpha_n,alpha_p;
+    /* temperature exponents of the low-field mobility, (T/300)^x applied to
+       mu_min, mu_max (electrons, holes), N_ref and alpha */
+    double mt_min,mt_max_n,mt_max_p,mt_Nref,mt_alpha;
+    /* Masetti et al. 1983 doping dependence (mas_on = 1; silicon), per carrier
+       (0 n, 1 p): mu = mu_min1 exp(-Pc/N) + (mu_L - mu_min2)/(1+(N/Cr)^a)
+       - mu_1/(1+(Cs/N)^b), mu_L = mu_max (T/300)^mt_max (m^2/Vs, m^-3)     */
+    int    mas_on;
+    double mas_min1[2],mas_min2[2],mas_mu1[2],mas_Pc[2],mas_Cr[2],mas_Cs[2],mas_a[2],mas_b[2];
     double vsat_n,vsat_p,beta_n,beta_p;
     double tau_n0,tau_p0,Cn,Cp,Brad;
     double tau_Nref;              /* SRH lifetime doping dependence (0: off)  */
@@ -110,6 +118,13 @@ typedef struct {
     /* Lombardi surface mobility (cm units, Sentaurus form); lb_on = 0: off */
     int    lb_on;
     double lbB_n,lbC_n,lbL_n,lbD_n, lbB_p,lbC_p,lbL_p,lbD_p;
+    /* impact ionisation (avalanche), Chynoweth law per carrier (0 n, 1 p):
+         alpha(F) = g a exp(-(g b / F)^m),   F = field along the current,
+       a (1/m) and b (V/m) below / above the field E0 (V/m), exponent m; the
+       temperature factor g = tanh(hw/2kT0)/tanh(hw/2kT), T0 = 300 K, from
+       the optical-phonon energy hw (eV; 0: g = 1).  ii_on = 0: no data.    */
+    int    ii_on;
+    double ii_a[2][2], ii_b[2][2], ii_E0[2], ii_m[2], ii_hw, ii_g;
     /* Derived at solve time relative to the reference material:
          n = exp(lnc + (phi - phi_n)/VT),  p = exp(lnv + (phi_p - phi)/VT)
        For the reference material lnc = lnv = ln(ni). */
@@ -181,6 +196,7 @@ typedef struct {
                                      solve tg holds the display J_tun (A/m^2) */
     double *phi,*phi_n,*phi_p,*n,*p;
     double *Jx,*Jy,*Jz,*mu_n,*mu_p,*R_tot;
+    double *gii;                  /* impact-ionisation generation of the node (1/s) */
     mu_t   *fmu[6];               /* face mobility (k,k+e_ax): [0-2] n x,y,z; [3-5] p */
 
     /* solver work space */
@@ -227,11 +243,14 @@ typedef struct {
     long   pcg_its, bicg_its, newton_its, gummel_its; /* diagnostics */
     double t_pois, t_cont, t_mob, t_cur, t_aa, t_mg;   /* wall-time profile (s) */
     double pcg_rtol, ntol_fac, bicg_rtol;   /* inexact inner-solve controls */
+    double ii_err;                /* impact ionisation: estimated remaining change of the generated
+                                     current at the last accepted Gummel iterate (A) */
     double cont_atol_f;                     /* factor on CONT_ATOL (lowered when a metal-contact current stalls) */
     int    nthreads;
     int    models;                /* bit0 BGN, bit1 tau(N), bit2 v-sat, bit3 MLDA
                                      quantum confinement, bit4 Lombardi surface
-                                     mobility, bit5 gate tunnelling          */
+                                     mobility, bit5 gate tunnelling, bit6/7
+                                     metal contacts, bit8 impact ionisation  */
     /* unstructured (graph) mesh, unstr = 1: nodes 0..N-1 (Nx = N, Ny = Nz =
        1); neighbours from a symmetric CSR graph carrying the box-method
        geometry: per directed edge the neighbour, reverse edge, undirected id,
@@ -313,14 +332,31 @@ static inline void trap_eval(const Dev *d, size_t k, double n, double p,
 static void mat_init(Mat *m, int id, double T){
     memset(m,0,sizeof(*m));
     m->id=id; m->T=T; m->VT=KB*T/Q; m->insulator=0;
+    double tr=T/300.;
+    /* low-field mobility temperature exponents: Arora 1982 form unless a
+       material sets its own below */
+    m->mt_min=-0.57; m->mt_max_n=-2.33; m->mt_max_p=-2.23; m->mt_Nref=2.4; m->mt_alpha=-0.146;
     switch(id){
     case 0: /* Si */
         m->Eg=1.170-4.73e-4*T*T/(T+636.); m->chi=4.05; m->eps_r=11.7;
         m->Nc=2.86e25*pow(T/300.,1.58); m->Nv=3.10e25*pow(T/300.,1.85);
-        m->mu_n_max=0.1417; m->mu_p_max=0.0470; m->mu_n_min=0.0088; m->mu_p_min=0.00543;
-        m->Nref_n=1.30e23; m->Nref_p=2.35e23; m->alpha_n=0.88; m->alpha_p=0.88;
-        m->vsat_n=1.07e5; m->vsat_p=8.37e4; m->beta_n=1.109; m->beta_p=1.213;
-        m->tau_n0=1e-5; m->tau_p0=1e-5; m->Cn=2.8e-43; m->Cp=9.9e-44; m->Brad=1.8e-21;
+        /* low-field mobility: Masetti, Severi & Solmi 1983 (arsenic set for
+           electrons, boron set for holes; the Sentaurus defaults), lattice
+           term 1417 / 470.5 cm^2/Vs scaled by (T/300)^-2.5 / ^-2.2 */
+        m->mas_on=1; m->mt_max_n=-2.5; m->mt_max_p=-2.2;
+        m->mu_n_max=0.1417; m->mu_p_max=0.04705; m->mu_n_min=0.00522; m->mu_p_min=0.00449;
+        m->mas_min1[0]=0.00522; m->mas_min2[0]=0.00522; m->mas_mu1[0]=0.00434; m->mas_Pc[0]=0.;
+        m->mas_Cr[0]=9.68e22; m->mas_Cs[0]=3.43e26; m->mas_a[0]=0.680; m->mas_b[0]=2.0;
+        m->mas_min1[1]=0.00449; m->mas_min2[1]=0.;      m->mas_mu1[1]=0.00290; m->mas_Pc[1]=9.23e22;
+        m->mas_Cr[1]=2.23e23; m->mas_Cs[1]=6.10e26; m->mas_a[1]=0.719; m->mas_b[1]=2.0;
+        m->Nref_n=9.68e22; m->Nref_p=2.23e23; m->alpha_n=0.680; m->alpha_p=0.719;
+        /* Caughey-Thomas with Canali et al. 1975 temperature laws:
+           v_sat 1.07e7 (T/300)^-0.87 / 8.37e6 (T/300)^-0.52 cm/s,
+           beta 1.109 (T/300)^0.66 / 1.213 (T/300)^0.17 */
+        m->vsat_n=1.07e5*pow(tr,-0.87); m->vsat_p=8.37e4*pow(tr,-0.52);
+        m->beta_n=1.109*pow(tr,0.66); m->beta_p=1.213*pow(tr,0.17);
+        /* radiative: Trupke et al. 2003, 4.73e-15 cm^3/s */
+        m->tau_n0=1e-5; m->tau_p0=1e-5; m->Cn=2.8e-43; m->Cp=9.9e-44; m->Brad=4.73e-21;
         m->tau_Nref=1e22;                           /* Scharfetter, 1e16 cm^-3 */
         m->bgn_E=6.92e-3; m->bgn_N=1.3e23; m->bgn_C=0.5;  /* Klaassen 1992 */
         /* MLDA, (100) interface: every valley keeps its Boltzmann share of
@@ -336,6 +372,13 @@ static void mat_init(Mat *m, int id, double T){
         m->lb_on=1;
         m->lbB_n=4.75e7; m->lbC_n=580.;  m->lbL_n=0.125;  m->lbD_n=5.82e14;
         m->lbB_p=9.925e6; m->lbC_p=2947.; m->lbL_p=0.0317; m->lbD_p=2.0546e14;
+        /* impact ionisation: van Overstraeten & de Man 1970 - electrons
+           7.03e5 /cm, 1.231e6 V/cm; holes 1.582e6 /cm, 2.036e6 V/cm below
+           4e5 V/cm and 6.71e5 /cm, 1.693e6 V/cm above; optical phonon
+           0.063 eV for the temperature dependence */
+        m->ii_on=1; m->ii_hw=0.063; m->ii_m[0]=m->ii_m[1]=1.;
+        m->ii_a[0][0]=m->ii_a[0][1]=7.03e7;  m->ii_b[0][0]=m->ii_b[0][1]=1.231e8; m->ii_E0[0]=4e7;
+        m->ii_a[1][0]=1.582e8; m->ii_b[1][0]=2.036e8; m->ii_a[1][1]=6.71e7; m->ii_b[1][1]=1.693e8; m->ii_E0[1]=4e7;
         break;
     case 1: /* Ge: Nc 1.04e19, Nv 6.0e18 cm^-3 (Sze; Ioffe NSM) -> ni 2.2e13 cm^-3 at 300 K
                (earlier internal versions had Nv 10x too large: ni 3x too high) */
@@ -343,58 +386,92 @@ static void mat_init(Mat *m, int id, double T){
         m->Nc=1.04e25*pow(T/300.,1.5); m->Nv=6.0e24*pow(T/300.,1.5);
         m->mu_n_max=0.39; m->mu_p_max=0.19; m->mu_n_min=0.040; m->mu_p_min=0.020;
         m->Nref_n=1.30e23; m->Nref_p=1.00e23; m->alpha_n=0.56; m->alpha_p=0.43;
+        m->mt_min=0.; m->mt_max_n=-1.66; m->mt_max_p=-2.33; m->mt_Nref=0.; m->mt_alpha=0.;   /* lattice T^-1.66 / T^-2.33 */
         m->vsat_n=6e4; m->vsat_p=5.4e4; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-3; m->tau_p0=1e-3; m->Cn=1e-42; m->Cp=1e-42; m->Brad=6.4e-20;
         m->rich_n=1.43e6; m->rich_p=4.1e5; m->mt_e=0.12; m->mt_h=0.28; break;
     case 2: /* GaAs */
         m->Eg=1.519-5.405e-4*T*T/(T+204.); m->chi=4.07; m->eps_r=12.9;
         m->Nc=4.37e23*pow(T/300.,1.5); m->Nv=8.68e24*pow(T/300.,1.5);
-        m->mu_n_max=0.80; m->mu_p_max=0.040; m->mu_n_min=0.050; m->mu_p_min=0.0020;
-        m->Nref_n=1.70e23; m->Nref_p=2.75e23; m->alpha_n=0.394; m->alpha_p=0.394;
+        /* electrons: Sotoodeh, Khalid & Rezazadeh 2000 (9400, 500, 6.0e16, 0.394;
+           mu_max (300/T)^2.1, N_ref (T/300)^3.0) */
+        m->mu_n_max=0.94; m->mu_p_max=0.040; m->mu_n_min=0.050; m->mu_p_min=0.0020;
+        m->Nref_n=6.0e22; m->Nref_p=2.75e23; m->alpha_n=0.394; m->alpha_p=0.394;
+        m->mt_min=0.; m->mt_max_n=-2.1; m->mt_max_p=-2.1; m->mt_Nref=3.0; m->mt_alpha=0.;
         m->vsat_n=7.7e4; m->vsat_p=7.7e4; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-9; m->tau_p0=1e-9; m->Cn=1e-43; m->Cp=1e-43; m->Brad=1.5e-16;
-        m->rich_n=8.16e4; m->rich_p=7.44e5; m->mt_e=0.067; m->mt_h=0.45; break;
+        m->rich_n=8.16e4; m->rich_p=7.44e5; m->mt_e=0.067; m->mt_h=0.45;
+        /* impact ionisation: Bulman et al. 1983 (as tabulated by Quay 2001) -
+           electrons 2.99e5 /cm, 6.848e5 V/cm, m 1.6; holes 2.215e5 /cm,
+           6.57e5 V/cm, m 1.75 */
+        m->ii_on=1; m->ii_E0[0]=m->ii_E0[1]=1e30;
+        m->ii_a[0][0]=m->ii_a[0][1]=2.99e7;  m->ii_b[0][0]=m->ii_b[0][1]=6.848e7; m->ii_m[0]=1.6;
+        m->ii_a[1][0]=m->ii_a[1][1]=2.215e7; m->ii_b[1][0]=m->ii_b[1][1]=6.57e7;  m->ii_m[1]=1.75;
+        break;
     case 3: /* InP: Eg(T) Vurgaftman, Meyer & Ram-Mohan 2001 -> 1.353 eV at 300 K
                (earlier internal versions used the 300 K gap as Eg(0)) */
         m->Eg=1.4236-3.63e-4*T*T/(T+162.); m->chi=4.38; m->eps_r=12.5;
         m->Nc=5.7e23*pow(T/300.,1.5); m->Nv=1.1e25*pow(T/300.,1.5);
-        m->mu_n_max=0.45; m->mu_p_max=0.015; m->mu_n_min=0.040; m->mu_p_min=0.0010;
-        m->Nref_n=3.00e23; m->Nref_p=4.90e23; m->alpha_n=0.40; m->alpha_p=0.40;
+        /* electrons: Sotoodeh et al. 2000 (5200, 400, 3.0e17, 0.47; (300/T)^2.0, (T/300)^3.25) */
+        m->mu_n_max=0.52; m->mu_p_max=0.015; m->mu_n_min=0.040; m->mu_p_min=0.0010;
+        m->Nref_n=3.00e23; m->Nref_p=4.90e23; m->alpha_n=0.47; m->alpha_p=0.40;
+        m->mt_min=0.; m->mt_max_n=-2.0; m->mt_max_p=-2.0; m->mt_Nref=3.25; m->mt_alpha=0.;
         m->vsat_n=1e5; m->vsat_p=5e4; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-8; m->tau_p0=1e-8; m->Cn=1e-43; m->Cp=1e-43; m->Brad=8.5e-17;
         m->rich_n=9.6e4; m->rich_p=7.2e5; m->mt_e=0.08; m->mt_h=0.60; break;
     case 4: /* 4H-SiC */
-        m->Eg=3.265-6.5e-4*T*T/(T+1300.); m->chi=3.8; m->eps_r=9.7;
+        /* chi 3.7 eV: SiC/SiO2 conduction-band offset 2.75 eV (Afanas'ev et al. 1996: 2.7-2.8) */
+        m->Eg=3.265-6.5e-4*T*T/(T+1300.); m->chi=3.7; m->eps_r=9.7;
         m->Nc=1.73e25*pow(T/300.,1.5); m->Nv=2.64e25*pow(T/300.,1.5);
-        m->mu_n_max=0.095; m->mu_p_max=0.0125; m->mu_n_min=0.0040; m->mu_p_min=0.0015;
-        m->Nref_n=1.94e23; m->Nref_p=2.35e24; m->alpha_n=0.61; m->alpha_p=0.34;
+        /* electrons Roschke & Schwierz 2001; holes Schaffer et al. 1994
+           (124, 15.9, 1.76e19, 0.34); mu_max (T/300)^-2.40 / ^-2.15, mu_min ^-0.5 */
+        m->mu_n_max=0.095; m->mu_p_max=0.0124; m->mu_n_min=0.0040; m->mu_p_min=0.00159;
+        m->Nref_n=1.94e23; m->Nref_p=1.76e25; m->alpha_n=0.61; m->alpha_p=0.34;
+        m->mt_min=-0.5; m->mt_max_n=-2.40; m->mt_max_p=-2.15; m->mt_Nref=0.; m->mt_alpha=0.;
         m->vsat_n=2.2e5; m->vsat_p=1.6e5; m->beta_n=1.2; m->beta_p=1.;
-        m->tau_n0=1e-6; m->tau_p0=1e-7; m->Cn=5e-44; m->Cp=2e-44; m->Brad=1.5e-23;
-        m->rich_n=1.46e6; m->rich_p=9.6e5; m->mt_e=0.33; m->mt_h=0.80; break;
+        m->tau_n0=1e-6; m->tau_p0=1e-7; m->Cn=5e-44; m->Cp=2e-44; m->Brad=1.5e-18;   /* Galeckas 1997: B 1.5e-12 cm^3/s */
+        m->rich_n=1.46e6; m->rich_p=9.6e5; m->mt_e=0.33; m->mt_h=0.80;
+        /* impact ionisation along <0001> (vertical devices): Hatakeyama et
+           al. 2004 - electrons 1.76e8 /cm, 3.30e7 V/cm; holes 3.41e8 /cm,
+           2.50e7 V/cm */
+        m->ii_on=1; m->ii_E0[0]=m->ii_E0[1]=1e30; m->ii_m[0]=m->ii_m[1]=1.;
+        m->ii_a[0][0]=m->ii_a[0][1]=1.76e10; m->ii_b[0][0]=m->ii_b[0][1]=3.30e9;
+        m->ii_a[1][0]=m->ii_a[1][1]=3.41e10; m->ii_b[1][0]=m->ii_b[1][1]=2.50e9;
+        break;
     case 5: /* GaN */
         m->Eg=3.507-9.09e-4*T*T/(T+830.); m->chi=4.1; m->eps_r=8.9;
         m->Nc=2.3e24*pow(T/300.,1.5); m->Nv=4.6e25*pow(T/300.,1.5);
         m->mu_n_max=0.120; m->mu_p_max=0.0030; m->mu_n_min=0.0055; m->mu_p_min=0.00030;
         m->Nref_n=1.00e23; m->Nref_p=3.00e23; m->alpha_n=1.0; m->alpha_p=2.0;
+        m->mt_min=-1.02; m->mt_max_n=-3.84; m->mt_max_p=-3.84; m->mt_Nref=0.; m->mt_alpha=0.;   /* Farahmand 2001 exponents */
         m->vsat_n=2.5e5; m->vsat_p=2e5; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-8; m->tau_p0=1e-8; m->Cn=1e-43; m->Cp=1e-43; m->Brad=1.1e-16;
-        m->rich_n=2.64e5; m->rich_p=9.6e5; m->mt_e=0.22; m->mt_h=0.80; break;
+        m->rich_n=2.64e5; m->rich_p=9.6e5; m->mt_e=0.22; m->mt_h=0.80;
+        /* impact ionisation: Ji, Ercan & Chowdhury 2019 (homojunctions) -
+           electrons 2.11e9 /cm, 3.689e7 V/cm; holes 4.39e6 /cm, 1.8e7 V/cm */
+        m->ii_on=1; m->ii_E0[0]=m->ii_E0[1]=1e30; m->ii_m[0]=m->ii_m[1]=1.;
+        m->ii_a[0][0]=m->ii_a[0][1]=2.11e11; m->ii_b[0][0]=m->ii_b[0][1]=3.689e9;
+        m->ii_a[1][0]=m->ii_a[1][1]=4.39e8;  m->ii_b[1][0]=m->ii_b[1][1]=1.8e9;
+        break;
     case 6: /* Al(x)Ga(1-x)As, x=0.3: Eg(300K)=1.424+1.247x=1.798 eV (direct);
                band offsets dEc:dEv = 65:35 vs GaAs -> dEc=0.243 eV, chi=3.827 */
         m->Eg=1.882-5.58e-4*T*T/(T+295.); m->chi=3.827; m->eps_r=12.24;
         m->Nc=7.2e23*pow(T/300.,1.5); m->Nv=1.05e25*pow(T/300.,1.5);
         m->mu_n_max=0.35; m->mu_p_max=0.025; m->mu_n_min=0.020; m->mu_p_min=0.0015;
         m->Nref_n=6.00e22; m->Nref_p=1.00e23; m->alpha_n=0.394; m->alpha_p=0.394;
+        m->mt_min=0.; m->mt_max_n=-2.1; m->mt_max_p=-2.1; m->mt_Nref=3.0; m->mt_alpha=0.;   /* as GaAs */
         m->vsat_n=6e4; m->vsat_p=5e4; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-9; m->tau_p0=1e-9; m->Cn=1e-43; m->Cp=1e-43; m->Brad=5e-17;
         m->rich_n=1.08e5; m->rich_p=6.6e5; m->mt_e=0.092; m->mt_h=0.50; break;
     case 7: /* Al(x)Ga(1-x)N, x=0.25 - HEMT barrier.
-               Eg: Vegard + bowing b=1.0 eV (Vurgaftman & Meyer 2003) -> 3.92 eV @300K
+               Eg: Vegard + bowing b=1.0 eV (Vurgaftman, Meyer & Ram-Mohan 2001; their
+               2003 nitride update recommends 0.7 eV) -> 3.92 eV @300K
                dEc = 0.7*dEg vs GaN -> chi = 4.10-0.34 = 3.76 eV */
         m->Eg=3.990-9.09e-4*T*T/(T+830.); m->chi=3.76; m->eps_r=8.8;
         m->Nc=3.2e24*pow(T/300.,1.5); m->Nv=4.6e25*pow(T/300.,1.5);
         m->mu_n_max=0.030; m->mu_p_max=0.0010; m->mu_n_min=0.0030; m->mu_p_min=0.00020;
         m->Nref_n=1.00e23; m->Nref_p=3.00e23; m->alpha_n=1.0; m->alpha_p=2.0;
+        m->mt_min=-1.02; m->mt_max_n=-3.84; m->mt_max_p=-3.84; m->mt_Nref=0.; m->mt_alpha=0.;   /* as GaN */
         m->vsat_n=1.5e5; m->vsat_p=1e5; m->beta_n=1.; m->beta_p=1.;
         m->tau_n0=1e-9; m->tau_p0=1e-9; m->Cn=1e-43; m->Cp=1e-43; m->Brad=1e-16;
         m->rich_n=3.0e5; m->rich_p=9.6e5; m->mt_e=0.25; m->mt_h=1.0; break;
@@ -426,6 +503,7 @@ static void mat_init(Mat *m, int id, double T){
         m->ms_e=me[id]<0.5?me[id]:0.5; m->ms_h=0.5;
     }
     m->ni = m->insulator ? 0. : sqrt(m->Nc*m->Nv)*exp(-m->Eg/(2.*m->VT));
+    m->ii_g = m->ii_hw>0. ? tanh(m->ii_hw/(2.*KB*300./Q))/tanh(m->ii_hw/(2.*m->VT)) : 1.;
 }
 
 /* Band offsets: pick the reference (first semiconductor), then give every
@@ -448,10 +526,18 @@ static void mat_prepare(Dev *d){
 static double mob_low(const Mat *m, double Ntot, int hole){
     if(Ntot<1.)Ntot=1.;
     double tr=m->T/300.;
-    double mumin = (hole?m->mu_p_min:m->mu_n_min)*pow(tr,-0.57);
-    double mumax = (hole?m->mu_p_max:m->mu_n_max)*pow(tr,hole?-2.23:-2.33);
-    double Nref  = (hole?m->Nref_p:m->Nref_n)*pow(tr,2.546);
-    double alpha = (hole?m->alpha_p:m->alpha_n)*pow(tr,-0.146);
+    if(m->mas_on){                      /* Masetti 1983 */
+        int c=hole?1:0;
+        double muL=(hole?m->mu_p_max:m->mu_n_max)*pow(tr,hole?m->mt_max_p:m->mt_max_n);
+        double mu=m->mas_min1[c]*exp(-m->mas_Pc[c]/Ntot)
+                 +(muL-m->mas_min2[c])/(1.+pow(Ntot/m->mas_Cr[c],m->mas_a[c]))
+                 -m->mas_mu1[c]/(1.+pow(m->mas_Cs[c]/Ntot,m->mas_b[c]));
+        return mu>1e-6 ? mu : 1e-6;
+    }
+    double mumin = (hole?m->mu_p_min:m->mu_n_min)*pow(tr,m->mt_min);
+    double mumax = (hole?m->mu_p_max:m->mu_n_max)*pow(tr,hole?m->mt_max_p:m->mt_max_n);
+    double Nref  = (hole?m->Nref_p:m->Nref_n)*pow(tr,m->mt_Nref);
+    double alpha = (hole?m->alpha_p:m->alpha_n)*pow(tr,m->mt_alpha);
     if(mumax<mumin) mumax=mumin;
     return mumin + (mumax-mumin)/(1.+pow(Ntot/Nref,alpha));
 }
@@ -601,13 +687,13 @@ static double bgn_half(const Mat *m, double N){       /* dEg/(2 VT) */
 /* ----------------------------------------------------------- allocation */
 #define NODE_D(d) { &d->Nd,&d->Na,&d->Nf,&d->eps,&d->bgn,&d->qcn,&d->qcp,&d->qd,&d->tk,&d->tg, \
     &d->phi,&d->phi_n,&d->phi_p,&d->n,&d->p, \
-    &d->Jx,&d->Jy,&d->Jz,&d->mu_n,&d->mu_p,&d->R_tot, \
+    &d->Jx,&d->Jy,&d->Jz,&d->mu_n,&d->mu_p,&d->R_tot,&d->gii, \
     &d->A.c,&d->A.xm,&d->A.xp,&d->A.ym,&d->A.yp,&d->A.zm,&d->A.zp,&d->ilu, \
     &d->wk[0],&d->wk[1],&d->wk[2],&d->wk[3],&d->wk[4],&d->wk[5],&d->wk[6], \
     &d->h1[0],&d->h1[1],&d->h1[2],&d->h2[0],&d->h2[1],&d->h2[2], \
     &d->e2[0],&d->e2[1],&d->e2[2], \
     &d->sc,&d->rhs,&d->sol,&d->dsc,&d->xsave }
-#define N_NODE_D 50
+#define N_NODE_D 51
 
 static void mg_free(Dev *d);
 static int  mg_alloc(Dev *d);
@@ -2313,6 +2399,7 @@ static int  float_fix_g(Dev *d, int hole);
 static void terminal_flux_g(Dev *d, double *I, double *S);
 static void upd_J_g(Dev *d);
 static void region_shift_g(Dev *d, const double *dV);
+static void ii_update(Dev *d);
 
 static double poisson_eval(Dev *d, const double *phi, const double *Vapp,
                            int build, double *F){
@@ -2627,6 +2714,7 @@ static void cont_assemble(Dev *d, int hole){
         double vol=volume(d,i,j,l);
         dg+=vol*dR; b+=vol*(dR*car[k]-R);
         dg+=d->tk[k]; b+=d->tg[k];                 /* gate tunnelling: sink tk*c - tg */
+        b+=d->gii[k];                              /* impact ionisation (pairs) */
         double w=1./(dg*sk);
         A->c[k]=1.; A->xm[k]=off[0]*w; A->xp[k]=off[1]*w; A->ym[k]=off[2]*w;
         A->yp[k]=off[3]*w; A->zm[k]=off[4]*w; A->zp[k]=off[5]*w;
@@ -2736,7 +2824,7 @@ static int float_fix(Dev *d, int hole){
                 recombKnp(d,k, hole?oth[k]:c, hole?c:oth[k], &R,&dRn,&dRp);
                 double vol=volume(d,i,j,l);
                 G+=vol*R; dG+=vol*(hole?dRp:dRn)*c;
-                G+=d->tk[k]*c-d->tg[k]; dG+=d->tk[k]*c;
+                G+=d->tk[k]*c-d->tg[k]-d->gii[k]; dG+=d->tk[k]*c;
             }
             if(!(dG>0.)) break;
             double ds=-G/dG; if(ds>2.) ds=2.; else if(ds<-2.) ds=-2.;
@@ -3312,6 +3400,18 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
     double *xk=d->wk[6], *dqn=d->Jx, *dqp=d->Jy;
     double *qn0=d->Jz, *qp0=d->R_tot;       /* phi_n,p entering the iteration (display arrays are free here) */
     double itol = d->tol_c>0. ? d->tol_c : 1e-6;
+    /* impact ionisation: the generation is lagged one iteration, so the
+       multiplication builds up as a geometric series (ratio = ionisation
+       integral, 0.8-0.95 near breakdown).  Track the total generation Gs (a
+       sum of positive terms, resolved far better than a contact flux) and
+       accept only when its change AND the extrapolated remainder of the
+       series are below tol_ii * Gs.  The continuity solves run tighter. */
+    const int iion=(d->models&256)!=0;
+    const double tol_ii=fmax(itol,1e-4);
+    double Gs_old=-1., dG_old=0., ii_rel=1., ii_best=1e300, Erem=0.;
+    double brtol0=d->bicg_rtol;
+    if(iion && d->bicg_rtol>1e-8) d->bicg_rtol=1e-8;
+    d->ii_err=0.;
     apply_bc(d,Va);
     aa_reset(d);
     /* start from a Poisson-consistent potential for the predicted phi_n,p */
@@ -3326,6 +3426,24 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
         upd_mob(d);
         tun_update(d,Va);
         te_update(d,Va);
+        ii_update(d);
+        int iiok=1;
+        if(iion){
+            double Gs=0.;
+            #pragma omp parallel for reduction(+:Gs) schedule(static) if(N>PAR_MIN)
+            for(size_t k=0;k<N;k++) Gs+=d->gii[k];
+            if(Gs>0.){
+                if(Gs_old<0.){ iiok=0; Erem=Gs; }
+                else {
+                    double dG=fabs(Gs-Gs_old), rho = dG_old>0. ? dG/dG_old : 0.;
+                    if(rho>0.99) rho=0.99;
+                    Erem = dG + dG*rho/(1.-rho);
+                    iiok = dG<=tol_ii*Gs && Erem<=tol_ii*Gs;
+                    dG_old=dG;
+                }
+                ii_rel=Erem/Gs; Gs_old=Gs;
+            } else { Erem=0.; ii_rel=0.; }
+        }
         double t1=wtime(); d->t_mob+=t1-t0;
         double dn=0.,dp=0.;
         if(!solve_cont(d,0,dqn,lo,hi,&dn)) break;
@@ -3338,6 +3456,10 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
         if(haveI) for(int c=0;c<nc;c++){
             if(fabs(I[c]-Iold[c])>fmax(itol*fabs(I[c]),3e-14*S[c])) icv=0;
             if(fabs(I[c]-Iold[c])>fmax(fmax(itol,1e-4)*fabs(I[c]),3e-14*S[c])) icl=0;
+        }
+        if(iion && !iiok){                      /* generation below the current resolution: nothing to converge */
+            double Sm=0.; for(int c=0;c<nc;c++) if(S[c]>Sm) Sm=S[c];
+            if(Q*Erem<=3e-14*Sm) iiok=1;
         }
         loose = icl ? loose+1 : 0;
         memcpy(Iold,I,sizeof(double)*nc); haveI=1;
@@ -3362,7 +3484,7 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
         if(dpsi!=dpsi || dq!=dq) break;
         double r=fmax(dpsi,dq);
         g_prog[1]=it; g_prog[2]=r; g_prog[5]=(double)(d->gummel_its+it);
-        if(dq<gtol && dpsi<gtol && icv){           /* accept psi_k + its carriers */
+        if(dq<gtol && dpsi<gtol && icv && iiok){   /* accept psi_k + its carriers */
             memcpy(d->phi,xk,N*sizeof(double)); conv=1; break;
         }
         /* metal contacts: potentials converged but a terminal current keeps
@@ -3381,7 +3503,7 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
                     stall=0; ntight++; best_mark=1e300; it_mark=it;
                     if(d->verbose) fprintf(stderr,"semisim: terminal current not settling - continuity tolerance %.0e, floor %.0e\n",
                                            d->bicg_rtol,CONT_ATOL*d->cont_atol_f);
-                } else if(d->n_te>0 && loose>=8){
+                } else if(d->n_te>0 && loose>=8 && iiok){
                     /* nothing left to tighten: the reverse current of a metal
                        contact is carried by trace electrons across a depletion
                        region (tens of kT per mesh step) whose density settles
@@ -3401,7 +3523,8 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
            of a blocking thyristor, fed only by generation), whose majority
            quasi-Fermi level double precision cannot pin any tighter. */
         if(r<0.5*best_mark){ best_mark=r; it_mark=it; }
-        if(it-it_mark>20 && r<=1e3*gtol && icv){
+        if(iion && ii_rel<0.5*ii_best){ ii_best=ii_rel; it_mark=it; }   /* slow multiplication is progress */
+        if(it-it_mark>20 && r<=1e3*gtol && icv && iiok){
             memcpy(d->phi,xk,N*sizeof(double)); conv=1;
             if(d->verbose) fprintf(stderr,"semisim: accepted at noise floor (res %.2e)\n",r);
             break;
@@ -3415,6 +3538,8 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
         d->t_aa+=wtime()-t4;
     }
     if(it>maxit) it=maxit;
+    if(iion && brtol0>1e-8 && d->bicg_rtol==1e-8) d->bicg_rtol=brtol0;   /* (a metal-contact tightening stays) */
+    if(iion) d->ii_err=Q*Erem;
     d->gummel_its+=it; *iters=it; *res=fmax(dpsi,dq);
     return conv;
 }
@@ -3537,7 +3662,11 @@ static int cont_path(Dev *d){
     }
     int first=1;
     double t=0., tp=-1., dt = span>0. ? fmin(1.,0.1/span) : 1.;
-    int ok_all=0, its=0, steps=0, fails=0; double res=0.;
+    int ok_all=0, its=0, steps=0, fails=0, cfail=0; double res=0.;
+    /* With impact ionisation a failure near breakdown is physical (the
+       multiplication diverges whatever the step): give up after three
+       failed sub-steps in a row instead of shrinking the step to 2e-5. */
+    int max_cfail = (d->models&256) ? 3 : 1<<30;
     g_prog[0]=0.; g_prog[3]=0.;
     for(int guard=0;guard<5000;guard++){
         if(g_stop) break;
@@ -3593,9 +3722,10 @@ static int cont_path(Dev *d){
                linearly converging Gummel map the iteration count is set by
                the contraction rate, not by the step length) */
             dt*= its<=8 ? 2.0 : (its<=25 ? 1.5 : GROW_SLOW);
+            cfail=0;
         } else {
-            fails++; rx=0.;
-            if(span==0. || dt*span<2e-5){ break; }
+            fails++; cfail++; rx=0.;
+            if(span==0. || dt*span<2e-5 || cfail>=max_cfail){ break; }
             dt*=0.3;
         }
     }
@@ -3652,7 +3782,7 @@ static int run_continuation(Dev *d){
     for(int c=0;c<nc;c++){
         double Iv=I[c], fv=fl[c], fo=F-fl[c];
         if(d->cons[c].bc!=2 && ncar>1 && fo<fv){ Iv=-(ks-I[c]); fv=fo; }
-        d->cons[c].I=Iv; d->cons[c].Iflr=fv*scl; d->cons[c].Iraw=I[c];
+        d->cons[c].I=Iv; d->cons[c].Iflr=fv*scl+(ok_all ? d->ii_err : 0.);   /* (a failed point keeps its partial-state floor) */ d->cons[c].Iraw=I[c];
     }
     return ok_all;
 }
@@ -3801,6 +3931,7 @@ static void cont_assemble_g(Dev *d, int hole){
         double vol=d->gvol[k];
         dg+=vol*dR; b+=vol*(dR*car[k]-R);
         dg+=d->tk[k]; b+=d->tg[k];
+        b+=d->gii[k];
         double w=1./(dg*sk);
         dgv[k]=1.;
         for(int e=e0;e<e1;e++) d->gval[e]*=w;
@@ -3854,7 +3985,7 @@ static int float_fix_g(Dev *d, int hole){
                 recombKnp(d,k, hole?oth[k]:c, hole?c:oth[k], &R,&dRn,&dRp);
                 double vol=d->gvol[k];
                 G+=vol*R; dG+=vol*(hole?dRp:dRn)*c;
-                G+=d->tk[k]*c-d->tg[k]; dG+=d->tk[k]*c;
+                G+=d->tk[k]*c-d->tg[k]-d->gii[k]; dG+=d->tk[k]*c;
             }
             if(!(dG>0.)) break;
             double ds=-G/dG; if(ds>2.) ds=2.; else if(ds<-2.) ds=-2.;
@@ -3918,6 +4049,66 @@ static void upd_J_g(Dev *d){
         d->Jx[k]=J[0]; d->Jy[k]=J[1]; d->Jz[k]=J[2];
         double R,a,b; recombK(d,k,&R,&a,&b);
         d->R_tot[k]=R;
+    }
+}
+
+/* ============================================ impact ionisation (avalanche)
+   Generation of electron-hole pairs by carriers accelerated in high fields:
+       G = (alpha_n(F_n) |J_n| + alpha_p(F_p) |J_p|) / q
+   at every semiconductor node, with J_n, J_p the node current-density
+   vectors of the two carriers (from the edge fluxes, as for display; least
+   squares on the prism mesh) and F = |E.J|/|J| the field along each
+   carrier's current (the "Eparallel" driving force).  G (1/s, over the
+   control volume) enters both continuity equations as a source and the
+   balance of floating regions; it is evaluated from the iterate at the
+   start of every Gummel iteration, so the multiplication is iterated to
+   self-consistency (it converges as long as the ionisation integral stays
+   below 1, i.e. below breakdown).  G = 0 at equilibrium (J = 0).
+   models bit 8 (256); materials without data (ii_on = 0) get none. */
+static inline double ii_alpha(const Mat *m, double F, int c){
+    if(!(F>1e5)) return 0.;                          /* below 1 kV/cm: nothing */
+    int r = F>=m->ii_E0[c];
+    double x = m->ii_g*m->ii_b[c][r]/F;
+    if(m->ii_m[c]!=1.) x=pow(x,m->ii_m[c]);
+    if(x>700.) return 0.;
+    return m->ii_g*m->ii_a[c][r]*exp(-x);
+}
+static void ii_update(Dev *d){
+    size_t N=NN(d);
+    if(!(d->models&256)){ memset(d->gii,0,N*sizeof(double)); return; }
+    #pragma omp parallel for schedule(static) if(N>PAR_MIN)
+    for(size_t k=0;k<N;k++){
+        d->gii[k]=0.;
+        if(d->kind[k]!=K_SEMI || car_fix(d,k)) continue;
+        const Mat *m=MK(d,k); if(!m->ii_on) continue;
+        double Jn[3],Jp[3],E[3],vol;
+        if(d->unstr){
+            double g[3];
+            g_node_J(d,k,1,Jn); g_node_J(d,k,2,Jp); g_grad(d,d->phi,k,g);
+            for(int q=0;q<3;q++) E[q]=-g[q];
+            vol=d->gvol[k];
+        } else {
+            int i,j,l; unidx(d,k,&i,&j,&l);
+            for(int ax=0;ax<3;ax++){
+                double sn=0.,sp=0.,h,ar,a,b,c2,e; int cnt=0; size_t kb;
+                if(nbr(d,i,j,l,2*ax,&kb,&h,&ar) && d->kind[kb]==K_SEMI){
+                    face_flux(d,kb,k,h,ar,&a,&b,&c2,&e); sn+=a/ar; sp+=b/ar; cnt++; }
+                if(nbr(d,i,j,l,2*ax+1,&kb,&h,&ar) && d->kind[kb]==K_SEMI){
+                    face_flux(d,k,kb,h,ar,&a,&b,&c2,&e); sn+=a/ar; sp+=b/ar; cnt++; }
+                Jn[ax]= cnt? sn/cnt : 0.; Jp[ax]= cnt? sp/cnt : 0.;
+                E[ax]=-grad_semi(d,i,j,l,ax);
+            }
+            vol=volume(d,i,j,l);
+        }
+        double G=0.;
+        for(int c=0;c<2;c++){
+            const double *J = c? Jp : Jn;
+            double jj=sqrt(J[0]*J[0]+J[1]*J[1]+J[2]*J[2]);
+            if(!(jj>0.)) continue;
+            double F=fabs(E[0]*J[0]+E[1]*J[1]+E[2]*J[2])/jj;
+            G+=ii_alpha(m,F,c)*jj;
+        }
+        d->gii[k]=G/Q*vol;
     }
 }
 
@@ -4381,9 +4572,9 @@ int    api3_get_Nz(void){ return gdev.Nz; }
 int    api3_get_conv(void){ return gdev.converged; }
 int    api3_get_iter(void){ return gdev.conv_iter; }
 double api3_get_res(void) { return gdev.conv_res; }
-double api3_get_xs(int i) { return gdev.xs[i]; }
-double api3_get_ys(int j) { return gdev.ys[j]; }
-double api3_get_zs(int l) { return gdev.zs[l]; }
+double api3_get_xs(int i) { return (gdev.allocated && gdev.xs && i>=0 && i<gdev.Nx) ? gdev.xs[i] : NAN; }
+double api3_get_ys(int j) { return (gdev.allocated && gdev.ys && j>=0 && j<gdev.Ny) ? gdev.ys[j] : NAN; }
+double api3_get_zs(int l) { return (gdev.allocated && gdev.zs && l>=0 && l<gdev.Nz) ? gdev.zs[l] : NAN; }
 double api3_get_Cref(void){ return gdev.Cref; }
 long   api3_get_stat(int w){
     switch(w){ case 0: return gdev.pcg_its; case 1: return gdev.bicg_its;
@@ -4439,6 +4630,7 @@ static double node_Jc(const Dev *d, size_t k, int ax, int hole){
 
 /* Derived quantity at node k (display gauge: vacuum level = -phi) */
 static double node_val(const Dev *d, int which, size_t k){
+    if(!d->allocated || !d->have_solution || !d->phi || k>=NN(d)) return NAN;   /* bad index / nothing solved */
     const Mat *m=&d->mats[d->mat_idx[k]]; int kd=d->kind[k];
     switch(which){
     case 0: return d->phi[k];
@@ -4477,18 +4669,37 @@ static double node_val(const Dev *d, int which, size_t k){
         if(!d->tr_rp || d->tr_rp[k]>=d->tr_rp[k+1]) return 0.;
         if(which==32){ double s=0.; for(int e=d->tr_rp[k];e<d->tr_rp[k+1];e++) s+=d->tr_N[e]; return s; }
         double r,a,b,rho,drho; trap_eval(d,k,d->n[k],d->p[k],&r,&a,&b,&rho,&drho); return rho; }
+    case 33: {                                                     /* impact-ionisation generation (m^-3 s^-1) */
+        if(d->kind[k]!=K_SEMI || !d->gii) return 0.;
+        double v; if(d->unstr) v=d->gvol[k]; else { int i,j,l; unidx(d,k,&i,&j,&l); v=volume(d,i,j,l); }
+        return v>0. ? d->gii[k]/v : 0.; }
     }
     return 0.;
 }
-/* which = 0..32: phi,n,p,Ec,Ev,Efn,Efp,Jx,Jy,Jz,mun,mup,R,kind,Nnet,phin,phip,Nf,
+/* which = 0..33: phi,n,p,Ec,Ev,Efn,Efp,Jx,Jy,Jz,mun,mup,R,kind,Nnet,phin,phip,Nf,
    contact, dEg_bgn, Jn_x,Jn_y,Jn_z, Jp_x,Jp_y,Jp_z, ni_eff, J_tunnel,
    Lambda_n, Lambda_p (quantum potentials, eV), interface distance, trapped
-   charge (elementary charges/m^3, signed) and total trap density (m^-3) */
+   charge (elementary charges/m^3, signed), total trap density (m^-3) and
+   impact-ionisation generation (m^-3 s^-1) */
 void api3_bulk_copy(int which,double *out){
     Dev *d=&gdev; if(!d->allocated) return;
     size_t N=NN(d);
     #pragma omp parallel for schedule(static) if(N>PAR_MIN)
     for(size_t k=0;k<N;k++) out[k]=node_val(d,which,k);
+}
+/* Electron and hole numbers in the semiconductor: out[0] = sum n dV,
+   out[1] = sum p dV (dimensionless).  The stored charge of a bias point:
+   differences between neighbouring points give charge-control
+   capacitances, e.g. the quasi-static f_T = g_m / (2 pi q dN_base/dV_BE). */
+void api3_carrier_sums(double *out){
+    Dev *d=&gdev; out[0]=out[1]=0.; if(!d->allocated) return;
+    size_t N=NN(d); double sn=0., sp=0.;
+    for(size_t k=0;k<N;k++){          /* serial: the same bits on every run */
+        if(d->kind[k]!=K_SEMI) continue;
+        double v; if(d->unstr) v=d->gvol[k]; else { int i,j,l; unidx(d,k,&i,&j,&l); v=volume(d,i,j,l); }
+        sn+=d->n[k]*v; sp+=d->p[k]*v;
+    }
+    out[0]=sn; out[1]=sp;
 }
 double api3_get_phi(int k){ return node_val(&gdev,0,(size_t)k); }
 double api3_get_n(int k)  { return node_val(&gdev,1,(size_t)k); }

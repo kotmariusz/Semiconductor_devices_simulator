@@ -1,9 +1,9 @@
-# SemiSim 3D 0.1 — user manual
+# SemiSim 3D 0.2 — user manual
 
 The long form of the program's Help (F1). Short version: [README](../README.md);
 every reference: [SOURCES](SOURCES.md).
 
-**Status.** 0.1 is the first public version and it is still being tested. The
+**Status.** 0.2 is an early public version and it is still being tested. The
 physics is checked against textbook theory (see Validation), not yet against
 measurements of real devices; the effects under Limitations are not modelled.
 Check important results independently. Free to use, copy, change and share
@@ -18,9 +18,9 @@ solution), or triangular prisms (`semimesh.py`) that follow round and sloped
 interfaces. The core (`semiconductor_3d.c`, OpenMP) returns bands, quasi-Fermi
 levels, fields, currents, mobilities, recombination and trapped charge; the
 interface (`main.py`, Python/Tk) builds the device, runs bias points and sweeps
-and draws the results. The 47 templates range from textbook diodes to FinFETs,
-a CMOS inverter, SiC/GaN power devices and parts modelled on real components
-(device class only - not their real dies).
+and draws the results. The 55 templates range from textbook diodes to FinFETs,
+a CMOS inverter, SiC/GaN power devices, comb-emitter power BJTs and parts
+modelled on real components (device class only - not their real dies).
 
 ## Install
 
@@ -107,9 +107,10 @@ View → `WSL: turn maximise into fill screen` switches this off.
   density, levels) and random scatter (see Defects).
 * `Solver`: temperature, physical models (band-gap narrowing, τ(N), velocity
   saturation, quantum confinement, Lombardi surface mobility, gate
-  tunnelling, metal-contact thermionic emission and barrier tunnelling), the
-  background SRH lifetime, iteration limits, tolerances and CPU threads. Each
-  template sets the model switches it was designed with.
+  tunnelling, metal-contact thermionic emission and barrier tunnelling,
+  impact ionisation), the background SRH lifetime, iteration limits,
+  tolerances and CPU threads. Each template sets the model switches it was
+  designed with.
 * `Sweep`: the swept terminal, range and points, a floating terminal and the
   plotted current.
 
@@ -131,6 +132,21 @@ View → `WSL: turn maximise into fill screen` switches this off.
   between the mesh nodes, so the count is not limited by the mesh; denser
   arrows are drawn shorter and thinner. Arrow length is log-scaled, so weak
   and strong currents both show.
+* `Current` → `Map` puts the device structure under the arrows of the
+  in-plane map: `|J|` (the current density, as before), `structure` (the
+  region colours) or `|J| + structure` (both, the structure see-through on
+  top). `Structure in 3-D` draws the regions and contacts around the 3-D
+  arrows. The `Opacity` slider next to them sets how see-through that
+  structure is; parts hidden in `Layers…` stay hidden there, and a part given
+  its own opacity in `Layers…` keeps it.
+* `Panels ▾` (every plot tab) hides and shows the tab's panels; the panels
+  left share the room. `Layers…` (Structure and Current tabs) hides parts of
+  the 3-D view and sets the opacity of each part
+  (see [BJT effects, breakdown and comparing designs](#bjt-effects-breakdown-and-comparing-designs)).
+* `Current` → `Contact` adds the panel `Current under a contact`; the I-V tab
+  has `Pin sweep`, `Pins…`, `A/B compare…` and `Table…` (the parameters of
+  the last and the pinned sweeps side by side), and a BJT panel (gain and f_T
+  against I_C) for Gummel sweeps.
 * Region labels sit where they fit and never cover each other, the line cuts
   mark the regions they cross in a strip above the curves, and the semi-log
   I-V panel spans the currents that matter (a curve far below them is listed
@@ -166,12 +182,25 @@ zero (a bracketed secant on the continued solution). This turns a sweep into
 a transfer curve (the inverter's unloaded output). With `Adaptive
 refinement`, steep parts of the curve get extra points automatically.
 
-**Extracted parameters** (I-V and Results tabs): diode ideality and J₀; for
-gate sweeps SS, V_th (maximum-g_m extrapolation, plus constant current
-100 nA·W/L where the template gives W/L) and I_on/I_off; for gate-current
+**Extracted parameters** (I-V and Results tabs): diode ideality and J₀ (a
+straight line through the steepest-ideal part of ln J spanning two decades,
+with kT/q at the sweep's temperature); for gate sweeps SS (the steepest
+decade above the resolution floor), V_th (at |V_DS| ≤ 0.1 V the tangent at
+maximum g_m minus V_DS/2, in saturation the √I_D extrapolation - Ortiz-Conde
+et al. 2002 - plus constant current 100 nA·W/L where the template gives
+W/L) and I_on/I_off; for gate-current
 sweeps the peak J_G and J_G at ±0.5 and ±1 V; for transfer curves V_M, the
 maximum gain, V_OH/V_OL, V_IL/V_IH, the noise margins and the peak supply
-current; a heuristic current knee for blocking sweeps.
+current; for output curves the Early voltage; for Gummel plots of a BJT the
+current gain and f_T,max (f_T = ΔI_C / 2πΔQ between neighbouring points, at
+their logarithmic-mean I_C); the avalanche breakdown voltage when impact
+ionisation is on (a heuristic current knee otherwise). Pinned sweeps get the
+same list.
+
+**Open terminal.** A floating terminal whose own swept terminal is the one
+observed (`Plot current of` = the swept terminal) is drawn as an I-V curve,
+not a transfer curve, with the open terminal's voltage on the semi-log
+panel's right axis: the open base of a BV_CEO measurement.
 
 ## Contact metals
 
@@ -315,10 +344,121 @@ quantum confinement depends on where the MLDA potential ends at the gate edge
 similar small amount in the other direction (BJT −0.8 → +1.6 %). Compare
 with a uniformly finer mesh when it matters.
 
+## BJT effects, breakdown and comparing designs
+
+**Impact ionisation (avalanche breakdown).** Solver page → `Impact
+ionisation (avalanche breakdown)`. Carriers accelerated by a high field
+create electron-hole pairs at G = (α_n|J_n| + α_p|J_p|)/q, with the
+Chynoweth law α = γ a exp(−(γ b/F)^m), F the field along each carrier's
+current and γ = tanh(ħω/2kT₀)/tanh(ħω/2kT) the optical-phonon temperature
+factor (ħω = 63 meV, T₀ = 300 K), so breakdown voltages rise with
+temperature. Coefficients: Si van Overstraeten - de Man (holes in two field
+ranges split at 4e5 V/cm), GaAs Bulman et al., 4H-SiC Hatakeyama et al.
+(along the c axis), GaN Ji et al.; Ge, InP and the alloys have none. The
+generation is a source in both continuity equations, updated every Gummel
+iteration, and enters the balance of floating regions. The 3D Slicer
+quantity `log10 G avalanche` shows where the pairs are made.
+
+Close to breakdown the multiplication grows without bound (~10-50) and the
+Gummel iteration, which solves the equations one after the other, stops
+converging. The I-V tab reports BV where 1/I, extrapolated from the last
+converged points, reaches zero (1/I falls to zero at breakdown, for a
+junction and for an open-base transistor alike) - or, with `BV knee` > 0,
+where the current density reaches that value. Past breakdown the current is
+held back only by the series resistance and the space charge of the
+avalanche carriers; the solver may converge again on that high-current
+branch (a jump in the curve). With impact ionisation on, a sweep ends after
+two failed points in a row. Checked in validate.py section 17.
+
+**Gain and f_T (BJT panel).** Every sweep point stores the electron and hole
+charge in the device. For a Gummel sweep - the base swept, the collector
+observed, V_CE held - the I-V tab's third panel draws β = I_C/I_B and the
+quasi-static f_T = g_m / (2π C_in) against I_C, with g_m = dI_C/dV_BE and
+C_in = dQ/dV_BE (Q: the charge of the base's majority carrier, holes for an
+NPN): the charge-control estimate of where |h21| falls to 1. It contains the
+emitter and collector depletion charges and the stored minority charge -
+including the charge in the collector once the base pushes into it at high
+current (the Kirk effect), which is what makes f_T fall past its peak. It
+leaves out the non-quasi-static phase delay and every parasitic outside the
+simulated cell (pads, interconnect, base resistance beyond the cell).
+
+**Early voltage.** For output curves (collector or drain swept and observed,
+three or more terminals) the flat part of the curve - after the saturation
+knee, before any breakdown upturn - is fitted with a straight line: V_A =
+I/g_o − V, where the dotted line meets I = 0 at −V_A (for a MOSFET, 1/λ).
+
+**Current crowding.** Current tab → `Contact`: the panel `Current under a
+contact` shows the current density through the chosen contact or net, node
+by node - a profile across it in 2-D sections, a map over it in 3-D devices -
+with the ratios J max/mean and centre/edge. Face contacts only.
+
+**Comparing designs.**
+
+* `Pin sweep` (I-V tab) keeps the last sweep as a reference curve. Later
+  sweeps of the same swept terminal are drawn over it, dashed in the pin's
+  colour, on the linear, semi-log and BJT panels, and its parameters are
+  listed under those of the last sweep.
+* `Pins…` shows or hides each pin (click `Shown`), renames it (double-click),
+  changes its colour, removes it, exports all pins to CSV, and puts the
+  fields of a pin's last bias point in the solution tabs (`Show fields`).
+* `Table…` (I-V tab) lists the parameters of the shown pins and the last
+  sweep side by side, one column each: the device, the sweep, the
+  temperature and physics models (`default` = the Solver page's default
+  switches, then `+` and `−` what differs), then every parameter the I-V tab
+  extracts
+  - V_th (max-g_m and constant-current), SS, g_m,max, I_on, I_off and their
+  ratio; diode n and J_0; V_A and g_o; BV; β,max, f_T,max and the currents
+  where they occur; V_M, V_OH/V_OL, V_IL/V_IH and the noise margins of an
+  inverter - and the output current at the end of each sweep. Pick the
+  `Reference` column; the other columns show their difference from it:
+  voltages in mV or V (V_th, SS, V_M, n), currents and frequencies as ratios
+  (×), gain, f_T, V_A and BV also in per cent. `Show` switches between values,
+  values with differences and differences only; `Hidden pins too` adds the
+  hidden pins. `Copy` puts the table on the clipboard tab-separated (paste it
+  into a spreadsheet), `Export CSV…` writes it with the numbers in base
+  units (V, A, S, Hz). A `*` marks a value with a note in the I-V tab (V_th
+  or f_T still rising at the sweep end). The table follows every new sweep
+  and pin.
+* `A/B compare…` captures two designs and runs the Sweep page's sweep on both,
+  one after the other. A design is the whole editor state - structure, mesh,
+  contact voltages, physics switches, temperature and an open (floating)
+  terminal - as it is when you press `Capture the editor's device`; `Load
+  into the editor` brings it back. The templates of the `BJT effects &
+  breakdown` group have variant pairs: choose one under `Variants`, press
+  `→ A`, choose the other, `→ B`, then `▶ Run A and B`. Both results become
+  pins (A blue, B pink); older pins are hidden. B can differ from A in
+  anything: a doping, a finger layout, one physics switch, the temperature.
+
+**Visibility.** `Panels ▾` on every plot tab hides panels so the others get
+the room: the Structure tab's 3-D view, cross-section and legend; the 3D
+Slicer's 3-D view and its three planes; the band diagram and ribbon; the five
+Current panels; E-field and mobility; the three I-V panels. `Layers…` (on
+the Structure and Current tabs) lists every region, contact and the defects
+with its opacity. Click `Shown` to hide or show a part. Select one or more
+parts (Ctrl or Shift for several) and move `Opacity of the selected parts` to
+give them their own opacity, e.g. a see-through substrate under an opaque
+channel; `Auto` hands them back to the sliders for all regions and all
+contacts. `See-through contacts` sets the contacts to 0.15, `Insulators in
+3-D` draws the oxides too, and `Apply to the cross-section too` uses the same
+choices in the Structure tab's section. The Current tab's structure overlay
+(`Map`, `Structure in 3-D`) follows the same list: hidden parts stay hidden,
+the others take the tab's own `Opacity` unless they have one of their own.
+
+**The demonstration templates** (group `BJT effects & breakdown (A/B
+variants)`, 2-D sections, seconds per bias point):
+
+| Template | Variants (A/B) | Sweep | What to look at |
+|---|---|---|---|
+| BJT effects: Kirk effect (f_T vs I_C) | collector 1e16 / 1e17 cm⁻³ | Base 0.6 → 1.1 V at V_CE = 2 V | f_T peaks at 6.3 GHz near 1.2e-5 A per cell (6.7e3 A/cm² over the emitter) with the light collector, 11.5 GHz near 1.6e-5 A with the heavy one; β 36 / 60 at low current |
+| BJT effects: emitter current crowding | one 20 µm emitter / four 5 µm fingers | Base 0.6 → 0.98 V at V_CE = 2 V | Current tab, `Contact` = Emitter: at 0.98 V the middle of the wide emitter carries 1.4 % of its edge current density; the fingers deliver 3.5× its collector current for the same V_BE |
+| BJT effects: Early effect (output curve) | base 5e16 / 2e17 cm⁻³ | Collector 0 → 5 V at V_BE = 0.75 V | V_A = 5.6 V (light base) / 42 V (heavy base, lower β) |
+| Avalanche: Si p+n diode breakdown | impact ionisation on / off | Anode 0 → −56 V | BV ≈ 52 V (ionisation integral 51.9 V, Baliga 53.4 V); with impact ionisation off no breakdown at all |
+| Avalanche: NPN BV_CBO, BV_CES, BV_CEO | base shorted to the emitter / base open / emitter left out (pick two) | Collector 0 → 60 V | BV_CBO ≈ 56 V > BV_CES ≈ 34 V (the avalanche holes flowing to the base contact turn the emitter edge on) > BV_CEO ≈ 21 V (open base: M = 1 + 1/β; Miller's BV_CBO/β^(1/4) gives 22 V) |
+
 ## Validation
 
-`python3 validate.py` runs 120 checks against closed-form theory (about 5 min
-on two cores); `--templates` adds section 9: all 167 checks in about 10 min.
+`python3 validate.py` runs 158 checks against closed-form theory (about 10 min
+on two cores); `--templates` adds section 9: all 213 checks in about 21 min.
 Each check prints PASS/FAIL with its tolerance, and the script doubles as an
 example of driving the core without the interface. The references are in
 [SOURCES](SOURCES.md).
@@ -333,7 +473,7 @@ example of driving the core without the interface. The references are in
 | 6 | MOS capacitor: flat band, ψₛ(V_T) = 2φ_F, inversion charge | 0.06 mV; dQ/dV = 0.96 C_ox |
 | 7 | Long-channel NMOS, linear region: I_D vs μQ_inv V_DS/L | +1.25 % |
 | 8 | 2-D BJT (band-gap narrowing, τ(N)): base current vs Gummel number | within 0.45 % |
-| 9 | (`--templates`) all 47 templates converge at their default bias | all converge |
+| 9 | (`--templates`) all 55 templates converge at their default bias | all converge |
 | 10 | CMOS inverter, FinFET | V_T ±0.48 vs ±0.46 V; V_M 1.14 V; SS 67 mV/dec, DIBL 28 mV/V |
 | 11 | Gate tunnelling: Tsu-Esaki kernel, thin SiO2, high-k, Fowler-Nordheim | kernel 0.01 %; 81 A/cm² at 1 V (1.2 nm); FN slope 2.25e10 V/m |
 | 12 | MLDA quantum confinement, Lombardi mobility | ΔV_th +57 mV, centroid 0.82 nm; universal curve within 18 % |
@@ -341,6 +481,8 @@ example of driving the core without the interface. The references are in
 | 14 | Schottky diodes vs Crowell-Sze; contact resistivity vs Tsu-Esaki; Al ohmic on n⁺, rectifying on n⁻ | within 0.22 %; within 0.3–5 % over 8 decades |
 | 15 | Defects: compensation, trap-limited lifetime, D_it swing, oxide charge, void, metal particle, numbers of states | exact … 1.25 % |
 | 16 | Adaptive refinement vs finer meshes; sweep predictor | coarse diode 3.0 % → 0.04 %; same currents, 671 vs 829 iterations |
+| 17 | Avalanche breakdown of Si p⁺/n junctions vs the ionisation integral and Baliga; 400 K; stored charge; short-base diode transit time; Early voltage and f_T extraction | BV within 0.2 % of the ionisation integral (1e16, 1e17 cm⁻³, 400 K), 3 % under Baliga; BV ×1.21 at 400 K; charge sums exact; transit time −3 %; V_A, f_T, β within 0.03 % |
+| 18 | Material parameters and analysis: Si mobility vs Masetti (1e15–1e20, 300 and 400 K), 4H-SiC holes vs Schaffer, nᵢ and V_bi at 250/400 K, the 32-contact limit, NaN from bad getter indices, ideality factor (n = 1 and 1.7, series resistance, 250–400 K), V_th (linear and saturation), SS above a noisy floor | mobility exact; n within 0.15 %; V_th exact; SS 0.0003 % |
 
 ## Device templates
 
@@ -376,6 +518,8 @@ through that terminal. y is depth: the top surface is y = 0 in every template.
 | RW: BPW34, Ge 1550 nm photodiodes | PIN photodiodes, dark | reverse bias | Anode sweep |
 | RW: AlGaAs IR LED, PERC cell | DH emitter, thin-wafer PERC cell (dark) | 0 V | Forward positive |
 | RW: BC547 | Small-signal NPN | V_BE 0.7, V_CE 3 V | Base |
+| **RW: PNP / NPN power BJT 250 V (MJ21193 / MJ21194)** | Audio power transistors with a comb emitter: a 3-D section (0.28 × 0.20 mm) of interleaved emitter and base-contact fingers on bus bars, 7 µm base, 30 µm collector drift (5e14); the section plane opens as a top view of the two combs | V_BE ∓0.75, V_CE ∓5 V (PNP negative) | Base ∓0.45…−0.85 / +0.80 V: hFE 44 (PNP) / 56 (NPN), falling at high current as the collector goes into quasi-saturation (PNP 17 at ~17 A, NPN 46 at ~33 A for a 5 × 5 mm die, ×450 the section). Heavy: ~30 s per point |
+| **RW: Lateral PNP LDO 1 A (LM2940)** | One round-emitter cell (simulated as a quarter, triangular mesh) of the lateral PNP pass transistor of a bipolar LDO: 12.7 µm p emitter, 5 µm lateral base in 3e15 n-epi, p collector ring, n⁺ buried layer, base contact through an n⁺ sinker | V_EB 0.85, V_EC 2 V, substrate −5 V: 2.8 mA per emitter at β 25 | Collector: V_EC 2 → 0.05 V (dropout). Below ~0.2 V the transistor saturates: I_C −60 % at 0.05 V, base current ×4, substrate current ×10 |
 | RW: IRLZ44N, superjunction 600 V, SiC 900 V (C3M) | Power MOSFETs in the on-state | V_DS 1–2 V | Drain output curve |
 | RW: IGBT 1200 V (IKW40N120) | Field-stop trench IGBT with a transparent collector | V_GE 15, V_CE 1.5 V | Collector 0…1.8 V |
 | RW: GaN RF HEMT 28 V, GaN HEMT 650 V (GS66508) | RF HEMT; e-mode p-GaN gate | V_D 28 / 1 V | Drain / gate |
@@ -383,7 +527,12 @@ through that terminal. y is depth: the top surface is y = 0 in every template.
 
 For the blocking state of a power switch, set its gate to 0 V and sweep the
 drain or collector to the rated voltage. The field distribution and E_max are
-meaningful. There is no avalanche model (see Limitations).
+meaningful; switch on impact ionisation (Solver page) for the breakdown
+voltage itself.
+
+The group `BJT effects & breakdown (A/B variants)` - Kirk effect, emitter
+current crowding, Early effect, Si avalanche diode, NPN BV_CBO / BV_CES / BV_CEO - is
+described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdown-and-comparing-designs).
 
 ## How the core works
 
@@ -405,8 +554,8 @@ meaningful. There is no avalanche model (see Limitations).
   from the extrapolation of the last two. Steps that converge slowly (more
   than 25 iterations) are followed by 2.2× longer ones: there the iteration
   count is set by the Gummel contraction rate, not by the step length, so
-  fewer, longer steps are cheaper (−24 % iterations over the 47 templates'
-  default solves; e.g. the GaN RF HEMT 2.2× and the Si trench MOSFET 3.7×
+  fewer, longer steps are cheaper (−24 % iterations over the default solves
+  of the 47 templates of v0.1; e.g. the GaN RF HEMT 2.2× and the Si trench MOSFET 3.7×
   faster). MOS gates are ramped before the drain or collector.
 * **Sweep predictor.** When a solve continues the previous bias change in the
   same direction - the next point of a sweep, or the secant steps of a
@@ -435,20 +584,55 @@ meaningful. There is no avalanche model (see Limitations).
   above, new mesh lines, the old solution moved onto the new mesh by
   tri-linear interpolation (`api3_get_state` / `api3_set_state`), and a
   resolve without a bias ramp.
+* **Impact ionisation.** At every semiconductor node G = (α_n|J_n| +
+  α_p|J_p|)/q with the node currents from the face fluxes and F = |E·J|/|J|
+  (the field along each current), updated every Gummel iteration as an
+  explicit source of both continuity equations and of the floating-region
+  balance; Chynoweth α with the optical-phonon temperature factor.
+* **Stored charge.** `api3_carrier_sums` returns Σn dV and Σp dV; every sweep
+  point records them (the quasi-static f_T).
 * **Maximum principle, floating regions, mobility, recombination, MLDA,
   Lombardi, gate tunnelling, stop/progress, terminal currents:**
   quasi-Fermi potentials clamped to the span of the terminal voltages, a
-  balance step for floating quasi-neutral regions, Arora + Caughey-Thomas
-  velocity saturation, SRH τ(N) + Auger + radiative, Klaassen BGN, MLDA
+  balance step for floating quasi-neutral regions, Masetti (Si) and
+  Caughey-Thomas (other materials) mobility with velocity saturation, SRH τ(N) + Auger + radiative, Klaassen BGN, MLDA
   per-valley DOS cut at interfaces, Lombardi surface mobility, Tsu-Esaki/WKB
   gate tunnelling, cooperative stop, Kirchhoff-exact terminal currents with
   a round-off resolution floor.
 
 ## Limitations
 
-* **No impact ionisation or band-to-band tunnelling.** Avalanche and Zener
-  breakdown voltages are not predicted, and there is no GIDL. Blocking sweeps
-  give fields and leakage only; the I-V "knee" marker is a heuristic.
+* **Impact ionisation is local** (the field at each node - no dead space, no
+  energy relaxation): high-field regions shorter than ~100 nm break down at
+  too low a voltage. Near breakdown the Gummel iteration fails, so the
+  breakdown voltage comes from the current's runaway; snapback, second
+  breakdown and avalanche ruggedness are out of reach. The runaway shows only
+  when the leakage it multiplies lies above the current resolution: in very
+  small cells with long lifetimes, shorten the background lifetime (Solver
+  page, τ0) - it raises the leakage, not the breakdown voltage. No
+  coefficients for Ge, InP and the alloys. Off by default (Solver page).
+* **No band-to-band tunnelling.** Zener breakdown and GIDL are absent. It
+  also adds to avalanche breakdown above ~5e16 cm⁻³, and the silicon
+  ionisation coefficients are fitted for 1.75–6e5 V/cm: an abrupt Si junction
+  at 1e17 cm⁻³ breaks down at 14 V here against about 11 V in the classical
+  curves (Sze & Gibbons); at 1e16 cm⁻³ the 52 V agree with the literature.
+* **Currents near avalanche** are converged to their resolution floor; when
+  the multiplied current is below ~1e-16 A per cell it can still move by a
+  few per cent between solves (the floor in the results says by how much).
+* **Boltzmann statistics, full ionisation.** No Fermi-Dirac statistics
+  (degenerate n++/p++ layers, GaAs above ~4e17 cm⁻³ and HEMT channels are
+  approximate) and every dopant is ionised (p-type 4H-SiC with Al and p-GaN
+  with Mg are far too conductive).
+* **No negative differential mobility.** GaAs and InP electrons saturate
+  smoothly at v_sat (no transferred-electron peak, no Gunn effect): short
+  GaAs/InP channels carry 2–3× too little current near the peak field.
+* **Temperature.** Silicon's saturation velocity follows Canali et al.; the
+  other materials keep their 300 K saturation velocity, and the SiC and GaN
+  Auger and ionisation coefficients do not depend on temperature. Silicon's
+  nᵢ is 1.07e10 cm⁻³ at 300 K (Green's densities of states), 11 % above the
+  modern 9.65e9: saturation currents are ~23 % higher.
+* **f_T is quasi-static** (charge control, no AC analysis): no
+  non-quasi-static phase delay, no parasitics outside the simulated cell.
 * **No optical generation.** Solar cells and photodiodes are simulated dark.
 * **Quantum confinement is MLDA only** (no subband energies); heterostructure
   2DEGs stay classical. MLDA ends abruptly where a face gate ends, which makes
@@ -468,14 +652,18 @@ meaningful. There is no avalanche model (see Limitations).
   scatter.
 * **Drift-diffusion transport.** No ballistic transport, strain or
   remote-phonon scattering; Lombardi has Si parameters only.
-* **Not modelled:** self-heating, incomplete ionisation, field plates,
-  transients/AC.
+* **Not modelled:** self-heating, field plates, transients/AC.
 * **Adaptive mesh refinement** works on the rectangular mesh only; a new line
   runs through the whole device. It resolves what the indicator sees
   (space charge, band bending, quasi-Fermi curvature); quantities that hinge
   on something else are not improved.
-* **Low-current accuracy.** Near the resolution floor, currents are good to
-  about 0.1–1 %; below it they are noise (the GUI marks them).
+* **Low-current accuracy.** Currents are taken at the contacts, where they
+  are a small difference of large drift and diffusion terms: below about
+  1e-2 A/cm² they are good to 1e-4…1e-3 (they change by that much with the
+  bias path or the number of threads), near the resolution floor to about
+  0.1–1 %, and below it they are noise (the GUI marks them).
+* **Limits.** At most 32 contacts and 16 different materials (gate-stack and
+  defect materials count); more gives an error.
 * **Speed.** Gummel iteration is slow under strong high-level injection: the
   1200 V IGBT takes about 2 min at its default bias on two cores, most
   templates seconds. The Gummel loop stops converging in a few high-current

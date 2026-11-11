@@ -1,14 +1,18 @@
-# SemiSim 3D — semiconductor device simulator (v0.1)
+# SemiSim 3D — semiconductor device simulator (v0.2)
 
 A 3-D drift-diffusion simulator for semiconductor devices with a desktop
 interface: build a device from blocks of material and doping, solve it, and
-look at its bands, fields, current flow and I-V curves. A C core (OpenMP)
-does the numerics; the interface is Python/Tk. 47 ready-made devices are
-included: diodes, BJTs, MOSFETs, FinFETs, a CMOS inverter, JFETs, GaN HEMTs,
-Si and SiC power devices, solar cells, LEDs and photodiodes.
+look at its bands, fields, current flow and I-V curves - and compare
+designs side by side, curves and a table of their parameters. A C core (OpenMP) does the numerics; the interface is
+Python/Tk. 55 ready-made devices are included: diodes, BJTs (among them
+comb-emitter power transistors, the lateral PNP of an LDO regulator, and
+small sections that show the Kirk effect, emitter current crowding, the
+Early effect and avalanche breakdown), MOSFETs, FinFETs, a CMOS inverter,
+JFETs, GaN HEMTs, Si and SiC power devices, solar cells, LEDs and
+photodiodes.
 
-> **v0.1 is the first public version and a test version.** It is still being
-> tested and its results can be wrong - see [Status](#status).
+> **v0.2 is an early public version and still a test version.** Its results
+> can be wrong - see [Status](#status).
 
 ![FinFET with a tapered, rounded fin on the triangular-prism mesh](docs/screenshots/finfet_structure.png)
 
@@ -16,6 +20,9 @@ Si and SiC power devices, solar cells, LEDs and photodiodes.
 |---|---|
 | ![Current flow in an n-JFET](docs/screenshots/jfet_current.png) | ![CMOS inverter transfer curve](docs/screenshots/cmos_transfer.png) |
 | ![Electron density in a gate-all-around nanowire FET](docs/screenshots/gaa_slicer.png) | ![A diode with a metal particle, a void and a dislocation](docs/screenshots/defects_structure.png) |
+| ![Comb (interdigitated) emitter of the MJ21193-like power PNP, top view](docs/screenshots/comb_bjt_structure.png) | ![Lateral PNP of an LDO regulator going into dropout: collector, base and substrate currents](docs/screenshots/ldo_dropout.png) |
+| ![A/B compare: Gummel plots, gain and f_T of an NPN with a 1e16 and a 1e17 collector (Kirk effect)](docs/screenshots/kirk_ab_iv.png) | ![Emitter current crowding: current density map and the current under a 20 um emitter](docs/screenshots/crowding_current.png) |
+| ![Current arrows through a FinFET with the device structure drawn see-through around them](docs/screenshots/current_structure.png) | ![Parameter table: V_th, SS and I_on/I_off of an NMOS at 300, 350 and 400 K with their differences](docs/screenshots/param_table.png) |
 
 ## Install
 
@@ -55,10 +62,11 @@ maximise button). On a Mac, ⌘R runs and ⌘. stops.
 
 ## Status
 
-- The physics is checked against textbook theory (`validate.py`, 167
+- The physics is checked against textbook theory (`validate.py`, 213
   checks), not yet against measurements of real devices.
-- Results can be wrong, and avalanche breakdown, band-to-band tunnelling,
-  light, self-heating and transients are not modelled
+- Results can be wrong; band-to-band tunnelling, light, self-heating and
+  transients are not modelled, avalanche breakdown is a local-field model
+  and f_T a quasi-static estimate
   ([Limitations](docs/MANUAL.md#limitations)). Check anything important
   independently.
 - `RW:` devices follow the class and ratings of real parts, not their dies.
@@ -79,6 +87,10 @@ Problems and ideas:
 
 [MIT](LICENSE): free to use, copy, change and share for any purpose, as long
 as the copyright and licence notice stay with it. No warranty.
+
+Part numbers and company names in the device templates only identify the
+parts the templates are modelled on; they belong to their owners, who are not
+connected with this project.
 
 ## How it was made
 

@@ -129,11 +129,11 @@ _p("Pt (platinum, lifetime control)", "Point defects & contamination", "uniform"
    density=1e14, shape="everywhere", host="Si")
 _p("Neutron damage (Si, Perugia model)", "Radiation damage", "fluence",
    "Displacement damage by 1-MeV-equivalent neutrons, the three-level 'Perugia' trap model for "
-   "p-type FZ silicon (Petasecca et al., IEEE TNS 53, 2971, 2006): acceptors Ec − 0.42 eV (σn 2e-15, "
-   "σp 2e-14, η 1.613 cm⁻¹) and Ec − 0.46 eV (5e-15/5e-14, η 0.9) and a donor Ev + 0.36 eV "
-   "(2.5e-14/2.5e-15, η 0.9). Density = fluence Φeq (n_eq/cm²); level densities η·Φ.",
-   levels=[L("A", "Ec", 0.42, 2e-15, 2e-14, 1.613), L("A", "Ec", 0.46, 5e-15, 5e-14, 0.9),
-           L("D", "Ev", 0.36, 2.5e-14, 2.5e-15, 0.9)], density=1e13, shape="everywhere", host="Si")
+   "p-type FZ silicon (Petasecca et al., IEEE TNS 53, 2971, 2006): acceptors Ec − 0.42 eV (σn 9.5e-15, "
+   "σp 9.5e-14, η 1.613 cm⁻¹) and Ec − 0.46 eV (5e-15/5e-14, η 0.9) and a donor Ev + 0.36 eV "
+   "(3.23e-13/3.23e-14, η 0.9). Density = fluence Φeq (n_eq/cm²); level densities η·Φ.",
+   levels=[L("A", "Ec", 0.42, 9.5e-15, 9.5e-14, 1.613), L("A", "Ec", 0.46, 5e-15, 5e-14, 0.9),
+           L("D", "Ev", 0.36, 3.23e-13, 3.23e-14, 0.9)], density=1e13, shape="everywhere", host="Si")
 _p("Ionizing dose (MOS: oxide charge + D_it)", "Radiation damage", "interface",
    "Total-ionizing-dose damage of a MOS interface: holes trapped in the oxide near the interface "
    "(fixed positive charge, default 5e11 q/cm²) and radiation-generated interface traps "

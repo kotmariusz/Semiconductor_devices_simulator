@@ -24,7 +24,7 @@ jobs:
       - name: Core build info
         run: python3 semibuild.py --check
       - name: Validation (selected sections)
-        run: python3 validate.py --only 2,4,6,7,8,11,12,14,15
+        run: python3 validate.py --only 2,4,6,7,8,11,12,14,15,17,18
       - name: GUI smoke test
         run: |
           sudo apt-get install -y xvfb
@@ -42,6 +42,6 @@ jobs:
       - name: Core build info
         run: .venv/bin/python semibuild.py --check
       - name: Validation (selected sections)
-        run: .venv/bin/python validate.py --only 2,4,6,7,8,11,12,14,15
+        run: .venv/bin/python validate.py --only 2,4,6,7,8,11,12,14,15,17,18
       - name: GUI smoke test
         run: .venv/bin/python tests/gui_smoke.py

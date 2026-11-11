@@ -3,7 +3,7 @@
 Rectangular (graded tensor) or triangular-prism meshes (semimesh.py);
 dense nodes at junctions, interfaces and gates, coarse elsewhere."""
 
-import sys,os,ctypes,threading,time,traceback,platform,subprocess
+import sys,os,ctypes,threading,time,traceback,platform,subprocess,math
 IS_MAC=sys.platform=="darwin"
 def _is_wsl():
     """Windows Subsystem for Linux (its WSLg window system has quirks)."""
@@ -139,12 +139,11 @@ api_conI    = _f("api3_get_contact_I",D,I)      # terminal current (A, into devi
 api_conA    = _f("api3_get_contact_A",D,I)      # contact area (m^2)
 api_conIn   = _f("api3_get_contact_In",D,I)     # electron component (A)
 api_conF    = _f("api3_get_contact_Ifloor",D,I) # round-off resolution floor (A)
+api_conIraw = _f("api3_get_contact_Iraw",D,I)   # the contact's own flux (A), before the Kirchhoff choice
 api_stat    = _f("api3_get_stat",ctypes.c_long,I)
 api_Nx=_f("api3_get_Nx",I); api_Ny=_f("api3_get_Ny",I); api_Nz=_f("api3_get_Nz",I)
 api_conv=_f("api3_get_conv",I); api_iter=_f("api3_get_iter",I); api_res=_f("api3_get_res",D)
 api_xs=_f("api3_get_xs",D,I); api_ys=_f("api3_get_ys",D,I); api_zs=_f("api3_get_zs",D,I)
-_Gd={nm:_f(f"api3_get_{nm}",D,I) for nm in
-     ["phi","n","p","Ec","Ev","Efn","Efp","Jx","Jy","Jz","mun","mup","R"]}
 api_mat_ni=_f("api3_mat_ni",D,I); api_mat_Eg=_f("api3_mat_Eg",D,I)
 api_bulk=_f("api3_bulk_copy",V,I,DP)  # which, out
 IP=ctypes.POINTER(I)
@@ -367,7 +366,7 @@ METALS = {
 }
 METAL_NONE="(ideal / custom φm)"
 # semiconductor electron affinity and gap (eV, 300 K) as in the core
-SEMI_CHI = {"Si":4.05,"Ge":4.00,"GaAs":4.07,"InP":4.38,"4H-SiC":3.80,"GaN":4.10,"AlGaAs":3.827,"AlGaN":3.76}
+SEMI_CHI = {"Si":4.05,"Ge":4.00,"GaAs":4.07,"InP":4.38,"4H-SiC":3.70,"GaN":4.10,"AlGaAs":3.827,"AlGaN":3.76}
 SEMI_EG  = {"Si":1.124,"Ge":0.66,"GaAs":1.424,"InP":1.353,"4H-SiC":3.23,"GaN":3.43,"AlGaAs":1.80,"AlGaN":3.90}
 # Cowley-Sze: phi_Bn = S (phi_m - chi) + (1 - S) phi_pin  (slope S, pinned barrier phi_pin)
 SB_PIN   = {"Si":(0.27,0.80),"Ge":(0.05,0.58),"GaAs":(0.07,0.85),"InP":(0.10,0.48),
@@ -444,6 +443,27 @@ def _cur_unit(m):
     for sc,un in ((1.,"A"),(1e-3,"mA"),(1e-6,"µA"),(1e-9,"nA"),(1e-12,"pA"),(1e-15,"fA")):
         if m>=sc: return sc,un
     return (1e-15,"fA") if m>0 else (1.,"A")
+def grid_axes(fig,items,hspace=0.55,wspace=0.42):
+    """Axes for the visible panels of a tab: items = [(key, projection or
+    None)] in display order -> {key: axes}.  Up to 3 panels share one row,
+    4 make a 2 x 2 grid, 5-6 a 2 x 3 grid."""
+    n=len(items)
+    if n==0: return {}
+    nr,nc=(1,n) if n<=3 else ((2,2) if n==4 else (2,3))
+    gs=GridSpec(nr,nc,figure=fig,hspace=hspace,wspace=wspace)
+    out={}
+    for k,(key,proj) in enumerate(items):
+        r,c=divmod(k,nc)
+        out[key]=fig.add_subplot(gs[r,c],projection=proj) if proj else fig.add_subplot(gs[r,c])
+    return out
+
+def row_axes(fig,items,wspace=0.35):
+    """One row of panels: items = [(key, width ratio, projection or None)]."""
+    if not items: return {}
+    gs=GridSpec(1,len(items),figure=fig,wspace=wspace,width_ratios=[w for _,w,_ in items])
+    return {key:(fig.add_subplot(gs[k],projection=proj) if proj else fig.add_subplot(gs[k]))
+            for k,(key,_,proj) in enumerate(items)}
+
 def sax(ax,xl="",yl="",t="",log=False):
     ax.set_xlabel(xl,fontsize=8); ax.set_ylabel(yl,fontsize=8)
     ax.set_title(t,fontsize=9,fontweight="bold",pad=4); ax.grid(True,lw=0.35,ls="--")
@@ -479,6 +499,51 @@ def mfig(p,fs=(11,5.5)):
 # ══════════════════════════════════════════════════════════════
 #  DATA CLASSES
 # ══════════════════════════════════════════════════════════════
+DEVICE_FILE_VERSION=1
+def check_device_json(d):
+    """Check a device-file dict before anything of it is applied; raises
+    ValueError naming the first bad field (a bad file must leave the editor
+    untouched).  Returns a list of warnings (e.g. a newer file version)."""
+    def num(v,what,lo=None,hi=None,integer=False,strict_lo=False):
+        if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v):
+            raise ValueError(f"{what}: expected a number, got {v!r}")
+        if integer and int(v)!=v: raise ValueError(f"{what}: expected a whole number, got {v!r}")
+        if lo is not None and (v<=lo if strict_lo else v<lo): raise ValueError(f"{what} = {v!r} is too small")
+        if hi is not None and v>hi: raise ValueError(f"{what} = {v!r} is too large")
+        return v
+    if not isinstance(d,dict): raise ValueError("not a SemiSim 3D device file")
+    warn=[]
+    ver=d.get("version",1)
+    if isinstance(ver,(int,float)) and ver>DEVICE_FILE_VERSION:
+        warn.append(f"file version {ver} is newer than this program's {DEVICE_FILE_VERSION}: unknown fields are ignored")
+    for k in ("Lx","Ly","Lz","Nx","Ny","Nz","regs","cons"):
+        if k not in d: raise ValueError(f"missing field '{k}'")
+    for k in ("Lx","Ly","Lz"): num(d[k],k,0.,None,strict_lo=True)
+    for k in ("Nx","Ny","Nz"): num(d[k],k,2,100000,integer=True)
+    for nm in ("regs","cons"):
+        if not isinstance(d[nm],list): raise ValueError(f"'{nm}' must be a list")
+    for i,r in enumerate(d["regs"]):
+        if not isinstance(r,dict): raise ValueError(f"region {i+1}: not an object")
+        w=f"region {i+1} ({r.get('label','')})"
+        if r.get("mat") not in MATS: raise ValueError(f"{w}: unknown material {r.get('mat')!r}")
+        for a in ("x","y","z"):
+            v0=num(r.get(a+"0"),f"{w} {a}0"); v1=num(r.get(a+"1"),f"{w} {a}1")
+            if not v1>v0: raise ValueError(f"{w}: {a}1 = {v1} must be larger than {a}0 = {v0}")
+        if r.get("dtype") not in ("n","p","i",None,""): raise ValueError(f"{w}: doping type must be n, p or i")
+        num(r.get("doping",0.),f"{w} doping",0.,1e22)
+    for i,c in enumerate(d["cons"]):
+        if not isinstance(c,dict): raise ValueError(f"contact {i+1}: not an object")
+        w=f"contact {i+1} ({c.get('label','')})"
+        num(c.get("face"),f"{w} face",0,len(Con.FNAME)-1,integer=True)
+        num(c.get("bc"),f"{w} type (bc)",0,len(Con.BCNAME)-1,integer=True)
+        num(c.get("V",0.),f"{w} voltage",-1e5,1e5)
+    if len(d["cons"])>32: raise ValueError(f"{len(d['cons'])} contacts: the solver holds at most 32")
+    so=d.get("solver") or {}
+    if "T" in so: num(so["T"],"temperature (solver T)",20.,2000.)
+    ms=(d.get("mesh") or {}).get("type","rect")
+    if ms not in ("rect","tri"): raise ValueError(f"unknown mesh type {ms!r} (rect or tri)")
+    return warn
+
 class Reg:
     """Region: a box (nm), optionally cut to a cross-section outline (shape,
     semimesh.Shape: the region is its box intersected with the outline, or
@@ -1162,10 +1227,11 @@ def T_jfet():
 #   * A simulated unit cell (a few um wide) stands in for a die containing
 #     millions of such cells in parallel, so absolute currents are per-cm^2,
 #     not per-part amperes.
-#   * There is NO impact-ionisation model, so avalanche breakdown voltage is
-#     not predicted from first principles; the GUI's breakdown marker is a
-#     heuristic knee detector on the I-V curve. Blocking-state fields and
-#     depletion widths ARE computed correctly and can be compared with Ec.
+#   * Impact ionisation (avalanche) is OFF in these templates: switch it on
+#     in the Solver page to get a breakdown voltage (a local-field model;
+#     with it off the GUI's breakdown marker is a heuristic knee detector).
+#     Blocking-state fields and depletion widths are computed either way and
+#     can be compared with Ec.
 #   * Real Zener/tunnel behaviour needs band-to-band tunnelling, also absent.
 # ══════════════════════════════════════════════════════════════
 
@@ -1206,7 +1272,11 @@ def T_rw_zener_5v1():
     wide and the field reaches >5 MV/cm at 5 V - the tunnelling regime.
     NOTE: no band-to-band tunnelling model, so the 5.1 V knee is NOT
     reproduced. What IS correct and instructive is the ultra-thin, ultra-high
-    field depletion layer that makes Zener action possible."""
+    field depletion layer that makes Zener action possible.  Leave impact
+    ionisation off here: the local avalanche model ignores the dead space of
+    a 10 nm junction (carriers cannot gain the ionisation energy in so short
+    a distance) and would show an avalanche that a real junction this thin
+    does not have."""
     Lx,Ly,Lz = 400., 300., 400.; Nx,Ny,Nz = 6, 200, 6
     regs=[
         Reg("Si",0,0,0,Lx,Ly,Lz,      "n",2e19,"n+ cathode side"),
@@ -1484,6 +1554,397 @@ def T_rw_bjt_bc547():
                 dense_x=[],dense_y=[],dense_z=[],
                 desc="Si NPN small-signal BJT 45V (BC547-like) - 0.6um base")
 
+def _comb_bjt(pol):
+    """Vertical power BJT section with an interdigitated ('comb') emitter, full
+    3-D: x across the fingers, y = depth (top surface y = 0), z along them.
+    In x the section runs from the middle of one emitter finger to the
+    middle of the next-but-one (half fingers on the mirror planes x = 0 and
+    x = Lx, a whole one in the centre, two base-contact fingers between);
+    in z from the base bus (z = 0) to the emitter bus (z = Lz), so the
+    emitter and the base contact are two combs whose fingers interleave."""
+    Lx,Ly,Lz = 280000., 50000., 200000.; Nx,Ny,Nz = 44, 46, 22
+    e,b = ("p","n") if pol=="pnp" else ("n","p")    # emitter & collector type, base type
+    s = -1. if pol=="pnp" else 1.
+    wE,wB,g,bus = 80000., 30000., 15000., 20000.    # emitter / base-contact finger width, gap, bus width
+    yBC,yE,yB1,yB2,ySub = 2500., 5000., 8000., 12000., 42000.
+    NB1 = 2e16 if pol=="pnp" else 6e16              # active base (NPN: higher - electrons are faster)
+    efin=[(0.,wE/2),(Lx/2-wE/2,Lx/2+wE/2),(Lx-wE/2,Lx)]
+    bfin=[(wE/2+g,wE/2+g+wB),(Lx/2+wE/2+g,Lx/2+wE/2+g+wB)]
+    ze0,zb1 = bus+g, Lz-bus-g                       # emitter fingers start / base fingers end
+    regs=[
+        Reg("Si",0,0,0,Lx,Ly,Lz,        e,5e14,f"{e}- collector drift (30um)"),
+        Reg("Si",0,ySub,0,Lx,Ly,Lz,     e,1e19,f"{e}+ substrate (collector)"),
+        Reg("Si",0,0,0,Lx,yB2,Lz,       b,1e16,f"{b} base"),
+        Reg("Si",0,0,0,Lx,yB1,Lz,       b,NB1, f"{b} base (active)"),
+        Reg("Si",0,0,Lz-bus,Lx,yE,Lz,   e,1e19,f"{e}+ emitter bus"),
+    ]
+    for k,(x0,x1) in enumerate(efin):
+        regs.append(Reg("Si",x0,0,ze0,x1,yE,Lz-bus,e,1e19,f"{e}+ emitter finger {k+1}"))
+    regs.append(Reg("Si",0,0,0,Lx,yBC,bus,b,1e19,f"{b}+ base bus"))
+    for k,(x0,x1) in enumerate(bfin):
+        regs.append(Reg("Si",x0,0,bus,x1,yBC,zb1,b,1e19,f"{b}+ base finger {k+1}"))
+    ins=5000.                                       # contact windows 5 um inside the diffusions
+    fx=lambda a: a/Lx
+    fz=lambda a: a/Lz
+    cons=[con_part(2,0.,1.,fz(Lz-bus+ins),1.,0,0.,"Emitter bus",net="Emitter")]
+    for k,(x0,x1) in enumerate(efin):
+        cons.append(con_part(2,fx(x0+ins if x0>0 else 0.),fx(x1-ins if x1<Lx else Lx),fz(ze0+ins),fz(Lz-bus),
+                             0,0.,f"Emitter finger {k+1}",net="Emitter"))
+    cons.append(con_part(2,0.,1.,0.,fz(bus-ins),0,0.75*s,"Base bus",net="Base"))
+    for k,(x0,x1) in enumerate(bfin):
+        cons.append(con_part(2,fx(x0+ins),fx(x1-ins),fz(bus),fz(zb1-ins),0,0.75*s,f"Base finger {k+1}",net="Base"))
+    cons.append(con_full(3,0,5.*s,"Collector"))
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=Nx,Ny=Ny,Nz=Nz,regs=regs,cons=cons,
+                ivc=len(cons)-2,ivS=0.45*s,ivE=(0.85 if pol=="pnp" else 0.80)*s,ivN=9 if pol=="pnp" else 8,
+                ivnet="Base",ivout="Collector",
+                cut="Y",view=("XZ",1000.),
+                dense_x=sorted({v for xx in efin+bfin for v in xx if 0<v<Lx}),
+                dense_y=[yBC,yE,yB1,yB2,ySub],dense_z=[bus,ze0,zb1,Lz-bus],
+                desc=f"Si {pol.upper()} power BJT 250V/16A (MJ2119{3 if pol=='pnp' else 4}-like) - comb (interdigitated) emitter, 3-D section; Gummel plot (heavy: ~30 s per point)")
+
+def T_rw_bjt_mj21193():
+    """Si PNP power BJT, 250 V / 16 A / 250 W (MJ21193-like), comb structure.
+
+    An audio-amplifier output transistor: a vertical PNP whose emitter is a
+    comb.  The section (0.28 x 0.20 mm, full 3-D) holds one whole p+ emitter
+    finger (80 um wide) and two halves, joined by an emitter bus at the far
+    end, interleaved with two n+ base-contact fingers (30 um, 15 um gaps)
+    that hang from a base bus at the near end.  Every part of the emitter is
+    within 55 um of a base contact: the base current flows sideways under the
+    emitter, and its voltage drop would otherwise turn off the middle of a
+    wide emitter (current crowding at the edges).  onsemi builds the real
+    part with a 'Perforated Emitter' instead - one large emitter with an array
+    of holes for the base contact - which serves the same purpose.
+
+    Vertical structure: p+ emitter (1e19, 5 um), n base (2e16 to 8 um, 1e16 to
+    12 um: ~7 um of base under the emitter, for an f_T of a few MHz), p-
+    collector drift 5e14 x 30 um (a punch-through design: the depletion
+    reaches the substrate near 370 V, and at V_CB = 400 V the peak field is
+    2.4e5 V/cm, just under the avalanche field of such silicon - an ideal
+    BV_CBO a little above the 400 V rating), p+ substrate = collector
+    contact at the bottom.  Open the Structure tab: the section
+    plane starts as a top view (XZ, 1 um deep) that shows the two combs.
+
+    Bias: V_CE = -5 V, V_BE = -0.75 V; the sweep is the base, -0.45 to
+    -0.85 V (Gummel plot).  Simulated: hFE 44 and flat from nanoamps to
+    about a milliamp per section, 42 at 3.8 mA, 35 at 17 mA and 17 at 39 mA,
+    where the lightly doped collector goes into quasi-saturation (its ohmic
+    drop forward-biases the collector junction: see the hole density in the
+    drift region in the 3D Slicer).  Currents are per section: a 5 x 5 mm
+    die - the area the datasheet's C_ob <= 500 pF at V_CB = 10 V allows - is
+    ~450 sections, so 17 mA here is ~8 A and 39 mA ~17 A; the datasheet asks
+    hFE 25-75 at 8 A (V_CE = 5 V) and >= 8 at 16 A.  Not modelled:
+    second breakdown and self-heating (the SOA), AC; impact ionisation
+    (V_CEO(sus)) is off - the Solver page switches it on - and f_T is the
+    I-V tab's quasi-static estimate.  Heavy: ~20-30 s per bias point on two
+    cores (a mesh 3x finer moves the currents by ~6 %, hFE by ~2 %)."""
+    return _comb_bjt("pnp")
+
+def T_rw_bjt_mj21194():
+    """Si NPN power BJT, 250 V / 16 A / 250 W (MJ21194-like), comb structure.
+
+    The complement of the MJ21193 template - the same comb section, layers
+    and contacts with every doping type swapped: n+ emitter comb, p base,
+    n- collector drift (5e14 x 30 um), n+ substrate.  The active base is
+    doped higher (6e16 instead of 2e16): electrons cross a p base about
+    2.5x faster than holes cross an n base, so the same base would give the
+    NPN twice the gain - complementary pairs are matched by design like this.
+
+    Bias: V_CE = 5 V, V_BE = 0.75 V; the sweep is the base, 0.45 to 0.80 V
+    (Gummel plot).  Simulated: hFE 56 and flat up to ~20 mA per section
+    (~10 A for the 5 x 5 mm die, ~450 sections), still 46 at 74 mA (~33 A):
+    the n- drift conducts electrons ~3x better than the PNP's p- drift
+    conducts holes, so quasi-saturation sets in at higher currents than in
+    the PNP.
+    Datasheet: hFE 25-75 at 8 A, V_CE = 5 V.  Not modelled: second
+    breakdown, self-heating, AC (impact ionisation is off: Solver page).
+    Heavy: ~30 s per bias point."""
+    return _comb_bjt("npn")
+
+def T_rw_ldo_lateral_pnp():
+    """Lateral PNP pass transistor of a 1 A bipolar LDO regulator (LM2940-class), one emitter cell.
+
+    Bipolar low-dropout regulators of the LM2940 class pass the load current
+    through a PNP transistor, and in a junction-isolated bipolar process
+    that is a large LATERAL PNP: many small round p emitters (0.5 mil =
+    12.7 um across), each ringed by a p collector a few um away, in the
+    n-epi, with an n+ buried layer under the array.  National
+    Semiconductor's patents for such regulators describe 350 emitters, ~3 mA
+    each, for 1 A with 0.5 V dropout - the LM2940's ratings.  The template
+    is one emitter cell, simulated as its quarter (mirror planes x = 0 and
+    z = 0 through the emitter centre), on the triangular-prism mesh - the
+    outlines are true circles.  The section plane starts as a top view (XZ,
+    1 um deep).
+
+    Layers: p substrate (1e15); n-epi 3e15 x 10 um = the base; n+ buried layer
+    (1e19, 8-11 um) - it lowers the base resistance and turns back the holes
+    the emitter injects downwards, so few reach the substrate; p emitter
+    (radius 6.35 um) and p collector ring (radius 11.35-21 um), 6e18 x 3 um
+    (the NPN base diffusion), i.e. a 5 um lateral base; the base is
+    contacted at the cell corner through an n+ sinker that reaches the
+    buried layer (the NPN's collector reach-through) - with a shallow n+
+    contact instead, the lightly doped epi between contact and buried layer
+    debiases the emitter by tens of mV.
+
+    Bias - an LDO at full load: base 0 V, emitter +0.85 V (V_in), collector
+    2 V below the emitter (V_out), substrate (ground) at -5 V.  Run gives
+    0.69 mA per quarter cell = 2.8 mA per emitter at beta 25: 1 A from 350
+    emitters takes ~40 mA of base drive, the range of the LM2940's ground
+    current at 1 A (30 mA typical, 45 mA maximum).  Beta falls steeply with
+    current - 200 at 0.15 mA, 56 at 1.25 mA, 17 at 4.1 mA per emitter: high
+    injection in the 3e15 base - which is why these regulators draw tens of
+    mA at full load.  The sweep is the dropout: the collector from 2 V to
+    0.05 V below the emitter at fixed base drive.  The current holds to
+    within 6 % down to V_EC = 0.2 V, then the transistor saturates: the
+    collector junction forward-biases, I_C falls by 23 % at 0.1 V and 60 %
+    at 0.05 V, while the base current rises x4 and the substrate current
+    x10 - the extra ground current every PNP LDO draws in dropout.  The
+    datasheet's 0.5 V dropout at 1 A adds the metal, bond-wire and pin
+    resistances to the ~0.15 V of the transistor itself.  Currents are per
+    quarter cell (x4 per emitter, x1400 for 350 emitters).  The in-plane
+    mesh is what matters here (currents within ~1 % and beta within ~4 % of
+    a mesh with 2.6x the nodes); Run takes ~40 s on two cores, the sweep
+    ~2 min."""
+    Lx,Ly,Lz = 30000., 20000., 30000.; Nx,Ny,Nz = 80, 24, 80   # in-plane resolution matters, depth hardly
+    Re,WB,Rc2,Rbc = 6350., 5000., 21000., 5000.
+    yP,yEpi,yB0,yB1 = 3000., 10000., 8000., 11000.
+    VE,VC = 0.85, 0.85-2.0
+    emi=SM.Shape.circle("y",0.,0.,Re)
+    regs=[
+        Reg("Si",0,0,0,Lx,Ly,Lz,      "p",1e15,"p substrate"),
+        Reg("Si",0,0,0,Lx,yEpi,Lz,    "n",3e15,"n-epi (base)"),
+        Reg("Si",0,yB0,0,Lx,yB1,Lz,   "n",1e19,"n+ buried layer"),
+        Reg("Si",0,0,0,Lx,yP,Lz,      "p",6e18,"p collector ring",shape=SM.Shape.circle("y",0.,0.,Rc2)),
+        Reg("Si",0,0,0,Lx,yP,Lz,      "n",3e15,"n-epi (lateral base)",shape=SM.Shape.circle("y",0.,0.,Re+WB)),
+        Reg("Si",0,0,0,Lx,yP,Lz,      "p",6e18,"p emitter",shape=emi),
+        Reg("Si",0,0,0,Lx,yB0,Lz,     "n",1e19,"n+ sinker (base contact)",shape=SM.Shape.circle("y",Lx,Lz,Rbc)),
+    ]
+    w=0.6*Re                                      # emitter contact window (quarter)
+    r0,r1=Re+WB+1500.,Rc2-1500.                   # collector windows: over the ring
+    d0,d1=r0/np.sqrt(2)+200.,r1/np.sqrt(2)-200.
+    fx=lambda a: a/Lx
+    fz=lambda a: a/Lz
+    cons=[
+        con_part(2,0.,fx(w),0.,fz(w),0,VE,"Emitter"),
+        con_part(2,fx(r0),fx(r1),0.,fz(2500.),0,VC,"Collector x",net="Collector"),
+        con_part(2,fx(d0),fx(d1),fz(d0),fz(d1),0,VC,"Collector diagonal",net="Collector"),
+        con_part(2,0.,fx(2500.),fz(r0),fz(r1),0,VC,"Collector z",net="Collector"),
+        con_part(2,fx(Lx-0.6*Rbc),1.,fz(Lz-0.6*Rbc),1.,0,0.,"Base"),
+        con_full(3,0,-5.,"Substrate"),
+    ]
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=Nx,Ny=Ny,Nz=Nz,regs=regs,cons=cons,
+                ivc=1,ivS=VE-2.0,ivE=VE-0.05,ivN=21,ivnet="Collector",ivout="Collector",
+                mesh="tri",extrude="y",cut="X",view=("XZ",1000.),
+                dense_x=[Re,Re+WB,Rc2],dense_y=[yP,yB0,yB1,yEpi],dense_z=[Re,Re+WB,Rc2],
+                desc="Lateral PNP pass transistor of a 1A bipolar LDO (LM2940-class) - round emitter cell, quarter; dropout sweep (heavy: ~40 s)")
+
+# ── BJT effects: small 2-D sections that each show one non-ideal effect, with
+#    variants for the A/B compare (I-V tab ▸ A/B compare… ▸ Variants) ──────
+def _fx_bjt(NC=1e16,NB=1e17,tC=850.,Vbe=0.6,Vce=2.,emitter=True,base=True,ii=False):
+    """The planar NPN of the 'NPN BJT' template (x across, y = depth): n+
+    emitter at the top left, p+ extrinsic base at the top right, p base
+    (0.25 um below the emitter), n collector tC thick on an n+ buried layer
+    contacted at the bottom.  emitter = False leaves the emitter out (no
+    region, no contact: the collector-base diode); base = False leaves the
+    base contact out (the base region floats)."""
+    Lx,Lz=2000.,200.; yB=450.; yBL=yB+tC; Ly=yBL+300.
+    Ny=70 if tC<=1000 else 90
+    regs=[Reg("Si",0,0,0,Lx,Ly,Lz,      "n",NC,  f"n collector ({NC:.0e})"),
+          Reg("Si",0,yBL,0,Lx,Ly,Lz,    "n",1e19,"n+ buried layer"),
+          Reg("Si",0,0,0,Lx,yB,Lz,      "p",NB,  f"p base ({NB:.0e})")]
+    if emitter: regs.append(Reg("Si",0,0,0,900,200,Lz,"n",2e19,"n+ emitter"))
+    regs.append(Reg("Si",1400,0,0,Lx,200,Lz,"p",1e19,"p+ extrinsic base"))
+    cons=[]
+    if emitter: cons.append(con_part(2,0.,900/Lx,0.,1.,0,0.0,"Emitter"))
+    if base: cons.append(con_part(2,1400/Lx,1.,0.,1.,0,Vbe,"Base"))
+    cons.append(con_full(3,0,Vce,"Collector"))
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=52,Ny=Ny,Nz=4,regs=regs,cons=cons,
+                dense_x=[900.,1400.],dense_y=[200.,yB,yBL],dense_z=[],
+                models=M_DEFAULT|(M_II if ii else 0),cut="Y")
+
+def _kirk_bjt(NC):
+    t=_fx_bjt(NC=NC,Vbe=0.6,Vce=2.)
+    t.update(ivS=0.6,ivE=1.1,ivN=26,ivnet="Base",ivout="Collector",
+             desc=f"Kirk effect: NPN Gummel plot, collector {NC:.0e} cm^-3 - f_T and beta vs I_C (I-V tab, BJT panel)")
+    return t
+def T_fx_kirk():
+    """BJT effects: Kirk effect - f_T and gain against collector current.
+
+    The planar NPN of the 'NPN BJT' template with a 0.85 um n collector
+    (1e16 cm^-3) on its n+ buried layer; V_CE = 2 V, the sweep is the base
+    from 0.6 to 1.1 V (a Gummel plot).  The I-V tab's third panel shows the
+    current gain beta = I_C/I_B and the quasi-static transit frequency
+    f_T = g_m / (2 pi C_in) against I_C (C_in = dQ/dV_BE: the change of the
+    holes stored in the device).  At low current f_T rises with I_C (the
+    junction capacitances charge faster); it peaks at 6.3 GHz near I_C =
+    1.2e-5 A per cell (~6.7e3 A/cm2 over the emitter contact) and then falls:
+    the injected electrons outnumber the collector doping, the field at the
+    base-collector junction collapses and the base widens into the collector
+    (Kirk effect: base push-out at J_K ~ q v_sat N_C = 1.6e4 A/cm2 for 1e16),
+    together with high injection in the base.  Beta falls from 36 to 2 over
+    the same range.  See the holes spread into the collector in the 3D
+    Slicer (log10(p)) at the last sweep point.
+
+    Variants (A/B compare): the same transistor with a 1e17 collector - its
+    f_T peaks at 11.5 GHz near 1.6e-5 A (9e3 A/cm2): a heavier collector
+    pushes the Kirk effect to higher current (at the price of a lower
+    breakdown voltage and a larger collector capacitance).  Capture the two
+    with 'Variants → A / → B', then Run A and B.  ~25-40 s per sweep."""
+    return _kirk_bjt(1e16)
+
+def _crowd_bjt(nf):
+    """Emitter-crowding section (x across, y depth, 2-D): total emitter
+    width 20 um as one stripe (nf = 1) or nf narrow fingers, with p+ base
+    contacts beside every stripe; same width, layers and doping."""
+    Lx,Ly,Lz=43000.,2000.,1000.
+    yE,yB,yX,yC=150.,350.,300.,1500.
+    if nf==1:
+        bases=[(0.,10500.),(32500.,Lx)]; ems=[(11500.,31500.)]
+    else:
+        w=20000./nf; bases=[]; ems=[]; x=0.
+        bw=(Lx-20000.-2*nf*1000.)/(nf+1)
+        for k in range(nf):
+            bases.append((x,x+bw)); x+=bw+1000.; ems.append((x,x+w)); x+=w+1000.
+        bases.append((x,Lx))
+    regs=[Reg("Si",0,0,0,Lx,Ly,Lz,"n",3e16,"n collector (3e16)"),
+          Reg("Si",0,yC,0,Lx,Ly,Lz,"n",1e19,"n+ substrate"),
+          Reg("Si",0,0,0,Lx,yB,Lz,"p",1e17,"p base (1e17, ~10 kOhm/sq under the emitter)")]
+    for k,(a,b) in enumerate(ems): regs.append(Reg("Si",a,0,0,b,yE,Lz,"n",2e19,f"n+ emitter {k+1}"))
+    for k,(a,b) in enumerate(bases): regs.append(Reg("Si",a,0,0,b,yX,Lz,"p",1e19,f"p+ base {k+1}"))
+    cons=[con_part(2,a/Lx,b/Lx,0.,1.,0,0.0,f"Emitter {k+1}",net="Emitter") for k,(a,b) in enumerate(ems)]
+    cons+=[con_part(2,(a+500.)/Lx if a>0 else 0.,(b-500.)/Lx if b<Lx else 1.,0.,1.,0,0.6,f"Base {k+1}",net="Base")
+           for k,(a,b) in enumerate(bases)]
+    cons.append(con_full(3,0,2.0,"Collector"))
+    edges=sorted({v for ab in ems+bases for v in ab if 0<v<Lx})
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=150,Ny=48,Nz=2,regs=regs,cons=cons,
+                ivS=0.6,ivE=0.98,ivN=20,ivnet="Base",ivout="Collector",prof="Emitter",
+                dense_x=edges,dense_y=[yE,yX,yB,yC],dense_z=[],cut="X",models=M_DEFAULT,
+                desc=("Emitter current crowding: one 20 um emitter" if nf==1 else
+                      f"Emitter current crowding: {nf} x {20/nf:g} um emitter fingers")+
+                     " - Gummel plot; Current tab ▸ Contact = Emitter")
+def T_fx_crowding():
+    """BJT effects: emitter current crowding - one wide emitter vs narrow fingers.
+
+    A 2-D NPN section 43 um wide with 20 um of emitter, as ONE stripe with a
+    p+ base contact on each side.  The base current reaches the middle of
+    the emitter sideways through the thin p base under it (0.2 um, 1e17:
+    ~10 kOhm/sq, a 'pinched' base); its voltage drop lowers V_BE in the
+    middle, so at high current the emitter injects mainly at its edges -
+    emitter current crowding.  The sweep is the base (0.6 to 0.98 V,
+    V_CE = 2 V).  Open the Current tab with 'Contact' = Emitter (set by the
+    template): the 'Current under a contact' panel shows the current
+    density across the emitter - flat at low current, rising towards the
+    edges once the lateral base drop reaches a few kT/q (J_B ~ 5 A/cm2).
+    At the last point (0.98 V) the middle of the stripe carries 1.4 % of the
+    current density at its edges (J max / mean 12).
+
+    Variants (A/B compare): the same 20 um of emitter as four 5 um fingers
+    with a base contact between every two (the base drop falls with the
+    square of the width).  Run both: the Gummel plots part at high current -
+    at 0.98 V the fingers deliver 3.5x the collector current of the single
+    stripe (1.3x at 0.70 V, the same at 0.6 V), because the middle of the
+    wide emitter is turned off; each finger crowds far less (centre / edge
+    0.17 at 0.98 V, J max / mean 3.5).  This is why power and RF transistors
+    use comb (interdigitated) or perforated emitters (see the MJ21193 /
+    MJ21194 templates).  ~1 min per sweep."""
+    return _crowd_bjt(1)
+
+def _early_bjt(NB):
+    t=_fx_bjt(NC=1e16,NB=NB,Vbe=0.75,Vce=0.)
+    t.update(ivS=0.,ivE=5.,ivN=26,ivnet="Collector",ivout="Collector",
+             desc=f"Early effect: NPN output curve I_C(V_CE) at V_BE = 0.75 V, base {NB:.0e} cm^-3")
+    return t
+def T_fx_early():
+    """BJT effects: Early effect - output curve and Early voltage.
+
+    The planar NPN with a light p base (5e16 cm^-3, 0.25 um below the
+    emitter) at a fixed V_BE = 0.75 V; the sweep is the collector, 0 to 5 V
+    (output characteristic).  Past saturation (V_CE < ~0.3 V) the collector
+    current keeps rising: the base-collector depletion region widens with
+    V_CB and eats into the neutral base, so the electrons cross a thinner
+    base (base-width modulation).  The I-V tab fits the flat part of the
+    curve and reports the Early voltage V_A = I_C / g_o - V_CE (the dotted
+    line meets I = 0 at V = -V_A): about 6 V here, with beta ~ 90 at
+    V_CE = 2 V - I_C grows by 85 % from 0.2 to 5 V.
+
+    Variants (A/B compare): base 5e16 vs 2e17 cm^-3 - the heavier base is
+    barely depleted, so its V_A is ~42 V (I_C +13 % over the same range), but
+    its beta falls to ~17 and its I_C to a sixth: fewer electrons get across
+    the heavier base.  Every BJT design trades gain against Early voltage
+    this way; the HBT template shows the way out.  ~25 s per sweep."""
+    return _early_bjt(5e16)
+
+def _aval_diode(ii):
+    Lx,Lz=200.,200.; Wp,Wn,Wnp=1000.,4000.,500.; Ly=Wp+Wn+Wnp
+    regs=[Reg("Si",0,0,0,Lx,Ly,Lz,"n",1e16,"n (1e16)"),
+          Reg("Si",0,0,0,Lx,Wp,Lz,"p",1e19,"p+ anode"),
+          Reg("Si",0,Wp+Wn,0,Lx,Ly,Lz,"n",1e19,"n+ cathode")]
+    cons=[con_full(2,0,0.,"Anode"),con_full(3,0,0.,"Cathode")]
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=3,Ny=260,Nz=3,regs=regs,cons=cons,
+                ivc=0,ivS=0.,ivE=-56.,ivN=57,bv_thr=0.,cut="Y",
+                dense_x=[],dense_y=[Wp,Wp+Wn],dense_z=[],models=M_DEFAULT|(M_II if ii else 0),
+                desc="Avalanche breakdown: Si p+/n (1e16) diode, reverse sweep to -56 V"+
+                     ("" if ii else " - impact ionisation OFF"))
+def T_fx_avalanche_diode():
+    """Avalanche breakdown: Si p+/n junction (BV ~ 52 V).
+
+    An abrupt p+ (1e19) / n (1e16, 4 um) / n+ diode, 1-D, swept in reverse
+    to -56 V with impact ionisation on (Solver page: Chynoweth law with the
+    van Overstraeten - de Man coefficients).  The leakage current is flat
+    (below the current resolution, grey) until the multiplication takes off
+    a few volts below breakdown; there the solver stops converging, and the
+    I-V tab reports BV where 1/I, extrapolated from the last converged
+    points, reaches zero: ~52 V.  Past breakdown the current jumps to a
+    branch held back only by the series resistance and the space charge of
+    the avalanche carriers.  Theory: the
+    ionisation integral of the simulated field reaches 1 at 51.9 V, and
+    Baliga's closed form for silicon gives 5.34e13 N^-3/4 = 53.4 V.  The
+    3D Slicer quantity 'log10 G avalanche' shows where the pairs are made
+    (the high-field part of the depletion region).
+
+    Variants (A/B compare): the same diode with impact ionisation off - its
+    current never runs away (no breakdown at any voltage): the avalanche is
+    the model, not the field.  See validate.py section 17 for the checks
+    behind these numbers."""
+    return _aval_diode(True)
+
+def _bv_bjt(mode):
+    t=_fx_bjt(NC=1e16,NB=1e17,tC=3000.,Vbe=0.,Vce=0.,ii=True,emitter=(mode!="cbo"))
+    t.update(Nx=40,Nz=3,ivS=0.,ivE=60.,ivN=31,ivnet="Collector",ivout="Collector",bv_thr=0.,
+             ivfloat="Base" if mode=="ceo" else None,
+             desc={"cbo":"BV_CBO: the collector-base junction alone (emitter left out)",
+                   "ces":"BV_CES: NPN collector sweep, base shorted to the emitter",
+                   "ceo":"BV_CEO: NPN collector sweep, base open (floating, I = 0)"}[mode]+" - impact ionisation on")
+    return t
+def T_fx_bv_bjt():
+    """Avalanche breakdown: NPN BV_CBO, BV_CES and BV_CEO.
+
+    The planar NPN with a thick (3 um, 1e16 cm^-3) collector, impact
+    ionisation on, the collector swept from 0 to 60 V in 2 V steps.  Three
+    variants (A/B compare: pick two) differ only in what the base and
+    emitter do:
+    - BV_CES (this one): the base shorted to the emitter, both at 0 V.  The
+      holes the avalanche makes flow out to the base contact - sideways
+      under the emitter, through the thin base - and the voltage they drop
+      there turns the emitter edge on: the transistor amplifies the
+      multiplication, and the current runs away at ~34 V.
+    - BV_CEO: the base open (a floating terminal, I = 0 - the Sweep page's
+      'Floating terminal').  All the holes go into the base, forward-bias
+      the emitter and return multiplied by the transistor's gain: the
+      current runs away once M = 1 + 1/beta, at ~21 V (between 20 and 22 V,
+      the base floating up to 0.9 V) - close to Miller's estimate
+      BV_CBO / beta^(1/n) with beta ~ 40, n ~ 4.
+    - BV_CBO: the collector-base junction on its own (the emitter left out,
+      as an open emitter carries no current): ~56 V - a little above the
+      52 V of the p+/n diode template, as the 1e17 base takes a share of
+      the voltage.
+    BV_CBO > BV_CES > BV_CEO: the order of every bipolar transistor's
+    voltage ratings.  Below breakdown the leakage of this small section is
+    under the current resolution (grey points); the open base's voltage is
+    drawn on the semi-log panel's right axis.  ~0.5-2 min per variant, most
+    of it in the failed points at breakdown."""
+    return _bv_bjt("ces")
+
 def T_rw_mosfet_irlz44n():
     """Si logic-level power MOSFET, 55 V / 47 A class (IRLZ44N-like).
     One planar VDMOS half-cell with a JFET window. Epi Nd=8e15 cm^-3, 4.5 um
@@ -1652,8 +2113,8 @@ def T_rw_gan_hemt_rf():
     Ni Schottky gate, phi_m = 5.1 eV; pinch-off near -3...-4 V.
     No field plate here: at V_D = 28 V the peak field at the drain-side gate
     edge (~7 MV/cm) exceeds GaN's ~3.3 MV/cm critical field - real parts
-    spread it with gate/source field plates (and there is no avalanche model
-    to show the consequence)."""
+    spread it with gate/source field plates (impact ionisation is off here;
+    the Solver page switches it on)."""
     Lx,Ly,Lz = 3500., 600., 400.; Nx,Ny,Nz = 56, 54, 4
     bar=20.; src_w, drn_x = 500., 3000.
     regs=[
@@ -2132,6 +2593,9 @@ TEMPLATES = {
     "RW: Si PERC solar cell":          T_rw_solar_perc,
     # ── real-world parts: transistors & switches ────────────────
     "RW: Si NPN BJT 45V (BC547)":      T_rw_bjt_bc547,
+    "RW: Si PNP power BJT 250V (MJ21193)": T_rw_bjt_mj21193,
+    "RW: Si NPN power BJT 250V (MJ21194)": T_rw_bjt_mj21194,
+    "RW: Si lateral PNP LDO 1A (LM2940)":  T_rw_ldo_lateral_pnp,
     "RW: Si MOSFET 55V (IRLZ44N)":     T_rw_mosfet_irlz44n,
     "RW: Si superjunction 600V":       T_rw_superjunction_600v,
     "RW: Si IGBT 1200V (IKW40N120)":   T_rw_igbt_1200v,
@@ -2148,6 +2612,31 @@ TEMPLATES = {
     "Gate leakage: 1.2nm SiO2 NMOS":   T_leak_sio2,
     "Gate leakage: HfO2 high-k NMOS":  T_leak_hfo2,
     "Fowler-Nordheim: 8nm SiO2 MOS":   T_fowler_nordheim,
+    # ── BJT effects & breakdown (each with A/B variants) ────────
+    "BJT effects: Kirk effect (f_T vs I_C)":       T_fx_kirk,
+    "BJT effects: emitter current crowding":       T_fx_crowding,
+    "BJT effects: Early effect (output curve)":    T_fx_early,
+    "Avalanche: Si p+n diode breakdown":           T_fx_avalanche_diode,
+    "Avalanche: NPN BV_CBO, BV_CES, BV_CEO":       T_fx_bv_bjt,
+}
+# Template variants for the A/B compare (I-V tab): label -> template dict
+TEMPLATE_VARIANTS = {
+    "BJT effects: Kirk effect (f_T vs I_C)": [
+        ("collector 1e16 (early Kirk)",lambda:_kirk_bjt(1e16)),
+        ("collector 1e17 (late Kirk)", lambda:_kirk_bjt(1e17))],
+    "BJT effects: emitter current crowding": [
+        ("one 20 um emitter (crowding)",lambda:_crowd_bjt(1)),
+        ("four 5 um fingers",          lambda:_crowd_bjt(4))],
+    "BJT effects: Early effect (output curve)": [
+        ("base 5e16 (low V_A)", lambda:_early_bjt(5e16)),
+        ("base 2e17 (high V_A)",lambda:_early_bjt(2e17))],
+    "Avalanche: Si p+n diode breakdown": [
+        ("impact ionisation on", lambda:_aval_diode(True)),
+        ("impact ionisation off",lambda:_aval_diode(False))],
+    "Avalanche: NPN BV_CBO, BV_CES, BV_CEO": [
+        ("BV_CES (base shorted to the emitter)",lambda:_bv_bjt("ces")),
+        ("BV_CEO (base open)",lambda:_bv_bjt("ceo")),
+        ("BV_CBO (emitter left out)",lambda:_bv_bjt("cbo"))],
 }
 # Menu categories (every template appears once; anything not listed here
 # lands in "Other")
@@ -2165,6 +2654,8 @@ TEMPLATE_GROUPS = [
         "RW: Si IGBT 1200V (IKW40N120)","RW: SiC MOSFET 900V (C3M)"]),
     ("Bipolar & thyristors", ["NPN BJT","PNP BJT","Lateral PNP (bipolar IC)","SOI lateral NPN",
         "GaAs HBT","RW: Si NPN BJT 45V (BC547)",
+        "RW: Si PNP power BJT 250V (MJ21193)","RW: Si NPN power BJT 250V (MJ21194)",
+        "RW: Si lateral PNP LDO 1A (LM2940)",
         "RW: Si thyristor 800V (BT151)"]),
     ("GaN HEMTs", ["GaN HEMT","RW: GaN RF HEMT 28V (CGH40010)","RW: GaN HEMT 650V (GS66508)"]),
     ("Contacts & defects", ["Metal contacts: ohmic vs Schottky (Al)",
@@ -2172,6 +2663,9 @@ TEMPLATE_GROUPS = [
         "Defects: NMOS after irradiation (oxide charge + D_it)"]),
     ("Optoelectronics & solar", ["GaAs LED","Si Solar","RW: Si PIN photodiode (BPW34)",
         "RW: Ge photodiode 1550nm","RW: AlGaAs IR LED 870nm","RW: Si PERC solar cell"]),
+    ("BJT effects & breakdown (A/B variants)", ["BJT effects: Kirk effect (f_T vs I_C)",
+        "BJT effects: emitter current crowding","BJT effects: Early effect (output curve)",
+        "Avalanche: Si p+n diode breakdown","Avalanche: NPN BV_CBO, BV_CES, BV_CEO"]),
 ]
 def template_groups():
     """[(category, [names])] covering every template exactly once."""
@@ -2399,12 +2893,28 @@ def _node_arrays(regs, own, mids):
 def _ip(a): return np.ascontiguousarray(a,dtype=np.int32).ctypes.data_as(IP)
 def _dp(a): return np.ascontiguousarray(a,dtype=np.float64).ctypes.data_as(DP)
 
+MAX_MATERIALS, MAX_CONTACTS = 16, 32        # NM_MAX, NC_MAX of the C core
+def _addmat(mi,T):
+    """Register a material with the core; a clear error past its limit
+    (the core would return -1 and every region of it would stay unpainted)."""
+    if not (np.isfinite(T) and T>0): raise ValueError(f"temperature must be above 0 K (got {T})")
+    r=api_addmat(mi,T)
+    if r<0: raise ValueError(f"too many different materials: the solver core holds at most {MAX_MATERIALS} "
+                             "(gate-stack and defect materials count too)")
+    return r
+def _addcon(*a):
+    """Register a contact; a clear error past the core's limit (it would drop
+    the contact and shift every later contact index)."""
+    r=api_addconx(*a)
+    if r<0: raise ValueError(f"too many contacts: the solver core holds at most {MAX_CONTACTS}")
+    return r
+
 def _gate_stack(cid, con, mids, T):
     """Layer stack of a Robin gate for tunnelling (ignored unless tunnelling is on)."""
     lay=con.layers(); ids=[]
     for m,_ in lay:
         mi=MATS.get(m,8)
-        if mi not in mids: mids[mi]=api_addmat(mi,T)
+        if mi not in mids: mids[mi]=_addmat(mi,T)
         ids.append(mids[mi])
     if ids and min(ids)>=0:
         api_gstack(cid,len(lay),(I*len(lay))(*ids),(D*len(lay))(*[tt*1e-9 for _,tt in lay]))
@@ -2454,7 +2964,7 @@ def _apply_defects(t, view, mat, Nd, Na, mids, T, gate_faces):
     dd=SD.apply(t["defects"],view,L,SEMIS,INSULATORS,_eg_of,_barrier_of,gate_faces)
     for k,mn in dd.mat.items():
         mi=MATS[mn]
-        if mi not in mids: mids[mi]=api_addmat(mi,T)
+        if mi not in mids: mids[mi]=_addmat(mi,T)
         mat[k]=mids[mi]; Nd[k]=0.; Na[k]=0.
     return dd
 
@@ -2496,7 +3006,7 @@ def setup_device(t, solver=(2000,1000,500,1e-8,1e-6,1.,1.), models=7, T=300., gr
     mids={}
     for r in t["regs"]:
         m=MATS[r.mat]
-        if m not in mids: mids[m]=api_addmat(m,T)
+        if m not in mids: mids[m]=_addmat(m,T)
     xs,ys,zs=make_grid(t,graded)
     Nx,Ny,Nz=len(xs),len(ys),len(zs)
     api_solver(*solver)
@@ -2544,7 +3054,7 @@ def setup_device(t, solver=(2000,1000,500,1e-8,1e-6,1.,1.), models=7, T=300., gr
         robin=con.bc==2 and con.face<=5           # oxide (Robin) gate on a face
         tox=con.eot() if robin else con.tox
         bc_c,pm_c,_=contact_core(con,t["regs"],L3,models)
-        cid=api_addconx(con.face,i0,i1,j0,j1,k0,k1,bc_c,V,pm_c,tox*1e-9,con.nox*1e4)
+        cid=_addcon(con.face,i0,i1,j0,j1,k0,k1,bc_c,V,pm_c,tox*1e-9,con.nox*1e4)
         if robin and cid>=0: _gate_stack(cid,con,mids,T)
         if cid>=0 and getattr(con,"shape",None) is not None:
             # shaped box contact: its nodes as a list (staircase of the outline)
@@ -2563,7 +3073,7 @@ def _setup_tri(t, solver, models, T, volt):
     mids={}
     for r in t["regs"]:
         m=MATS[r.mat]
-        if m not in mids: mids[m]=api_addmat(m,T)
+        if m not in mids: mids[m]=_addmat(m,T)
     xs,ys,zs=make_grid(t,True)
     tm=dict(t); tm["mesh_hints"]=defect_hints(t)
     pm=SM.PrismMesh(tm,(xs,ys,zs),prism_axis(t,t.get("prism")),INSULATORS,thin=t.get("tri_thin",True))
@@ -2588,8 +3098,7 @@ def _setup_tri(t, solver, models, T, volt):
         rob=con.bc==2 and con.face<=5
         tox=con.eot() if rob else con.tox
         bc_c,pm_c,_=contact_core(con,t["regs"],L3,models)
-        cid=api_addconx(con.face,0,0,0,0,0,0,bc_c,V,pm_c,tox*1e-9,con.nox*1e4)
-        if cid<0: continue
+        cid=_addcon(con.face,0,0,0,0,0,0,bc_c,V,pm_c,tox*1e-9,con.nox*1e4)
         nodes,areas=pm.contact_nodes(con)
         api_cnodes(cid,len(nodes),_ip(nodes),_dp(areas))
         if rob:
@@ -2612,7 +3121,8 @@ _PULL_Q=[("phi",0,1.),("n",1,1e-6),("p",2,1e-6),("Ec",3,1.),("Ev",4,1.),
          ("Efn",5,1.),("Efp",6,1.),("Jx",7,1e-4),("Jy",8,1e-4),("Jz",9,1e-4),
          ("mn",10,1e4),("mp",11,1e4),("R",12,1e-6),("kind",13,1.),("Nnet",14,1e-6),
          ("Jg",27,1e-4),("Lqn",28,1.),("Lqp",29,1.),
-         ("Qtrap",31,1e-6),("Ntrap",32,1e-6)]  # J in A/cm2, quantum potentials in eV, traps in cm^-3
+         ("Qtrap",31,1e-6),("Ntrap",32,1e-6),
+         ("Gii",33,1e-6)]  # J in A/cm2, quantum potentials in eV, traps in cm^-3, avalanche generation in cm^-3 s^-1
 def pull():
     if _PRISM is not None and api_isgraph():
         d=_pull_prism(_PRISM)
@@ -2640,6 +3150,8 @@ def pull():
     d["I"]=[api_conI(c) for c in range(nc)]; d["A"]=[api_conA(c) for c in range(nc)]
     d["Ifl"]=[api_conF(c) for c in range(nc)]
     d["Vs"]=[api_Vsol(c) for c in range(nc)]
+    d["Iraw"]=[api_conIraw(c) for c in range(nc)]     # each contact's own flux (no Kirchhoff substitution)
+    d["conv"]=bool(api_conv())                         # convergence of THIS solution
     return d
 
 def _pull_prism(pm):
@@ -2696,9 +3208,18 @@ api_trapsp  = _opt("api3_trap_species",I,I,I,D,D,D,default=-1)             # typ
 api_trapadd = _opt("api3_trap_add",I,I,I,IP,DP,default=0)                  # sid,n,nodes,dens(m^-3)
 api_qadd    = _opt("api3_charge_add",I,I,IP,DP,default=0)                  # n,nodes,rho(q/m^3)
 api_settau  = _opt("api3_set_mat_tau",I,I,D,D,default=0)                    # mat idx, tau_n0, tau_p0 (s)
+api_csums   = _opt("api3_carrier_sums",V,DP)                                # out[2]: sum n dV, sum p dV
+QE=1.602176634e-19                                                          # elementary charge (C)
+
+def carrier_charge():
+    """Electron and hole charge stored in the semiconductor, (q sum n dV,
+    q sum p dV) in C per simulated cell - NaN with a core that predates it."""
+    b=(D*2)(float("nan"),float("nan")); api_csums(b)
+    return b[0]*QE,b[1]*QE
 # model switches (api3_set_models): bit 0..5
 M_BGN,M_TAU,M_VSAT,M_QC,M_LB,M_TUN = 1,2,4,8,16,32
 M_TE,M_SBT = 64,128        # metal contacts: thermionic emission + image force; barrier tunnelling
+M_II = 256                 # impact ionisation (avalanche generation, Chynoweth law)
 M_DEFAULT = M_BGN|M_TAU|M_VSAT|M_TE|M_SBT
 
 def progress():
@@ -2753,17 +3274,19 @@ def _fl_eval(fidx,V):
     Fl=sum(api_conF(c) for c in fidx)
     return Inet, max(1e-3*Imax, 3.*Fl, 1e-30), bool(ok), Vr
 
-def solve_floating(fidx,V0,lo,hi,job=None,slope=None,vtol=1e-9,maxev=40):
+def solve_floating(fidx,V0,lo,hi,job=None,slope=None,vtol=1e-9,maxev=40,max_bad=0):
     """Zero-current (floating) node: find V in [lo,hi] such that the total
     current into the device through the contacts `fidx` vanishes.
     The current is non-decreasing in V and, by the maximum principle, the root
     lies between the lowest and highest applied voltages (lo, hi), so the
     bracket needs no evaluation of its ends.  Safeguarded secant (Illinois
     regula falsi once both signs are known, bisection as a fallback); every
-    evaluation continues from the previous solution.
+    evaluation continues from the previous solution.  max_bad > 0: give up
+    after that many evaluations in a row fail to converge (past avalanche
+    breakdown every one would).
     Returns (V, I_net, converged, evaluations, dI/dV estimate)."""
     a,b=float(lo),float(hi); fa=fb=None; side=0
-    x=min(max(float(V0),a),b); hist=[]; ok=False; fx=0.; xr=x; found=False
+    x=min(max(float(V0),a),b); hist=[]; ok=False; fx=0.; xr=x; found=False; bad=0
     for ev in range(1,maxev+1):
         if job is not None:
             if job.stop: break
@@ -2771,6 +3294,8 @@ def solve_floating(fidx,V0,lo,hi,job=None,slope=None,vtol=1e-9,maxev=40):
         fx,tol,ok,xr=_fl_eval(fidx,x)
         hist.append((xr,fx))
         if ok and abs(fx)<=tol: found=True; break
+        bad=0 if ok else bad+1
+        if max_bad and bad>=max_bad: break
         if fx>0.: b,fb=xr,fx; side=(side-1 if side<0 else -1)
         else:     a,fa=xr,fx; side=(side+1 if side>0 else 1)
         if b-a<=vtol: found=ok; break
@@ -2799,9 +3324,11 @@ def solve_floating(fidx,V0,lo,hi,job=None,slope=None,vtol=1e-9,maxev=40):
         if x2!=x1 and (f2-f1)/(x2-x1)>0: sl=(f2-f1)/(x2-x1)
     return xr,fx,found,len(hist),(sl or slope)
 
-def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine=True):
+def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine=True,max_fail=0):
     """Sweep the node `tgt` (contact indices, driven together) from Vs to Ve in
     Np points, continuing from the present C state (setup_device first).
+    Every point also records the electron and hole charge stored in the
+    device (Qn, Qp in C: charge-control capacitances, the quasi-static f_T).
     vapp: applied voltage of every contact (default: the Con.V values); the
     non-swept, non-floating contacts are held there.
     flt: contact indices of a floating node solved for zero current at every
@@ -2809,14 +3336,19 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
     than 8 % of the voltage span between neighbouring points is bisected
     (the steep part of a transfer curve gets its own points).
     on_point(k, rec) is called after every solved point (calling thread).
-    Returns a dict of numpy arrays ordered along the sweep."""
+    max_fail: stop after this many points in a row fail to converge (at and
+    just past avalanche breakdown the Gummel iteration fails at every point,
+    and each failed point costs the solver its whole step-halving search);
+    0 = never (the GUI uses 2 when impact ionisation is on).
+    Returns a dict of numpy arrays ordered along the sweep (+ 'stop_fail':
+    the voltage where max_fail stopped it, NaN if it did not)."""
     nc=len(cons); Np=max(1,int(Np))
     vapp=list(vapp) if vapp is not None else [c.V for c in cons]
     tgt=list(tgt); flt=[c for c in (flt or []) if c not in tgt]
     for c in range(nc):
         if c not in tgt and c not in flt: api_setV(c,vapp[c])
     Vv=np.linspace(Vs,Ve,Np) if Np>1 else np.array([float(Vs)])
-    R=dict(V=[],I=[],F=[],conv=[],Vf=[],nev=[],t=[])
+    R=dict(V=[],I=[],F=[],conv=[],Vf=[],nev=[],t=[],Qn=[],Qp=[])
     fixed=[vapp[c] for c in range(nc) if c not in flt and c not in tgt]
     span=max(fixed+[Vs,Ve])-min(fixed+[Vs,Ve]) or 1.
     st={"slope":None}
@@ -2825,13 +3357,14 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
         for c in tgt: api_setV(c,Vt)
         if flt:
             f=fixed+[Vt]; lo,hi=min(f),max(f)
-            Vx,fx,ok,ne,sl=solve_floating(flt,min(max(guess,lo),hi),lo,hi,job,st["slope"])
+            Vx,fx,ok,ne,sl=solve_floating(flt,min(max(guess,lo),hi),lo,hi,job,st["slope"],
+                                          max_bad=1 if max_fail else 0)
             st["slope"]=sl
         else:
             ok=bool(api_resolve()); ne=1; Vx=float("nan")
-        Vr=api_Vsol(tgt[0])
+        Vr=api_Vsol(tgt[0]); Qn,Qp=carrier_charge()
         rec=dict(V=(Vr if Vr==Vr else Vt),I=[api_conI(c) for c in range(nc)],
-                 F=[api_conF(c) for c in range(nc)],conv=bool(ok),Vf=Vx,nev=ne,t=time.time())
+                 F=[api_conF(c) for c in range(nc)],conv=bool(ok),Vf=Vx,nev=ne,t=time.time(),Qn=Qn,Qp=Qp)
         for kk in R: R[kk].append(rec[kk])
         if on_point: on_point(len(R["V"])-1,rec)
         return rec
@@ -2844,12 +3377,15 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
             a,b=o[0],o[1]; return Vf[a]+(Vf[a]-Vf[b])*(Vt-V[a])/(V[a]-V[b])
         return Vf[o[0]]
     dVmax=0.08*span; dVin_min=abs(Ve-Vs)/max(Np-1,1)/32.; budget=3*Np
-    prev=None
+    prev=None; nfail=0; stop_fail=float("nan")
     for k,Vt in enumerate(Vv):
         if job is not None:
             if job.stop: break
             job.k=k; job.ev=0
         rec=solve_at(Vt,guess_at(Vt))
+        nfail=0 if rec["conv"] else nfail+1
+        if max_fail and nfail>=max_fail and k<len(Vv)-1:
+            stop_fail=float(Vt); break
         if flt and refine and prev is not None:
             stack=[(prev,rec)]
             while stack and budget>0 and not (job is not None and job.stop):
@@ -2866,7 +3402,272 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
         if Ve<Vs: o=o[::-1]
         out={k:v[o] for k,v in out.items()}
     out["conv"]=out["conv"].astype(bool) if len(out["conv"]) else np.zeros(0,bool)
+    out["stop_fail"]=stop_fail
     return out
+
+# ── sweep analysis (GUI-independent; the I-V tab and validate.py use these) ──
+def avalanche_bv(V,J,conv,thr=0.,vmin=3.,floor=None):
+    """Breakdown voltage of a sweep solved with impact ionisation: where the
+    current runs away.  V: swept voltage, J: |current density| (A/cm^2) of
+    the observed terminal, conv: converged flags, floor: the current
+    resolution (A/cm^2; currents below it are round-off and do not count) -
+    all in sweep order.  Returns (BV, how) or (None, why).  Tried in turn:
+      1. thr > 0: the current density reaches thr (the data-sheet way, BV
+         at a stated leakage), interpolated in log J;
+      2. the solver stops converging after the current has started to
+         multiply (or the failed point already carries 100x the current):
+         near breakdown (M ~ 10-50) the Gummel iteration fails.  BV is where
+         1/J, extrapolated from the last two converged points, reaches zero
+         (1/J ~ 1/M falls linearly to zero at BV - for a junction and for
+         the open-base transistor alike), but at least the last converged
+         voltage; without two resolved points, the middle of the interval;
+      3. the current jumps tenfold between neighbouring converged points (a
+         series resistance can keep the solver converging past breakdown).
+    Only points with |V| >= vmin count (a forward-biased junction's current
+    rises steeply too)."""
+    V=np.asarray(V,float); J=np.abs(np.asarray(J,float)); cv=np.asarray(conv,bool)
+    n=len(V)
+    if n<3: return None,"too few points"
+    res=np.isfinite(J)&(J>0)
+    if floor is not None: res&=J>=np.asarray(floor,float)
+    ok=cv&res; big=np.abs(V)>=vmin
+    idx=np.where(ok)[0]
+    if thr>0:
+        for a,b in zip(idx[:-1],idx[1:]):
+            if big[b] and J[a]<thr<=J[b]:
+                la,lb=np.log(J[a]),np.log(J[b]); f=(np.log(thr)-la)/(lb-la) if lb>la else 1.
+                return float(V[a]+f*(V[b]-V[a])),f"|J| reaches {thr:g} A/cm²"
+    conv_idx=np.where(cv)[0]
+    fail=[k for k in range(n) if not cv[k] and big[k] and np.any(conv_idx<k)]
+    if fail:
+        kf=fail[0]; prev=conv_idx[conv_idx<kf]
+        k0=prev[-1]; kp=prev[-2] if len(prev)>=2 else None
+        grow=bool(ok[k0]) and kp is not None and J[k0]>=1.3*(J[kp] if res[kp] else 0.)
+        # or the failed point's (partial) state already carries a current far
+        # above the last converged one (leakage below the resolution, then a
+        # runaway - the open-base transistor)
+        ref=J[k0] if res[k0] else (float(np.asarray(floor,float)[k0]) if floor is not None else 0.)
+        jump=bool(np.isfinite(J[kf]) and J[kf]>0 and J[kf]>=100.*max(ref,1e-300))
+        if grow or jump:
+            BV=0.5*float(V[k0]+V[kf]); how=(f"the current runs away - the solver stops converging between "
+                                            f"{V[k0]:.4g} and {V[kf]:.4g} V")
+            if grow and res[kp] and J[k0]>J[kp] and V[k0]!=V[kp]:
+                BV=float(V[k0])
+                x=V[k0]+(V[k0]-V[kp])*(1./J[k0])/((1./J[kp])-(1./J[k0]))     # 1/J -> 0
+                lim=V[k0]+3.*(V[k0]-V[kp])                  # at most three steps beyond the last point
+                if (x-V[k0])*(V[k0]-V[kp])>=0 and abs(x-V[k0])<=abs(lim-V[k0]):
+                    BV=float(x); how+=f"; 1/I extrapolates to zero at {x:.4g} V"
+            return BV,how
+    for a,b in zip(idx[:-1],idx[1:]):
+        if big[b] and J[b]>=10.*J[a]:
+            return float(V[a]),f"the current jumps {J[b]/J[a]:.0f}x between {V[a]:.4g} and {V[b]:.4g} V"
+    return None,"no breakdown in the sweep range"
+
+def early_voltage(V,I,conv):
+    """Early voltage of an output characteristic (I_C vs V_CE at fixed V_BE,
+    or I_D vs V_DS): a straight line I = a + b V fitted to the flat part of
+    the curve - after the saturation knee, before any breakdown upturn -
+    gives V_A = a/b (the line meets I = 0 at V = -V_A) and the output
+    conductance g_o = b.  Works on magnitudes (PNP/PMOS curves too).
+    Returns dict(VA, go, V0, V1, a, b, s) - s: the sign of V - or None."""
+    V=np.asarray(V,float); I=np.asarray(I,float); cv=np.asarray(conv,bool)
+    ok=cv&np.isfinite(I)&np.isfinite(V)
+    if ok.sum()<5: return None
+    V,I=V[ok],I[ok]
+    sv=1. if V[np.argmax(np.abs(V))]>=0 else -1.
+    m=(V*sv)>0
+    if m.sum()<5: return None
+    x=V[m]*sv; y=I[m]; o=np.argsort(x); x,y=x[o],y[o]
+    if not np.all(np.diff(x)>0): x,iu=np.unique(x,return_index=True); y=y[iu]
+    if len(x)<5: return None
+    sy=1. if y[-1]>=0 else -1.; y=y*sy
+    if y[-1]<=0: return None
+    g=np.gradient(y,x)
+    hi_=y>=0.3*y.max()                     # the flat part carries most of the current
+    hi_[0]=hi_[-1]=False
+    if not hi_.any(): return None
+    j=int(np.argmin(np.where(hi_,g,np.inf)))
+    gm=max(g[j],0.)
+    tol=max(2.*gm,0.02*y[j]/max(x[j],1e-12))
+    lo=hi=j
+    while lo>0 and g[lo-1]<=tol: lo-=1
+    while hi<len(g)-1 and g[hi+1]<=tol: hi+=1
+    if hi-lo<2: return None
+    b,a=np.polyfit(x[lo:hi+1],y[lo:hi+1],1)
+    if not (b>0 and a>0): return None
+    return dict(VA=float(a/b),go=float(b),V0=float(x[lo]*sv),V1=float(x[hi]*sv),a=float(a*sy),b=float(b*sy/sv),s=sv)
+
+def bjt_gain_ft(V,Ib,Ic,Q,conv):
+    """Current gain and quasi-static transit frequency along a Gummel sweep
+    (V: the swept base voltage, V_CE held; Ib, Ic: base and collector
+    currents; Q: the charge of the base's majority carrier stored in the
+    device, C - holes for an NPN, electrons for a PNP).
+       beta = I_C / I_B,   f_T = g_m / (2 pi C_in),
+       g_m = dI_C/dV_BE,   C_in = dQ/dV_BE
+    - the charge-control (low-frequency) estimate of the frequency where
+    |h21| = 1: C_in holds the emitter and collector depletion charges and
+    the stored minority charge, so the base pushing into the collector at
+    high current (Kirk effect) shows as a fall of f_T past its peak.
+    Returns dict(Ic, beta, fT, k) of numpy arrays over the converged points
+    in |V| order (fT NaN where Q is unknown) - or None."""
+    V=np.asarray(V,float); Ib=np.asarray(Ib,float); Ic=np.asarray(Ic,float)
+    Q=np.asarray(Q,float) if Q is not None else np.full_like(V,np.nan)
+    ok=np.asarray(conv,bool)&np.isfinite(Ic)&np.isfinite(Ib)&(np.abs(Ib)>0)
+    if ok.sum()<3: return None
+    V,Ib,Ic,Q=V[ok],Ib[ok],Ic[ok],Q[ok]
+    o=np.argsort(np.abs(V)); V,Ib,Ic,Q=V[o],Ib[o],Ic[o],Q[o]
+    keep=np.concatenate(([True],np.diff(V)!=0)); V,Ib,Ic,Q=V[keep],Ib[keep],Ic[keep],Q[keep]
+    if len(V)<3: return None
+    a=np.abs(Ic); beta=a/np.abs(Ib)
+    # g_m = I_C d(ln I_C)/dV: no sinh-type error of a plain difference on coarse steps
+    la=np.log(np.where(a>0,a,np.nan)); gm=np.abs(a*np.gradient(la,V))
+    # f_T per interval between neighbouring points, dI_C/dQ = Delta I_C / Delta Q,
+    # placed at the logarithmic mean current of the interval (IcT): on a coarse
+    # Gummel sweep (I_C changing 2-3x per step) a point-wise value would sit at
+    # the wrong current and shift the f_T peak (the Kirk current)
+    if np.all(np.isfinite(Q)) and len(V)>=2:
+        dI=np.abs(np.diff(a)); dQ=np.abs(np.diff(Q))
+        fT=np.where(dQ>0,dI/(2.*np.pi*np.where(dQ>0,dQ,1.)),np.nan)
+        a0,a1=a[:-1],a[1:]
+        IcT=np.where((a0>0)&(a1>0)&(a0!=a1),(a1-a0)/np.log(np.where((a0>0)&(a1>0),a1/np.where(a0>0,a0,1.),2.)),0.5*(a0+a1))
+    else: fT=np.full(max(len(V)-1,0),np.nan); IcT=0.5*(a[:-1]+a[1:])
+    return dict(V=V,Ic=a,beta=beta,fT=fT,IcT=IcT,gm=gm)
+
+KB_Q=8.617333262e-5          # Boltzmann constant / q (V/K)
+
+def diode_ideality(V,J,T=300.,floor=None,decades=2.):
+    """Ideality factor n and saturation current density J_0 of a forward
+    diode branch J = J_0 exp(V/(n kT/q)): a straight line through ln J over
+    the window of consecutive points (>= 3 points spanning >= `decades`
+    decades, above 10x the resolution floor, V > 8 kT/q) with the smallest
+    n - the ideal-diffusion part, away from depletion-region recombination
+    at low bias and series resistance / high injection at high bias.
+    Returns dict(n, J0, V0, V1) or None."""
+    VT=KB_Q*(T if T else 300.)
+    V=np.asarray(V,float); J=np.asarray(J,float)
+    ok=np.isfinite(V)&np.isfinite(J)&(J>0)&(V>8.*VT)        # exp(V/nkT) >> 1 for n up to ~2
+    if floor is not None: ok&=J>10.*np.abs(np.asarray(floor,float))
+    V,J=V[ok],J[ok]
+    if len(V)<3: return None
+    o=np.argsort(V); V,J=V[o],J[o]; lj=np.log(J); need=decades*np.log(10.)
+    best=None
+    for i in range(len(V)-2):
+        for k in range(i+2,len(V)):
+            if lj[k]-lj[i]>=need: break
+        else: break
+        try: m,b=np.polyfit(V[i:k+1],lj[i:k+1],1)
+        except Exception: continue
+        if not m>0: continue
+        n=1./(m*VT)
+        if 0.5<n<10. and (best is None or n<best[0]): best=(n,float(np.exp(b)),float(V[i]),float(V[k]))
+    if best is None: return None
+    return dict(n=best[0],J0=best[1],V0=best[2],V1=best[3])
+
+def subthreshold_swing(Vg,I,floor=None,decades=1.):
+    """Subthreshold swing (mV/dec): the steepest straight line of log10|I|
+    over windows of consecutive points spanning >= `decades` decades, all
+    below 1 % of the largest current and above 10x the resolution floor (a
+    single noisy pair near the floor cannot give a too-small SS).
+    Returns dict(SS, V0, V1) or None."""
+    Vg=np.asarray(Vg,float); I=np.abs(np.asarray(I,float))
+    ok=np.isfinite(Vg)&np.isfinite(I)&(I>0)
+    if floor is not None: ok&=I>10.*np.abs(np.asarray(floor,float))
+    if ok.sum()<2: return None
+    Imax=float(np.max(I[ok])); ok&=I<0.01*Imax
+    Vg,I=Vg[ok],I[ok]
+    if len(Vg)<2: return None
+    o=np.argsort(Vg); Vg,I=Vg[o],I[o]; lg=np.log10(I)
+    best=None
+    for i in range(len(Vg)-1):
+        for k in range(i+1,len(Vg)):
+            if abs(lg[k]-lg[i])>=decades: break
+        else: break
+        if k-i>=2: m=np.polyfit(Vg[i:k+1],lg[i:k+1],1)[0]
+        else: m=(lg[k]-lg[i])/(Vg[k]-Vg[i])
+        if m==0: continue
+        ss=abs(1e3/m)
+        if best is None or ss<best[0]: best=(ss,float(Vg[i]),float(Vg[k]))
+    if best is None: return None
+    return dict(SS=best[0],V0=best[1],V1=best[2])
+
+def threshold_voltage(Vg,I,Vds=None):
+    """MOSFET threshold from a transfer curve (Ortiz-Conde et al. 2002):
+    linear region (|V_DS| <= 0.1 V or unknown): tangent at maximum g_m,
+    V_th = intercept - V_DS/2; saturation: tangent of sqrt|I_D| at its
+    steepest point, V_th = intercept.  Returns dict(Vth, method, edge,
+    gm, Vgm) or None; edge: the steepest point is at the end of the sweep."""
+    Vg=np.asarray(Vg,float); I=np.abs(np.asarray(I,float))
+    ok=np.isfinite(Vg)&np.isfinite(I)
+    Vg,I=Vg[ok],I[ok]
+    if len(Vg)<3: return None
+    o=np.argsort(Vg); Vg,I=Vg[o],I[o]
+    keep=np.concatenate(([True],np.diff(Vg)!=0)); Vg,I=Vg[keep],I[keep]
+    if len(Vg)<3: return None
+    gm=np.gradient(I,Vg)
+    sat = Vds is not None and abs(Vds)>0.1
+    if sat:
+        y=np.sqrt(I); dy=np.gradient(y,Vg)
+    else: y,dy=I,gm
+    # the turn-on direction: the side where the current is larger
+    sgn = 1. if I[-1]>=I[0] else -1.
+    j=int(np.argmax(sgn*dy))
+    if not sgn*dy[j]>0: return None
+    Vint=Vg[j]-y[j]/dy[j]
+    Vth = Vint if sat else Vint-(0.5*Vds if Vds is not None else 0.)
+    return dict(Vth=float(Vth),method="sat" if sat else "lin",edge=j in (0,len(Vg)-1),
+                gm=float(abs(gm[j])),Vgm=float(Vg[j]))
+
+def contact_profile(s,cons,idx):
+    """Current density through face contacts, node by node, from a pulled
+    solution s: J into the device (A/cm^2) over each contact's nodes - how
+    evenly a contact carries its current (emitter current crowding: the
+    base current's lateral voltage drop debiases the middle of a wide
+    emitter).  cons: the contacts of the solution, idx: the ones to show.
+    Returns dict(parts=[(label, u, v, J(nu, nv), w(nu, nv))], axes=(U, V),
+    skipped=[labels]) - u, v in nm along the face's two in-plane axes, w the
+    node areas inside the contact (nm^2) - or None if no face contact."""
+    x,y,z=s["x"],s["y"],s["z"]; Nx,Ny,Nz=len(x),len(y),len(z)
+    comp={0:("Jx",1.),1:("Jx",-1.),2:("Jy",1.),3:("Jy",-1.),4:("Jz",1.),5:("Jz",-1.)}
+    co={"X":x,"Y":y,"Z":z}
+    def dual(c,lo,hi):                    # node widths clipped to [lo, hi]
+        m=np.concatenate(([c[0]],0.5*(c[1:]+c[:-1]),[c[-1]]))
+        return np.clip(np.minimum(m[1:],hi)-np.maximum(m[:-1],lo),0.,None)
+    parts=[]; skipped=[]; axes=None
+    for k in idx:
+        c=cons[k]
+        if c.face==6 or c.bc==2: skipped.append(c.label); continue
+        i0,i1,j0,j1=c.to_idx(Nx,Ny,Nz,x,y,z)
+        U,Vn=Con.FAXES[c.face]; cu,cv=co[U],co[Vn]
+        key,sg=comp[c.face]; A=np.nan_to_num(s[key])*sg          # (Nz, Ny, Nx)
+        e=(0 if c.face%2==0 else -1)
+        if c.face in (0,1): J=A[j0:j1+1,i0:i1+1,e].T             # u = y, v = z
+        elif c.face in (2,3): J=A[j0:j1+1,e,i0:i1+1].T           # u = x, v = z
+        else: J=A[e,j0:j1+1,i0:i1+1].T                           # u = x, v = y
+        u=cu[i0:i1+1]; v=cv[j0:j1+1]
+        ulo,uhi=cu[0]+c.i0p*(cu[-1]-cu[0]),cu[0]+c.i1p*(cu[-1]-cu[0])
+        vlo,vhi=cv[0]+c.j0p*(cv[-1]-cv[0]),cv[0]+c.j1p*(cv[-1]-cv[0])
+        wu=dual(cu,ulo,uhi)[i0:i1+1]; wv=dual(cv,vlo,vhi)[j0:j1+1]
+        if axes is None: axes=(U,Vn)
+        elif axes!=(U,Vn): skipped.append(c.label); continue
+        parts.append((c.label,u,v,J,np.outer(wu,wv)))
+    if not parts: return None
+    return dict(parts=parts,axes=axes,skipped=skipped)
+
+def profile_stats(prof):
+    """Mean (area-weighted), maximum, and centre / edge values of a contact
+    profile; the edge and centre are read across the narrow direction of
+    each contact (along u when the profile is one-dimensional)."""
+    J=np.concatenate([p[3].ravel() for p in prof["parts"]]); W=np.concatenate([p[4].ravel() for p in prof["parts"]])
+    W=np.where(W>0,W,0.)
+    if W.sum()<=0: W=np.ones_like(J)
+    mean=float((J*W).sum()/W.sum()); mx=float(J.max()); mn=float(J.min())
+    ce=[]
+    for _,u,v,Jp,Wp in prof["parts"]:
+        alu=len(v)<3 or (len(u)>=3 and (u[-1]-u[0])<=(v[-1]-v[0]))     # across the narrow direction
+        ax=1 if alu else 0
+        w=Wp.sum(axis=ax); pr=(Jp*Wp).sum(axis=ax)/np.where(w>0,w,1.)
+        if len(pr)>=3: ce.append((float(pr[len(pr)//2]),float(max(pr[0],pr[-1]))))
+    return dict(mean=mean,max=mx,min=mn,ratio=mx/mean if mean else float("nan"),ce=ce)
 
 api_getstate= _opt("api3_get_state",I,DP,DP,DP,default=0)
 api_setstate= _opt("api3_set_state",I,DP,DP,DP,default=0)
@@ -3041,7 +3842,7 @@ import queue, json, copy, textwrap
 import tkinter.font as tkfont
 from matplotlib.ticker import FuncFormatter
 
-VERSION="0.1"
+VERSION="0.2"
 SETTINGS_FILE=os.path.join(os.path.expanduser("~"),".semisim3d.json")
 # label-based buttons (FlatButton) and themed check boxes: macOS draws the
 # classic Tk ones natively, without the app's colours; SEMISIM_FLAT_BUTTONS=1
@@ -3230,8 +4031,8 @@ Typical workflow for a new design: load the closest template, change regions and
 """),
 ("Status and terms", """
 # Status and terms
-SemiSim 3D 0.1 is the first public version - a test version: it is still being tested, so read its results with care.
-- The physics is checked against textbook theory (`validate.py`, 167 checks), not yet against measurements of real devices.
+SemiSim 3D 0.2 is an early public version - a test version: it is still being tested, so read its results with care.
+- The physics is checked against textbook theory (`validate.py`, 213 checks), not yet against measurements of real devices.
 - Results can be wrong, and some effects are not modelled at all (see Limitations). Check anything important against measurements, the literature or an established simulator.
 - The `RW:` templates are modelled on the device class and ratings of real parts, not on their real dies; currents are per simulated cell.
 - macOS support and the WSL2 full-screen workaround are new and have been tried on few computers so far.
@@ -3239,6 +4040,7 @@ SemiSim 3D 0.1 is the first public version - a test version: it is still being t
 - Problems and suggestions: https://github.com/kotmariusz/Semiconductor_devices_simulator/issues - say what you did, attach the saved device (File → Save device) and the output of `python3 semibuild.py --check`.
 ## Licence
 SemiSim 3D is released under the MIT License (the LICENSE file in the SemiSim 3D folder): free to use, copy, change and share, for any purpose, as long as the copyright and licence notice stay with it. There is no warranty of any kind: whoever uses it is responsible for how they use its results.
+Part numbers and company names in the `RW:` templates only identify the parts the templates are modelled on; they belong to their owners, who are not connected with this project.
 ## Sources
 The models, the material and defect parameters, the device structures and the test references come from the literature listed under Sources (also `docs/SOURCES.md`).
 """),
@@ -3285,7 +4087,7 @@ Both transistors have the same width, so V_M sits below VDD/2 (the PMOS is weake
 A 10 nm fin wraps the gate on three sides. The three box electrodes form the net `Gate` and are swept as one terminal.
 The gate dielectric is a real high-k stack, meshed node by node: 0.5 nm SiO2 interfacial layer + 2.5 nm HfO2 (EOT 0.94 nm).
 The structure tab opens on the YZ cross-section through the gate, so the tri-gate and the stack are visible.
-The I-V tab reports the subthreshold swing SS, V_th (maximum-gm extrapolation) and I_on/I_off; the semi-log panel also shows the gate tunnelling current.
+The I-V tab reports the subthreshold swing SS, V_th (linear extrapolation at maximum g_m minus V_DS/2, or √I_D extrapolation in saturation) and I_on/I_off; the semi-log panel also shows the gate tunnelling current.
 ## Gate dielectrics & tunnelling
 - `Gate leakage: 1.2nm SiO2 NMOS` and `Gate leakage: HfO2 high-k NMOS` are the same transistor (EOT 1.2 nm) with two gate stacks. The sweep plots the gate current: about 1e2 A/cm² through 1.2 nm SiO2 at +1 V against about 1e-2 A/cm² through 0.5 nm SiO2 + 3.95 nm HfO2.
 - `Fowler-Nordheim: 8nm SiO2 MOS`: gate current through a thick oxide at 4-10 V, where the barrier turns triangular.
@@ -3388,7 +4190,8 @@ The bias is ramped adaptively from the previous state. MOS gates are ramped firs
 - `Start / End / Points`: the voltage range.
 - `Floating terminal (I = 0)`: optional. At every point this terminal is solved for zero current, like the output of a logic gate with no load. This gives transfer curves. Steep parts of the curve are refined automatically when `Adaptive refinement` is on.
 - `Plot current of`: the terminal whose current appears in the linear panel. `auto` uses the swept terminal, or the terminal with the largest current if the swept one is an insulated gate.
-- `BV knee`: a current threshold (A/cm²) for the heuristic breakdown-knee marker. 0 turns it off.
+- `BV knee`: a current density (A/cm²) for breakdown. With impact ionisation on (Solver page) the breakdown voltage is where the current reaches it - 0: where the current runs away. With impact ionisation off it only places a heuristic knee marker.
+- With impact ionisation on, a sweep ends once two points in a row fail to converge (at and just past avalanche breakdown every point would fail, and each failed point costs the solver its whole step-halving search).
 ## Stop (Esc)
 Stops within one Gummel iteration. A sweep keeps the points already solved, and the device keeps its last converged state.
 ## Extracted parameters
@@ -3396,7 +4199,16 @@ The I-V tab and the Results tab report what fits the sweep:
 - diode ideality factor and J0 (forward exponential branch);
 - subthreshold swing, V_th and I_on/I_off (gate sweeps);
 - V_M, gain and noise margins (transfer curves);
-- a current-knee marker for blocking sweeps.
+- the Early voltage V_A = I/g_o − V of output curves (collector or drain swept and observed): a straight line through the flat part, drawn dotted;
+- for a Gummel plot (base swept, collector observed): the current gain β = I_C/I_B and the quasi-static f_T against I_C (the BJT panel), f_T,max and where β halves;
+- the avalanche breakdown voltage when impact ionisation is on (else a heuristic current knee).
+Pinned sweeps get the same parameters, listed below those of the last sweep; `Table…` puts them side by side with their differences.
+## Comparing designs
+- `Pin sweep` (I-V tab) keeps the last sweep as a reference: later sweeps of the same swept terminal are drawn over it, dashed in the pin's colour, on the linear, semi-log and BJT panels.
+- `Pins…`: show or hide each pin (click 'Shown'), rename it (double-click), change its colour, show the fields of its last point in the solution tabs ('Show fields'), export all pins to CSV, remove them.
+- `A/B compare…`: capture two designs and run the Sweep page's sweep on both. A design is the whole editor state - structure, mesh, contact voltages, physics models, temperature and an open (floating) terminal - captured with 'Capture the editor's device'; 'Load into the editor' brings it back. Templates of the 'BJT effects & breakdown' group have variant pairs: pick one under 'Variants', press '→ A', pick the other, '→ B', then '▶ Run A and B'. The two results become pins (A blue, B pink); the older pins are hidden.
+- A design B can differ from A in anything: a doping, a finger layout, one physics switch (impact ionisation on/off), the temperature.
+- `Table…` (I-V tab): the parameters of the shown pins and the last sweep side by side - device, sweep, temperature, physics models ('default' = the Solver page's default switches, + and − what differs), then V_th (max-g_m and constant current), SS, g_m, I_on, I_off, diode n and J_0, V_A, BV, β,max, f_T,max, V_M, V_OH/V_OL, V_IL/V_IH, noise margins and the output current at the sweep end. Choose the `Reference` column: the others show their difference from it - voltages in mV or V, currents and frequencies as ratios (×), gain, f_T, V_A and BV also in per cent. `Show`: values, values and differences, or differences only; `Hidden pins too` adds hidden pins. `Copy` (tab-separated, for a spreadsheet) and `Export CSV…` (numbers in V, A, S, Hz). `*` = a value with a note in the I-V tab, e.g. still rising at the sweep end.
 """),
 ("Plots", """
 # Plots
@@ -3405,6 +4217,12 @@ The I-V tab and the Results tab report what fits the sweep:
 - `Bands`: Ec and Ev (solid), the quasi-Fermi levels Efn and Efp (dashed) and a combined Ef, weighted towards the majority carrier. The energy zero is the vacuum level at φ = 0, so absolute values depend on the gauge but differences are physical. The n and p overlay uses a log scale on the right axis.
 - `3D Slicer`: pick a quantity and slide the plane. The three small maps are the XY, YZ and XZ planes through the slice point, drawn on the real (non-uniform) mesh.
 - `Current`: the in-plane map shows |J| with direction arrows. Arrow length is log-scaled so weak and strong regions are both visible. The number boxes next to `2-D arrows` and `3-D arrows` set how many arrows are drawn: 2-D, the arrows across the map (4-120; the rows follow the map's shape); 3-D, the arrows along x (2-40; depth y gets 3/4 and z 5/8 of them, never more than the mesh lines along an axis, at most 4000 arrows). The current is interpolated between the mesh nodes, so the count is not limited by the mesh; denser arrows are drawn shorter and thinner.
+- `Panels ▾` (every plot tab): hide panels to give the others the room - the Structure tab's 3-D view, cross-section and legend; the Slicer's 3-D view and its three planes; the band diagram and ribbon; the five Current panels; E-field and mobility; the linear, semi-log and BJT panels of the I-V tab.
+- `Layers…` (Structure and Current tabs): click 'Shown' to hide or show a region, contact or the defects in the 3-D view. Select one or more parts (Ctrl/Shift for several) and move 'Opacity of the selected parts' to give them their own opacity - a see-through substrate under an opaque channel, say; 'Auto' hands them back to the sliders for all regions and all contacts ('See-through contacts' sets 0.15). 'Insulators in 3-D' draws the oxides too; 'Apply to the cross-section too' uses the same choices in the section.
+- `Current` → `Map`: what lies under the arrows of the in-plane map - `|J|`, the device `structure` (region colours) or `|J| + structure`. `Structure in 3-D` draws the regions and contacts around the 3-D arrows. `Opacity` sets how see-through that structure is; parts hidden in `Layers…` stay hidden and a part with its own opacity there keeps it.
+- `Current` → `Contact`: pick a contact or net and the panel 'Current under a contact' shows the current density through it node by node - a profile across it (2-D sections) or a map over it (3-D devices) - with J max/mean and centre/edge. Emitter current crowding shows as a profile that rises towards the emitter edges.
+- `I-V` BJT panel: β (left axis) and f_T (right axis, dotted; dash-dot for pins) against I_C for Gummel sweeps; the stars mark f_T,max.
+- 3D Slicer `log10 G avalanche`: where impact ionisation makes electron-hole pairs (cm⁻³s⁻¹).
 - Oxide and metal nodes carry no carriers. They are blank in carrier plots.
 - Triangular (prism) mesh: line cuts and maps use the rectangular lines as a display grid (every prism node lies on it or is interpolated inside its triangle, from the same material). In the 3D Slicer the map of the cross-section normal to the prism axis is drawn on the triangulation itself, and the Structure tab's mesh overlay shows the triangles.
 - Use the matplotlib toolbar under each plot to zoom and pan. File → Export plot saves the visible tab (PNG/PDF/SVG).
@@ -3417,7 +4235,7 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - Heterojunctions (electron affinity rule).
 - Fermi statistics are not used (Boltzmann).
 - Klaassen band-gap narrowing.
-- Arora doping-dependent mobility with velocity saturation.
+- Doping-dependent mobility (Masetti in Si, Caughey-Thomas/Arora form elsewhere) with velocity saturation.
 - SRH with doping-dependent lifetimes, Auger and radiative recombination.
 - Deep levels of defects: SRH through any level with its own capture cross sections, plus the charge it traps (see Defects).
 - Oxide gates with fixed charge, interface sheet charges (GaN polarisation) and buried metal electrodes.
@@ -3425,6 +4243,14 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - Quantum confinement, MLDA (modified local-density approximation): at every semiconductor/insulator interface the density of states is cut by the factor 1 − exp(−(z/λ)²), λ = ħ/√(2 m kT), per valley: Si electrons in the Δ2 (m = 0.916, λ = 1.27 nm, 1/3 of the states) and Δ4 valleys (m = 0.19, λ = 2.79 nm, 2/3), holes heavy/light. The inversion layer moves ~1 nm off the oxide: V_th rises by 40-100 mV and the gate capacitance drops. The Bands tab draws Ec + Λn and Ev − Λp (the quantum potentials).
 - Lombardi surface mobility (Si): 1/µ = 1/µ_bulk + D/µ_ac + D/µ_sr with the field normal to the current, D = exp(−d/10 nm). Reproduces the universal mobility curve (~400 cm²/Vs at 0.5 MV/cm, ~250 at 1 MV/cm for electrons).
 - Gate tunnelling: Tsu-Esaki current with WKB transmission through the gate stack for electrons (conduction band) and holes (valence band), both directions (semiconductor → gate and gate → semiconductor). Direct tunnelling and Fowler-Nordheim are the same formula. Barriers from the electron affinities: SiO2 3.1 eV (tunnelling mass 0.42), HfO2 1.5 eV (0.18), Al2O3 2.7 eV (0.35), Si3N4 2.0 eV (0.5). The supply of an inversion or accumulation layer comes from its pressure on the interface, so the result does not depend on the mesh or on MLDA. The gate current appears in the Results table and the I-V semi-log panel; the 3D Slicer shows log10|J gate| at the interface nodes.
+## Impact ionisation (Solver page; off by default, on in the avalanche templates)
+- Electron-hole pairs are generated at G = (α_n|J_n| + α_p|J_p|)/q, with α = γ a exp(−(γ b/F)^m) (Chynoweth law), F the field along each carrier's current, and γ = tanh(ħω/2kT₀)/tanh(ħω/2kT) the optical-phonon temperature factor (ħω = 63 meV, T₀ = 300 K): breakdown voltages rise with temperature.
+- Coefficients: Si van Overstraeten - de Man (holes: two field ranges, split at 4e5 V/cm); GaAs Bulman et al. (m = 1.6 / 1.75); 4H-SiC Hatakeyama et al. (along the c axis); GaN Ji et al. Germanium, InP and the alloys have none (no avalanche there).
+- The generation is a source in both continuity equations (and in the balance of floating regions), updated every Gummel iteration.
+- Near breakdown the multiplication grows without bound (M ~ 10-50) and the Gummel iteration, which solves the equations one after the other, stops converging; the I-V tab takes BV where 1/I, extrapolated from the last converged points, reaches zero. Past breakdown the current is held back only by the series resistance and the space charge of the avalanche carriers, and the solver may converge again on that high-current branch (a jump in the I-V curve).
+- Checked in validate.py section 17: Si p+/n junctions break down where the ionisation integral of the simulated field reaches 1 (within 0.2 %, at 300 and 400 K), 3 % under Baliga's closed form.
+## Quasi-static f_T (I-V tab, BJT panel)
+- Every sweep point stores the electron and hole charge in the device. Along a Gummel sweep (V_CE held) f_T = g_m / (2π C_in), g_m = dI_C/dV_BE, C_in = dQ/dV_BE with Q the base's majority carrier (holes for an NPN): the charge-control estimate of where |h21| falls to 1. It contains the emitter and collector depletion charges and the stored minority charge (base, emitter, and the collector once the base pushes into it - the Kirk effect); it leaves out the non-quasi-static phase delay and every parasitic outside the simulated cell.
 ## Metal contacts (Solver page; on by default)
 - Thermionic emission: at a Schottky contact or a contact with a metal, carriers are not pinned to their equilibrium densities; electrons and holes cross the interface with the Richardson velocity v = A**T²/(q·N_c,v) (A** = 112 A/cm²K² for n-Si, 32 for p-Si; per material) against the density in equilibrium with the metal. Drift-diffusion then carries them through the depletion region: together this is the thermionic-emission-diffusion theory of Crowell and Sze.
 - Image-force lowering: the field at the interface lowers the barrier by Δφ = √(qF/4πε) (Schottky effect); the lowered barrier - flat up to the maximum x_m = Δφ/2F, −q/16πεx beyond - is part of the band the carriers move in, screened by the free carriers (Debye length) so that it acts in the depletion region only. Reverse currents therefore keep rising with voltage, as on real diodes.
@@ -3445,15 +4271,20 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 ("Limitations", """
 # Limitations and troubleshooting
 ## Not modelled
-- impact ionisation: breakdown voltage is NOT predicted, and the knee marker is a heuristic;
-- band-to-band tunnelling: Zener behaviour and GIDL are absent;
+- impact ionisation is a local-field model (no dead space, no energy relaxation): very short high-field regions (below ~100 nm) break down at too low a voltage; the voltage-driven contacts make snapback and second breakdown out of reach; the runaway shows only when the leakage it multiplies is above the current resolution (in tiny cells with long lifetimes shorten τ0 on the Solver page - it raises the leakage, not BV); no coefficients for Ge, InP and the alloys;
+- band-to-band tunnelling: Zener behaviour and GIDL are absent; it also adds to avalanche breakdown above ~5e16 cm⁻³, and the silicon ionisation coefficients (van Overstraeten & de Man) are fitted for 1.75–6e5 V/cm only - an abrupt Si junction at 1e17 cm⁻³ breaks down at 14 V here against about 11 V measured;
+- incomplete ionisation of dopants: every donor and acceptor is ionised, so p-type 4H-SiC (Al) and p-GaN (Mg), where only a few per cent are ionised at 300 K, are far too conductive;
+- Fermi-Dirac statistics: carriers follow Boltzmann statistics, so degenerate layers (n++/p++ contacts, GaAs above ~4e17 cm⁻³, HEMT channels) are approximate;
+- negative differential mobility: GaAs and InP electrons saturate smoothly at v_sat (no transferred-electron velocity peak, no Gunn effect), so short GaAs/InP channels carry 2–3x too little current near the peak field;
+- temperature dependence: silicon's saturation velocity follows Canali et al.; the other materials keep their 300 K v_sat, and the SiC/GaN Auger and ionisation coefficients have no temperature dependence;
+- currents near avalanche: the multiplied current is converged to its resolution floor; below ~1e-16 A per cell it can still move by a few per cent between solves (the floor shown in the results says by how much);
 - optical generation: solar cells show dark I-V only;
 - quantisation beyond MLDA: no subband energies, and MLDA underestimates the dark space at very high fields; no quantum confinement in heterostructure 2DEGs;
 - gate tunnelling: no image-force barrier lowering, no trap-assisted tunnelling, no valence-electron (EVB) tunnelling;
 - thermionic emission at heterointerfaces;
 - ballistic transport, strain and remote-phonon scattering in high-k stacks: nanoscale on-currents are drift-diffusion estimates;
 - self-heating;
-- transients and AC;
+- transients and AC (f_T is the quasi-static charge-control estimate);
 - defects: traps are in steady state (no transient trapping, current collapse or hysteresis), without field-enhanced emission (Poole-Frenkel, trap-assisted tunnelling); a metal particle carries no current through itself (a particle spanning a junction does not short it), and dislocations are not conducting pipes;
 - general 3-D (tetrahedral) meshes: the triangular mesh is a 2-D triangulation extruded along one axis, so an outline must be normal to the prism axis (others fall back to a staircase), and geometry along the axis stays blocky;
 - gate tunnelling through a curved stack uses the planar WKB barrier along each normal path (the field is exact, the barrier shape ignores the film's curvature).
@@ -3712,6 +4543,7 @@ class App(tk.Tk):
         self.m_tun=tk.BooleanVar(value=False)
         # metal contacts: thermionic emission (+ image force), barrier tunnelling
         self.m_te=tk.BooleanVar(value=True); self.m_sbt=tk.BooleanVar(value=True)
+        self.m_ii=tk.BooleanVar(value=False)          # impact ionisation (avalanche)
         self.tau0=tk.StringVar(value="")              # background SRH lifetime (s); "" = material defaults
         try: ncpu=len(os.sched_getaffinity(0))
         except Exception: ncpu=os.cpu_count() or 1
@@ -3745,6 +4577,26 @@ class App(tk.Tk):
         self.cur_n3d=tk.IntVar(value=_ci(self.cfg.get("arrows3d"),8,*ARROWS_3D))
         self.fi_axis=tk.StringVar(value="X"); self.fi_p1=tk.IntVar(value=0); self.fi_p2=tk.IntVar(value=0)
         self.fi_show_field=tk.BooleanVar(value=True); self.fi_show_mob=tk.BooleanVar(value=True)
+        # which panels each plot tab shows (Panels ▾ menus); the Structure 3-D
+        # view and the Field tab's E / µ switches are the same variables
+        self.pv={"td":{"3d":self.sec_3d},"tf":{"E":self.fi_show_field,"mu":self.fi_show_mob}}
+        # Structure tab layers (Layers… window): hidden parts (by object id),
+        # opacities, insulators in 3-D, defects, apply to the cross-section too
+        self.lay_hide=set(); self.lay_def=tk.BooleanVar(value=True); self.lay_ins3d=tk.BooleanVar(value=False)
+        self.lay_ra=tk.DoubleVar(value=0.35); self.lay_ca=tk.DoubleVar(value=0.85); self.lay_sec=tk.BooleanVar(value=False)
+        self.lay_alpha={}                                 # id(part) -> its own opacity (Layers… window)
+        self.lay_sa=tk.DoubleVar(value=0.35)              # the opacity slider of the selected parts
+        self._lay_top=None
+        # Current tab: the structure under the current arrows
+        self.cur_bg=tk.StringVar(value="|J|")             # in-plane map: |J| / structure / |J| + structure
+        self.cur_st3=tk.BooleanVar(value=False)           # structure in the 3-D current field
+        self.cur_sa=tk.DoubleVar(value=0.25)              # its opacity
+        # current under a contact (Current tab), pinned sweeps, A/B designs
+        self.cur_prof=tk.StringVar(value="(none)")
+        self.pins=[]; self._pin_top=None; self._ab_top=None; self.ab={"A":None,"B":None}
+        self._ptab_top=None; self.ptab_ref=tk.StringVar(value="")       # the parameter table (I-V tab ▸ Table…)
+        self.ptab_mode=tk.StringVar(value="Values and differences"); self.ptab_all=tk.BooleanVar(value=False)
+        self.ab_keep=tk.BooleanVar(value=True)
         # region form
         self.rb_mat=tk.StringVar(value="Si"); self.rb_dt=tk.StringVar(value="p")
         self.rb_dp=tk.StringVar(value="1e16"); self.rb_lbl=tk.StringVar(value="")
@@ -4899,8 +5751,8 @@ class App(tk.Tk):
         fr=self._sec(p,"Physics")
         fm=tk.Frame(fr,bg=C["panel"]); fm.pack(fill=tk.X,padx=4,pady=4)
         self._L(fm,"Temperature (K)",0,0); self._E(fm,self.T,0,1,8)
-        self._L(fm,"Background SRH τ0 (s)",9,0); self._E(fm,self.tau0,9,1,8)
-        self._L(fm,"empty = material",9,2)
+        self._L(fm,"Background SRH τ0 (s)",10,0); self._E(fm,self.tau0,10,1,8)
+        self._L(fm,"empty = material",10,2)
         for k,(txt,var) in enumerate([("Band-gap narrowing (Klaassen)",self.m_bgn),
                                       ("SRH lifetime τ(N)",self.m_tau),
                                       ("Velocity saturation",self.m_vsat),
@@ -4908,7 +5760,8 @@ class App(tk.Tk):
                                       ("Surface mobility (Lombardi, Si)",self.m_lb),
                                       ("Gate tunnelling (direct + Fowler-Nordheim)",self.m_tun),
                                       ("Metal contacts: thermionic emission + image-force lowering",self.m_te),
-                                      ("Tunnelling through Schottky barriers (field emission)",self.m_sbt)]):
+                                      ("Tunnelling through Schottky barriers (field emission)",self.m_sbt),
+                                      ("Impact ionisation (avalanche breakdown)",self.m_ii)]):
             ttk.Checkbutton(fm,text=txt,variable=var).grid(row=1+k,column=0,columnspan=3,sticky="w",padx=4,pady=1)
         self._hint(fr,"MLDA, Lombardi and gate tunnelling matter for thin-oxide MOS devices: MLDA pushes the "
                       "inversion layer ~1 nm off the oxide (V_th up, gate capacitance down), Lombardi lowers "
@@ -4919,6 +5772,12 @@ class App(tk.Tk):
                       "(Tsu-Esaki with WKB), so a metal on heavily doped silicon is ohmic and on lightly doped "
                       "silicon rectifies. Off: a Schottky contact is the classic fixed-density barrier and an "
                       "Ohmic contact with a metal stays ideal. Templates set these switches.")
+        self._hint(fr,"Impact ionisation: carriers accelerated by a high field knock out electron-hole pairs "
+                      "(Chynoweth law with the van Overstraeten-de Man coefficients for Si; GaAs, 4H-SiC and GaN "
+                      "from the literature, see the Help). It turns a reverse-biased junction's current into an "
+                      "avalanche: the I-V tab then reports the breakdown voltage where the current runs away. "
+                      "Near breakdown the multiplication grows without bound and the solver stops converging; "
+                      "the last converged points mark BV. Off: fields can be read, breakdown cannot.")
         self._hint(fr,"Background SRH τ0: the lifetime of the semiconductors' built-in midgap recombination "
                       "(empty = material defaults: Si 10 µs, Ge 1 ms, 4H-SiC 1 µs for electrons and 0.1 µs for "
                       "holes, GaN 10 ns, GaAs 1 ns; τ(N) still "
@@ -5003,6 +5862,38 @@ class App(tk.Tk):
             done.add(st)
         return st
 
+    # ─── PANEL VISIBILITY (Panels ▾ menu of every plot tab) ───
+    _PANELS={"td":[("3d","3-D view"),("sec","Cross-section"),("leg","Legend")],
+             "ts":[("3d","3-D slices"),("xy","XY plane"),("yz","YZ plane"),("xz","XZ plane")],
+             "tb":[("band","Band diagram"),("ribbon","Band ribbon (3-D)")],
+             "tc":[("line","Line cut: current density"),("map","In-plane map"),
+                   ("prof","Current under a contact"),("rec","Line cut: recombination"),("3d","3-D current field")],
+             "tf":[("E","Electric field"),("mu","Mobility")],
+             "ti":[("lin","Linear I-V"),("log","Semi-log I-V (all terminals)"),("bjt","BJT: gain and f_T vs I_C")]}
+    def _panels_menu(self,parent,tab,cmd,side=tk.RIGHT):
+        """A 'Panels ▾' menu button: show / hide each panel of a plot tab
+        (the panels left take the room of the hidden ones)."""
+        mb=ttk.Menubutton(parent,text="Panels ▾",style="TMenubutton")
+        m=tk.Menu(mb,tearoff=0,bg=C["panel"],fg=C["text"],activebackground=C["accent"],
+                  activeforeground="white",selectcolor=C["green"],font=self.F["ui"])
+        d=self.pv.setdefault(tab,{})
+        for key,label in self._PANELS[tab]:
+            v=d.setdefault(key,tk.BooleanVar(value=True))
+            m.add_checkbutton(label=label,variable=v,command=cmd)
+        m.add_separator()
+        m.add_command(label="Show all",command=lambda:(self._panels_all(tab,True),cmd()))
+        mb["menu"]=m; mb.pack(side=side,padx=4)
+        Tip(mb,"Show or hide the panels of this tab - the panels left share the room.",self.F["small"])
+        return mb
+    def _panels_all(self,tab,on):
+        for v in self.pv.get(tab,{}).values(): v.set(on)
+    def _vis(self,tab):
+        """Keys of the visible panels of a tab, in display order."""
+        d=self.pv.get(tab,{})
+        return [k for k,_ in self._PANELS[tab] if (d[k].get() if k in d else True)]
+    def _no_panels(self,fig,cv):
+        self._placeholder(fig,cv,"All panels of this tab are hidden - use Panels ▾ to show them")
+
     def _init_device_tab(self):
         cf=self._strip(self.td)
         self._radio_axes(cf,self.sec_plane,self._sec_changed,"Cross-section",("XY","YZ","XZ"))
@@ -5013,6 +5904,11 @@ class App(tk.Tk):
         self.sec_scale.pack(side=tk.LEFT,fill=tk.X,expand=True,padx=4)
         self._check(cf,"mesh",self.sec_mesh,self._ddev)
         self._check(cf,"3-D view",self.sec_3d,self._ddev)
+        lb=self._btn(cf,"Layers…",self._layers_win,bg=C["border"])
+        lb.pack(side=tk.LEFT,padx=4)
+        Tip(lb,"Show or hide regions, contacts and defects in the 3-D view (and optionally the\n"
+               "cross-section), make contacts see-through, show the insulators in 3-D.",self.F["small"])
+        self._panels_menu(cf,"td",self._ddev)
         self.fd,self.cvd=self._mfig(self.td,fs=(13,6))
 
     def _sec_changed(self):
@@ -5035,12 +5931,13 @@ class App(tk.Tk):
         self._radio_axes(cf,self.sl_axis,self._upd_slice,"Slice normal")
         tk.Label(cf,text="Quantity",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(12,2))
         qtys=["phi","log10(n)","log10(p)","Ec","Ev","Efn","Efp","log10|J|","mobility µn","log10|R|","net doping",
-              "log10|J gate|","Λn quantum","trap density","trapped charge"]
+              "log10|J gate|","Λn quantum","trap density","trapped charge","log10 G avalanche"]
         cb=ttk.Combobox(cf,textvariable=self.sl_qty,values=qtys,state="readonly",width=13,font=self.F["ui"])
         cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda _:self._upd_slice())
         ttk.Separator(cf,orient="vertical").pack(side=tk.LEFT,fill=tk.Y,padx=6,pady=2)
         self._check(cf,"Regions",self.show_regions,self._redraw_solution,"#f0abfc")
         self._check(cf,"Labels",self.show_labels,self._redraw_solution,"#f0abfc")
+        self._panels_menu(cf,"ts",self._upd_slice,side=tk.LEFT)
         self.sl_hover=tk.Label(cf,text="",bg=C["panel"],fg=C["text"],font=self.F["small"],anchor="w")
         self.sl_hover.pack(side=tk.LEFT,fill=tk.X,expand=True,padx=(10,4))
         sf=self._strip(self.ts)
@@ -5080,6 +5977,7 @@ class App(tk.Tk):
             self._check(cf,"n, p overlay",self.show_carriers,self._upd_band_plot)
             self._check(cf,"Regions",self.show_regions,self._redraw_solution,"#f0abfc")
             self._check(cf,"Labels",self.show_labels,self._redraw_solution,"#f0abfc")
+            self._panels_menu(cf,"tb",self._upd_band_plot,side=tk.LEFT)
         self.bd_lbl1,self.bd_lbl2,self.bd_scale1,self.bd_scale2=self._build_cut_controls(
             self.tb,self.bd_axis,self.bd_p1,self.bd_p2,self._upd_band_axis,
             lambda _:self._debounce('_bd_after_id',self._upd_band_plot),extras)
@@ -5124,6 +6022,37 @@ class App(tk.Tk):
             self._check(cf,"Labels",self.show_labels,self._redraw_solution,"#f0abfc")
             self.cur_hover=tk.Label(cf,text="",bg=C["panel"],fg=C["text"],font=self.F["small"],anchor="w")
             self.cur_hover.pack(side=tk.LEFT,fill=tk.X,expand=True,padx=(10,4))
+            cf2=self._strip(self.tc)                  # second row: contact profile, structure, panels
+            tk.Label(cf2,text="Contact",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(4,2))
+            self.cb_prof=ttk.Combobox(cf2,textvariable=self.cur_prof,values=["(none)"],state="readonly",width=22,
+                                      font=self.F["ui"])
+            self.cb_prof.pack(side=tk.LEFT,padx=2); self.cb_prof.bind("<<ComboboxSelected>>",self._prof_pick)
+            Tip(self.cb_prof,"Current density through a contact, node by node (the 'Current under a contact'\n"
+                             "panel): how evenly it carries its current. A wide emitter crowds its current\n"
+                             "to the edges nearest the base contact - the base current's lateral voltage\n"
+                             "drop turns the middle off. Face contacts only.",self.F["small"])
+            ttk.Separator(cf2,orient="vertical").pack(side=tk.LEFT,fill=tk.Y,padx=6,pady=2)
+            tk.Label(cf2,text="Map",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(2,2))
+            cb=ttk.Combobox(cf2,textvariable=self.cur_bg,values=["|J|","structure","|J| + structure"],state="readonly",
+                            width=16,font=self.F["ui"])
+            cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda e:self._upd_curr_plot())
+            Tip(cb,"What lies under the arrows of the in-plane map: the current density |J|, the device\n"
+                   "structure (region colours, see-through), or both.",self.F["small"])
+            self._check(cf2,"Structure in 3-D",self.cur_st3,self._upd_curr_plot,"#f0abfc")
+            tk.Label(cf2,text="Opacity",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(6,2))
+            sc=ttk.Scale(cf2,from_=0.,to=1.,orient=tk.HORIZONTAL,variable=self.cur_sa,length=120,
+                         command=lambda *_:self._debounce("_cur_sa_id",self._upd_curr_plot,200))
+            sc.pack(side=tk.LEFT,padx=2)
+            self._cur_sa_lbl=tk.Label(cf2,text=f"{self.cur_sa.get():.2f}",width=4,bg=C["panel"],fg=C["text"],font=self.F["ui"])
+            self._cur_sa_lbl.pack(side=tk.LEFT)
+            def _sa_txt(*_):
+                try: self._cur_sa_lbl.config(text=f"{float(self.cur_sa.get()):.2f}")
+                except (tk.TclError,ValueError): pass
+            self.cur_sa.trace_add("write",_sa_txt)      # also when set from a script or a loaded file
+            Tip(sc,"Opacity of the structure drawn with the current arrows (map and 3-D). Parts\n"
+                   "hidden in Layers… stay hidden; a part given its own opacity there keeps it.",self.F["small"])
+            b=self._btn(cf2,"Layers…",self._layers_win,bg=C["border"]); b.pack(side=tk.LEFT,padx=6)
+            self._panels_menu(cf2,"tc",self._upd_curr_plot,side=tk.LEFT)
         self.cur_lbl1,self.cur_lbl2,self.cur_scale1,self.cur_scale2=self._build_cut_controls(
             self.tc,self.cur_axis,self.cur_p1,self.cur_p2,self._upd_curr_axis,
             lambda _:self._debounce('_cur_after_id',self._upd_curr_plot),extras)
@@ -5131,18 +6060,44 @@ class App(tk.Tk):
         self.cvc.mpl_connect("motion_notify_event",lambda e:self._map_hover(e,self.cur_hover))
         self.cvc.mpl_connect("draw_event",self._labels_on_draw)
 
+    def _prof_choices(self):
+        cb=getattr(self,"cb_prof",None)
+        if cb is None: return
+        vals=["(none)"]+list(self._gmap.keys()); cb.configure(values=vals)
+        if self.cur_prof.get() not in vals: self.cur_prof.set("(none)")
+    def _prof_pick(self,_=None):
+        if self.cur_prof.get()!="(none)": self.pv["tc"]["prof"].set(True)
+        self._upd_curr_plot()
+
     def _init_fi_tab(self):
         def extras(cf):
             self._check(cf,"E-field",self.fi_show_field,self._upd_fi_plot,C["accent"])
             self._check(cf,"Mobility",self.fi_show_mob,self._upd_fi_plot,C["green"])
             self._check(cf,"Regions",self.show_regions,self._redraw_solution,"#f0abfc")
             self._check(cf,"Labels",self.show_labels,self._redraw_solution,"#f0abfc")
+            self._panels_menu(cf,"tf",self._upd_fi_plot,side=tk.LEFT)
         self.fi_lbl1,self.fi_lbl2,self.fi_scale1,self.fi_scale2=self._build_cut_controls(
             self.tf,self.fi_axis,self.fi_p1,self.fi_p2,self._upd_fi_axis,
             lambda _:self._debounce('_fi_after_id',self._upd_fi_plot),extras)
         self.ff,self.cvf=self._mfig(self.tf)
 
     def _init_iv_tab(self):
+        cf=self._strip(self.ti)
+        b=self._btn(cf,"Pin sweep",self._pin_sweep,bg=C["border"]); b.pack(side=tk.LEFT,padx=4)
+        Tip(b,"Keep the last sweep as a reference curve: later sweeps are drawn over it, e.g.\n"
+              "before and after a design change. Pins… lists, hides, renames and removes them.",self.F["small"])
+        self._btn(cf,"Pins…",self._pins_win,bg=C["border"]).pack(side=tk.LEFT,padx=4)
+        b=self._btn(cf,"A/B compare…",self._ab_win,bg=C["border"]); b.pack(side=tk.LEFT,padx=4)
+        Tip(b,"Capture two designs - two templates, two variants of one, or one device before\n"
+              "and after an edit - and run the same sweep on both: their curves come out side\n"
+              "by side, each pinned, with the parameters of both.",self.F["small"])
+        b=self._btn(cf,"Table…",self._ptab_win,bg=C["border"]); b.pack(side=tk.LEFT,padx=4)
+        Tip(b,"The parameters of the last sweep and of every pinned sweep side by side - V_th, SS,\n"
+              "I_on/I_off, n, V_A, BV, β, f_T, V_M … - with their differences from a reference\n"
+              "column; copy it into a spreadsheet or export it as CSV.",self.F["small"])
+        self.iv_pin_lbl=tk.Label(cf,text="",bg=C["panel"],fg=C["sub"],font=self.F["small"],anchor="w")
+        self.iv_pin_lbl.pack(side=tk.LEFT,padx=8)
+        self._panels_menu(cf,"ti",self._replot_iv)
         self.fiv,self.cviv=self._mfig(self.ti)
 
     def _init_results_tab(self):
@@ -5158,7 +6113,7 @@ class App(tk.Tk):
         self.res_tree.column("Terminal",anchor="w"); self.res_tree.column("Note",anchor="w")
         tf.pack(fill=tk.BOTH,expand=True,padx=6,pady=4)
         mid=tk.Frame(pw,bg=C["panel"])
-        tk.Label(mid,text="Extracted parameters (last sweep)",bg=C["panel"],fg=C["accent"],
+        tk.Label(mid,text="Extracted parameters (last sweep and pinned sweeps)",bg=C["panel"],fg=C["accent"],
                  font=self.F["uib"],anchor="w").pack(fill=tk.X,padx=8,pady=(4,0))
         self.res_par=self._textbox(mid,6)
         bot=tk.Frame(pw,bg=C["panel"])
@@ -5197,6 +6152,7 @@ class App(tk.Tk):
             self._placeholder(fig,cv,msg)
         self._placeholder(self.fiv,self.cviv,"No sweep yet - set it up in the Sweep page and press ↔ Sweep (F6)")
         self.sl_lbl.config(text="")
+        self._ptab_fill()
 
     # ─── TEMPLATE LOADING ──────────────────────────────────────
     def _load(self,name):
@@ -5205,6 +6161,11 @@ class App(tk.Tk):
         try: t=TEMPLATES[name]()
         except Exception:
             messagebox.showerror("Template error",traceback.format_exc()); return
+        self._apply_template(name,t)
+    def _apply_template(self,name,t,base=None):
+        """Put a template dict into the editor; base = the template a variant
+        belongs to (its documentation and menu category)."""
+        base=base or name
         self.tname=name
         self.tmeta={k:copy.deepcopy(t.get(k)) for k in ("nodes","clear","refine","view","ivnet","ivfloat","ivout","wl","extrude")}
         self.mesh_type.set(t.get("mesh","rect")); self.prism_ax.set("auto")
@@ -5220,17 +6181,22 @@ class App(tk.Tk):
         self.tau0.set("" if t.get("tau0") is None else ("none" if t["tau0"]==0 else f"{t['tau0']:g}"))
         mdl=int(t.get("models",M_DEFAULT))
         for v,b in ((self.m_bgn,M_BGN),(self.m_tau,M_TAU),(self.m_vsat,M_VSAT),(self.m_qc,M_QC),
-                    (self.m_lb,M_LB),(self.m_tun,M_TUN),(self.m_te,M_TE),(self.m_sbt,M_SBT)): v.set(bool(mdl&b))
+                    (self.m_lb,M_LB),(self.m_tun,M_TUN),(self.m_te,M_TE),(self.m_sbt,M_SBT),
+                    (self.m_ii,M_II)): v.set(bool(mdl&b))
         groups=con_groups(self.cons)
         tgt=t.get("ivnet")
         if not tgt:
             ivc=t.get("ivc",0); tgt=next((k for k,idx in groups if ivc in idx),groups[0][0] if groups else "")
         self._refresh_groups(tgt=tgt,flt=t.get("ivfloat") or "(none)",out=t.get("ivout") or "auto")
         self._rfr(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._def_centre(); self._def_sc_whole()
-        cat=next((c for c,ns in template_groups() if name in ns),"")
+        pk=t.get("prof")                  # Current tab: show the current under this contact
+        if pk and group_of(self.cons,pk):
+            disp=group_label(self.cons,pk,group_of(self.cons,pk))
+            if disp in self._gmap: self.cur_prof.set(disp); self.pv["tc"]["prof"].set(True)
+        cat=next((c for c,ns in template_groups() if base in ns),"")
         self.t_name.config(text=name); self.t_cat.config(text=cat)
         self.t_doc.configure(state="normal"); self.t_doc.delete("1.0","end")
-        self.t_doc.insert("end",template_doc(name)); self.t_doc.configure(state="disabled")
+        self.t_doc.insert("end",template_doc(base)); self.t_doc.configure(state="disabled")
         self.tmpl_btn.config(text=name if len(name)<=30 else name[:29]+"…")
         self.sol=None; self.ivd=None
         view=self.tmeta.get("view")
@@ -5380,6 +6346,7 @@ class App(tk.Tk):
                 "-" if ins else f"{r.doping:.2e}",f"{r.x0:g}",f"{r.x1:g}",f"{r.y0:g}",f"{r.y1:g}",f"{r.z0:g}",f"{r.z1:g}"))
         if idx is not None and idx<len(self.regs):
             self._select(self.rtree,idx,load=False)
+        self._lay_prune()
         if redraw: self._geometry_changed()
     def _con_range(self,c):
         e=con_extent(c,float(self.Lx.get()),float(self.Ly.get()),float(self.Lz.get()))
@@ -5409,7 +6376,7 @@ class App(tk.Tk):
                 f"{c.nox:.1e}" if gate and c.nox else "-",self._con_range(c)))
         if idx is not None and idx<len(self.cons):
             self._select(self.ctree,idx,load=False)
-        self._refresh_groups()
+        self._refresh_groups(); self._lay_prune(); self._prof_choices()
         if redraw: self._geometry_changed()
     def _select(self,tv,idx,load=True):
         ch=tv.get_children()
@@ -5582,6 +6549,11 @@ class App(tk.Tk):
         if not t["regs"]: raise ValueError("Add at least one region.")
         if not t["cons"]: raise ValueError("Add at least one contact.")
         if min(t["Nx"],t["Ny"],t["Nz"])<2: raise ValueError("Each base node count must be at least 2.")
+        if not min(t["Lx"],t["Ly"],t["Lz"])>0: raise ValueError("The domain sizes Lx, Ly, Lz must be positive.")
+        if not 20.<=T<=2000.: raise ValueError(f"Temperature {T:g} K is outside 20 … 2000 K.")
+        bad=[r.label for r in t["regs"] if not (r.x1>r.x0 and r.y1>r.y0 and r.z1>r.z0)]
+        if bad: raise ValueError("Region(s) with an end coordinate not above the start: "+", ".join(bad))
+        if len(t["cons"])>MAX_CONTACTS: raise ValueError(f"At most {MAX_CONTACTS} contacts.")
         models=self._models()
         graded=bool(self.use_graded.get())
         info=[f"'{c.label}': "+contact_core(c,t["regs"],(t["Lx"],t["Ly"],t["Lz"]),models)[2]
@@ -5600,7 +6572,8 @@ class App(tk.Tk):
         return ((M_BGN if self.m_bgn.get() else 0)|(M_TAU if self.m_tau.get() else 0)|
                 (M_VSAT if self.m_vsat.get() else 0)|(M_QC if self.m_qc.get() else 0)|
                 (M_LB if self.m_lb.get() else 0)|(M_TUN if self.m_tun.get() else 0)|
-                (M_TE if self.m_te.get() else 0)|(M_SBT if self.m_sbt.get() else 0))
+                (M_TE if self.m_te.get() else 0)|(M_SBT if self.m_sbt.get() else 0)|
+                (M_II if self.m_ii.get() else 0))
     def _forget(self):
         self._c_sig=None; self._c_ok=False; self._log("Solution forgotten - next run starts from equilibrium")
 
@@ -5640,7 +6613,7 @@ class App(tk.Tk):
             if job.kind=="sweep":
                 frac=(job.k+min(max(t,0.),1.))/max(job.N,1)
                 ex=getattr(job,"extra",0)
-                txt=f"point {min(job.k+1,job.N)}/{job.N}"+(f" (+{ex} refined)" if ex else "")
+                txt=getattr(job,"tag","")+f"point {min(job.k+1,job.N)}/{job.N}"+(f" (+{ex} refined)" if ex else "")
             else:
                 frac=min(max(t,0.),1.); txt="solving"
             if job.ev>1: txt+=f" · I=0 search #{job.ev}"
@@ -5783,7 +6756,7 @@ class App(tk.Tk):
         vapp=[c.V for c in cons]
         job=Job("sweep",Np); job.nthreads=self._nthreads()
         self._live=[]; self._live_meta=dict(cons=cons,groups=groups,tkey=tkey,fkey=fkey if flt else None,
-                                            okey=okey,bv=bv,Vs=Vs,Ve=Ve,wl=self.tmeta.get("wl"))
+                                            okey=okey,bv=bv,Vs=Vs,Ve=Ve,wl=self.tmeta.get("wl"),models=models,T=T)
         self.sv.set(f"Sweeping {tkey}: {Vs:g} → {Ve:g} V, {Np} points"+(f", {fkey} floating" if flt else "")+"…")
         self._log(f"Sweep {self.tname}: {tkey} {Vs:g}→{Ve:g} V ({Np} pts)"+(f", floating {fkey}" if flt else ""))
         refine=bool(self.iv_refine.get()); reuse=bool(self.reuse_sol.get())
@@ -5791,7 +6764,7 @@ class App(tk.Tk):
         def work(job):
             fresh=self._prepare(job,t,solver,models,T,graded,sig,reuse)
             R=run_sweep(cons,tgt,Vs,Ve,Np,flt,job,on_point=lambda k,rec:self._q.put(("point",rec)),
-                        vapp=vapp,refine=refine)
+                        vapp=vapp,refine=refine,max_fail=2 if models&M_II else 0)
             self._c_ok=True
             A=np.array([api_conA(c) for c in range(len(cons))])
             s=pull()
@@ -5816,17 +6789,339 @@ class App(tk.Tk):
         R=r["R"]; m=self._live_meta; cons=r["cons"]; self._defect_notes(r)
         self.ivd=dict(R=R,A=r["A"],cons=cons,groups=con_groups(cons),tkey=m["tkey"],fkey=m["fkey"],
                       okey=m["okey"],bv=m["bv"],labels=[c.label for c in cons],bcs=[c.bc for c in cons],
-                      vapp=r["vapp"],tname=self.tname,wl=m.get("wl"))
+                      vapp=r["vapp"],tname=self.tname,wl=m.get("wl"),models=m.get("models"),
+                      Vs=m.get("Vs"),Ve=m.get("Ve"),T=m.get("T"))
         n=len(R["V"]); nc=int(np.sum(R["conv"])) if n else 0
         state="STOPPED" if r["stopped"] else "done"
+        sf=R.get("stop_fail",float("nan"))
+        if sf==sf:
+            self._log(f"Sweep ended early at V = {sf:g} V: the last points did not converge"
+                      +(" (avalanche breakdown)" if (m.get("models") or 0)&M_II else ""))
         self.cv2.set(f"sweep {nc}/{n} converged · {r['dt']:.1f} s")
         self.sv.set(f"Sweep {state}: {nc}/{n} points converged in {r['dt']:.1f} s (fields show the last point)")
         self._log(f"Sweep {state}: {nc}/{n} converged, {r['dt']:.1f} s")
         if r["s"] is not None:
-            self.sol=r["s"]
+            self.sol=r["s"]; self.ivd["s"]=r["s"]
             self._fill_results(r["s"],cons,r["vapp"],r["flt"],None,note="last sweep point")
             self._new_solution_views()
         self._plot_iv(); self.nb.select(self.ti)
+
+    # ─── PINNED SWEEPS ─────────────────────────────────────────
+    PIN_COLS=["#f472b6","#38bdf8","#facc15","#a78bfa","#fb923c","#4ade80","#f87171","#22d3ee"]
+    PIN_FIELDS_MAX=600_000            # nodes: larger solutions are pinned without their fields
+    def _pin_record(self,d,name,s=None,color=None):
+        """A pinned copy of a sweep record (arrays and contacts copied)."""
+        keep=dict(R={k:np.array(v,copy=True) for k,v in d["R"].items()},
+                  A=None if d.get("A") is None else np.array(d["A"],copy=True),
+                  cons=copy.deepcopy(d.get("cons")),groups=copy.deepcopy(d["groups"]),
+                  tkey=d["tkey"],fkey=d.get("fkey"),okey=d.get("okey"),bv=d.get("bv",0.),wl=d.get("wl"),
+                  models=d.get("models"),tname=d.get("tname",""),labels=list(d.get("labels") or []),
+                  bcs=list(d.get("bcs") or [c.bc for c in d["cons"]]),vapp=list(d.get("vapp") or []),
+                  Vs=d.get("Vs"),Ve=d.get("Ve"),T=d.get("T"))
+        if s is not None and s.get("nodes",0)>self.PIN_FIELDS_MAX: s=None
+        if color is None:
+            used={p["color"] for p in self.pins}
+            color=next((c for c in self.PIN_COLS if c not in used),self.PIN_COLS[len(self.pins)%len(self.PIN_COLS)])
+        return dict(name=name,color=color,show=True,d=keep,s=s,when=time.strftime("%H:%M:%S"))
+    def _unique_pin_name(self,name):
+        have={p["name"] for p in self.pins}
+        if name not in have: return name
+        k=2
+        while f"{name} ({k})" in have: k+=1
+        return f"{name} ({k})"
+    def _pin_sweep(self):
+        d=self.ivd
+        if d is None or not len(d["R"]["V"]):
+            messagebox.showinfo("Pin sweep","Run a sweep first (↔ Sweep, F6): the last sweep is what gets pinned."); return
+        name=self._unique_pin_name(d.get("tname") or self.tname or "sweep")
+        self.pins.append(self._pin_record(d,name,s=d.get("s")))
+        self._log(f"Pinned sweep '{name}'"); self.sv.set(f"Pinned '{name}' - the next sweeps are drawn over it")
+        self._plot_iv(); self._pins_fill()
+    def _pins_win(self):
+        top=self._pin_top
+        if top is not None and top.winfo_exists():
+            top.deiconify(); top.lift(); self._pins_fill(); return
+        top=tk.Toplevel(self); top.title("Pinned sweeps"); top.configure(bg=C["panel"]); top.transient(self)
+        self._pin_top=top
+        try: top.geometry(f"+{self.winfo_rootx()+120}+{self.winfo_rooty()+110}")
+        except Exception: pass
+        tk.Label(top,text="Pinned sweeps are drawn over the last sweep on the I-V tab. Click 'Shown' to hide or show one.",
+                 bg=C["panel"],fg=C["sub"],font=self.F["small"],anchor="w").pack(fill=tk.X,padx=10,pady=(8,2))
+        lf=tk.Frame(top,bg=C["panel"]); lf.pack(fill=tk.BOTH,expand=True,padx=8,pady=2)
+        cols=(("show",56,"Shown"),("name",200,"Name"),("dev",190,"Device"),("sweep",210,"Sweep"),
+              ("when",70,"Pinned"),("fields",56,"Fields"))
+        tv=ttk.Treeview(lf,columns=[c for c,_,_ in cols],show="headings",height=10,selectmode="browse")
+        for c,w,t in cols:
+            tv.heading(c,text=t); tv.column(c,width=w,anchor="center" if c in ("show","when","fields") else "w",
+                                            stretch=c in ("name","dev","sweep"))
+        vs=ttk.Scrollbar(lf,orient="vertical",command=tv.yview); tv.configure(yscrollcommand=vs.set)
+        tv.pack(side=tk.LEFT,fill=tk.BOTH,expand=True); vs.pack(side=tk.LEFT,fill=tk.Y)
+        tv.bind("<ButtonRelease-1>",self._pins_click); tv.bind("<Double-1>",lambda e:self._pins_rename())
+        self._pin_tv=tv
+        bf=tk.Frame(top,bg=C["panel"]); bf.pack(fill=tk.X,padx=8,pady=(4,8))
+        for txt,fn in (("Rename…",self._pins_rename),("Colour…",self._pins_colour),("Show fields",self._pins_fields),
+                       ("Export CSV…",self._pins_csv),("Remove",self._pins_remove),("Remove all",self._pins_clear)):
+            self._btn(bf,txt,fn,bg=C["border"]).pack(side=tk.LEFT,padx=3)
+        self._pins_fill()
+    def _pins_fill(self):
+        self._ptab_fill()
+        top=self._pin_top
+        if top is None or not top.winfo_exists(): return
+        tv=self._pin_tv; sel=tv.selection()
+        for it in tv.get_children(): tv.delete(it)
+        for k,p in enumerate(self.pins):
+            d=p["d"]; R=d["R"]; V=R["V"]
+            rng=f"{d['tkey']} {V.min():.3g}…{V.max():.3g} V ({int(np.sum(R['conv']))}/{len(V)} conv.)" if len(V) else d["tkey"]
+            tag="p"+p["color"].lstrip("#"); tv.tag_configure(tag,foreground=p["color"])
+            tv.insert("","end",iid=str(k),values=("✓" if p.get("show",True) else "–",p["name"],d.get("tname",""),rng,
+                                                  p["when"],"yes" if p.get("s") is not None else "-"),tags=(tag,))
+        if sel and tv.exists(sel[0]): tv.selection_set(sel[0])
+        self.iv_pin_lbl.config(text=f"{len(self.pins)} pinned" if self.pins else "")
+    def _pin_sel(self):
+        tv=getattr(self,"_pin_tv",None)
+        if tv is None or not tv.selection(): return None
+        k=int(tv.selection()[0]); return k if k<len(self.pins) else None
+    def _pins_click(self,e):
+        tv=self._pin_tv; it=tv.identify_row(e.y); col=tv.identify_column(e.x)
+        if not it or col!="#1": return
+        p=self.pins[int(it)]; p["show"]=not p.get("show",True)
+        self._pins_fill(); self._replot_iv()
+    def _pins_rename(self):
+        k=self._pin_sel()
+        if k is None: return
+        from tkinter import simpledialog
+        v=simpledialog.askstring("Rename pinned sweep","Name:",initialvalue=self.pins[k]["name"],parent=self._pin_top)
+        if v and v.strip(): self.pins[k]["name"]=v.strip(); self._pins_fill(); self._replot_iv()
+    def _pins_colour(self):
+        k=self._pin_sel()
+        if k is None: return
+        from tkinter import colorchooser
+        c=colorchooser.askcolor(color=self.pins[k]["color"],parent=self._pin_top,title="Curve colour")
+        if c and c[1]: self.pins[k]["color"]=c[1]; self._pins_fill(); self._replot_iv()
+    def _pins_fields(self):
+        k=self._pin_sel()
+        if k is None: messagebox.showinfo("Pinned sweeps","Select a pinned sweep first.",parent=self._pin_top); return
+        p=self.pins[k]
+        if p.get("s") is None:
+            messagebox.showinfo("Pinned sweeps","This pin was stored without its fields (an A/B run with 'keep the "
+                                "fields' off, or a very large mesh).",parent=self._pin_top); return
+        d=p["d"]; self.sol=p["s"]
+        self._fill_results(p["s"],d["cons"],d.get("vapp") or None,None,None,note=f"pinned '{p['name']}', last sweep point")
+        self._fresh_cuts=False; self._new_solution_views()
+        self.sv.set(f"Fields of '{p['name']}' (its last sweep point) in the solution tabs")
+    def _pins_remove(self):
+        k=self._pin_sel()
+        if k is None: return
+        del self.pins[k]; self._pins_fill(); self._replot_iv()
+        if not self.pins and self.ivd is None: self._plot_iv()
+    def _pins_clear(self):
+        if not self.pins: return
+        if not messagebox.askyesno("Pinned sweeps",f"Remove all {len(self.pins)} pinned sweeps?",parent=self._pin_top): return
+        self.pins=[]; self._pins_fill()
+        if self.ivd is not None: self._plot_iv()
+        else: self._placeholder(self.fiv,self.cviv,"No sweep yet - set it up in the Sweep page and press ↔ Sweep (F6)")
+        self.iv_pin_lbl.config(text="")
+    def _pins_csv(self):
+        if not self.pins: return
+        p=filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV","*.csv")],parent=self._pin_top,
+                                       initialfile="pinned_sweeps.csv")
+        if not p: return
+        n=max(len(q["d"]["R"]["V"]) for q in self.pins); cols=[]; hdr=[]
+        for q in self.pins:
+            P=self._iv_prep(q["d"]); V=P["V"]; I=P["gI"][P["okey"]]
+            pad=lambda a:np.concatenate([np.asarray(a,float),np.full(n-len(a),np.nan)])
+            nm=q["name"].replace(",",";")
+            cols+= [pad(V),pad(I),pad(P["cv"].astype(float))]
+            hdr+=[f"{nm}: V_{P['tkey']}_V",f"{nm}: I_{P['okey']}_A",f"{nm}: converged"]
+        np.savetxt(p,np.column_stack(cols),delimiter=",",fmt="%.8e",comments="",header=",".join(hdr))
+        self.sv.set(f"Pinned sweeps → {p}"); self._log(f"Pinned sweeps exported to {p}")
+
+    # ─── A/B COMPARE ───────────────────────────────────────────
+    MODEL_NAMES={M_BGN:"BGN",M_TAU:"τ(N)",M_VSAT:"v_sat",M_QC:"MLDA",M_LB:"Lombardi",M_TUN:"tunnelling",
+                 M_TE:"TE",M_SBT:"barrier tunnelling",M_II:"avalanche"}
+    def _ab_win(self):
+        top=self._ab_top
+        if top is not None and top.winfo_exists():
+            top.deiconify(); top.lift(); self._ab_fill(); return
+        top=tk.Toplevel(self); top.title("Compare designs A and B"); top.configure(bg=C["panel"]); top.transient(self)
+        self._ab_top=top
+        try: top.geometry(f"+{self.winfo_rootx()+100}+{self.winfo_rooty()+80}")
+        except Exception: pass
+        tk.Label(top,text="Capture two designs, then run the Sweep page's sweep on both - their curves come out side "
+                          "by side on the I-V tab (each one pinned). A design is everything in the editor: structure, "
+                          "mesh, contact voltages, physics models and temperature, as they are when you press Capture. "
+                          "Load a template (or edit the device) and capture A; change it and capture B; Run.",
+                 bg=C["panel"],fg=C["sub"],font=self.F["small"],justify="left",anchor="w",wraplength=600
+                 ).pack(fill=tk.X,padx=10,pady=(8,4))
+        row=tk.Frame(top,bg=C["panel"]); row.pack(fill=tk.X,padx=8,pady=2)
+        self.ab_name={}; self.ab_lbl={}
+        for k,slot in enumerate(("A","B")):
+            fr=tk.LabelFrame(row,text=f" Design {slot} ",bg=C["panel"],fg=C["accent"],font=self.F["uib"],bd=1,relief="groove")
+            fr.grid(row=0,column=k,sticky="nsew",padx=4); row.columnconfigure(k,weight=1)
+            v=tk.StringVar(value=(self.ab[slot] or {}).get("name","")); self.ab_name[slot]=v
+            f1=tk.Frame(fr,bg=C["panel"]); f1.pack(fill=tk.X,padx=6,pady=(4,2))
+            tk.Label(f1,text="Name",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT)
+            e=tk.Entry(f1,textvariable=v,width=24,bg="#07111e",fg=C["text"],insertbackground=C["text"],relief="flat",
+                       font=self.F["ui"]); e.pack(side=tk.LEFT,fill=tk.X,expand=True,padx=4)
+            e.bind("<FocusOut>",lambda _e,sl=slot:self._ab_rename(sl)); e.bind("<Return>",lambda _e,sl=slot:self._ab_rename(sl))
+            l=tk.Label(fr,text="",bg=C["panel"],fg=C["text"],font=self.F["small"],justify="left",anchor="w",wraplength=280)
+            l.pack(fill=tk.X,padx=6,pady=2); self.ab_lbl[slot]=l
+            f2=tk.Frame(fr,bg=C["panel"]); f2.pack(fill=tk.X,padx=6,pady=(2,6))
+            self._btn(f2,"Capture the editor's device",lambda sl=slot:self._ab_capture(sl)).pack(side=tk.LEFT,padx=2)
+            self._btn(f2,"Load into the editor",lambda sl=slot:self._ab_load(sl),bg=C["border"]).pack(side=tk.LEFT,padx=2)
+        vf=tk.Frame(top,bg=C["panel"]); vf.pack(fill=tk.X,padx=10,pady=4); self._ab_vf=vf
+        tk.Label(vf,text="Variants of the loaded template",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT)
+        self.ab_var=tk.StringVar()
+        self.ab_vcb=ttk.Combobox(vf,textvariable=self.ab_var,values=[],state="readonly",width=34,font=self.F["ui"])
+        self.ab_vcb.pack(side=tk.LEFT,padx=4)
+        for slot in ("A","B"):
+            self._btn(vf,f"→ {slot}",lambda sl=slot:self._ab_variant(sl),bg=C["border"]).pack(side=tk.LEFT,padx=2)
+        self.ab_sw=tk.Label(top,text="",bg=C["panel"],fg=C["yellow"],font=self.F["small"],justify="left",anchor="w",
+                            wraplength=600)
+        self.ab_sw.pack(fill=tk.X,padx=10,pady=2)
+        bf=tk.Frame(top,bg=C["panel"]); bf.pack(fill=tk.X,padx=8,pady=(4,8))
+        self._check(bf,"Keep the final fields of both (Pins… → Show fields)",self.ab_keep,lambda:None)
+        self._btn(bf,"Close",top.destroy,bg=C["border"]).pack(side=tk.RIGHT,padx=3)
+        self.ab_run_btn=self._btn(bf,"▶ Run A and B",self._ab_run,bg=C["green"],fg="#03130a")
+        self.ab_run_btn.pack(side=tk.RIGHT,padx=3)
+        self._ab_fill()
+    def _ab_fill(self):
+        top=self._ab_top
+        if top is None or not top.winfo_exists(): return
+        mn=self.MODEL_NAMES
+        for slot in ("A","B"):
+            a=self.ab[slot]
+            if a is None: self.ab_lbl[slot].config(text="(empty - press Capture)",fg=C["sub"]); continue
+            t,solver,models,T,graded=a["snap"]
+            ml=", ".join(v for b,v in mn.items() if models&b) or "none"
+            vv=", ".join(f"{c.label} {c.V:g} V" for c in t["cons"][:6])+(" …" if len(t["cons"])>6 else "")
+            fk=a.get("fkey","(none)")
+            self.ab_lbl[slot].config(fg=C["text"],text=f"{a['tname']} · {a['nodes']:,} nodes · {T:g} K · captured {a['when']}\n"
+                                                       f"models: {ml}\ncontacts: {vv}"+
+                                                       (f"\nopen (floating, I = 0): {fk}" if fk!="(none)" else ""))
+        base=self.tname.split(" [")[0]
+        vars_=[lab for lab,_ in TEMPLATE_VARIANTS.get(base,[])]
+        self.ab_vcb.configure(values=vars_,state="readonly" if vars_ else "disabled")
+        if vars_ and self.ab_var.get() not in vars_: self.ab_var.set(vars_[0])
+        if not vars_: self.ab_var.set("(this template has no variants)")
+        tk_=self._gmap.get(self.iv_tgt.get()); fk=self._gmap.get(self.iv_flt.get(),"(none)"); ok=self._gmap.get(self.iv_out.get(),"auto")
+        try: rng=f"{float(self.ivS.get()):g} → {float(self.ivE.get()):g} V, {int(self.ivN.get())} points"
+        except Exception: rng="(check the Sweep page)"
+        self.ab_sw.config(text=f"Sweep (from the Sweep page): {tk_ or '?'} {rng}, observing {ok}. The terminal names "
+                               f"must exist in both designs; an open (floating) terminal is taken from each design as "
+                               f"captured.")
+    def _ab_rename(self,slot):
+        a=self.ab.get(slot); v=self.ab_name[slot].get().strip()
+        if a is not None and v: a["name"]=v
+    def _ab_capture(self,slot,name=None):
+        try: snap=self._snapshot()
+        except ValueError as e: messagebox.showerror("Capture design",str(e),parent=self._ab_top); return False
+        js=json.loads(json.dumps(self._device_json()))
+        nm=(name or self.ab_name[slot].get().strip() or f"{slot}: {self.tname}")
+        fk=self._gmap.get(self.iv_flt.get(),"(none)")          # an open terminal is part of the design
+        self.ab[slot]=dict(snap=snap,js=js,tname=self.tname,name=nm,when=time.strftime("%H:%M:%S"),
+                           nodes=self._node_count() or 0,fkey=fk or "(none)")
+        self.ab_name[slot].set(nm); self._ab_fill()
+        self._log(f"A/B: design {slot} = '{nm}' ({self.tname})")
+        return True
+    def _ab_load(self,slot):
+        a=self.ab.get(slot)
+        if a is None or self.busy: return
+        js=copy.deepcopy(a["js"])
+        try: check_device_json(js); parts=self._device_parts(js)
+        except Exception as e: messagebox.showerror("Load design",str(e),parent=self._ab_top); return
+        self._apply_device_json(js,*parts,src=a["tname"],label=f"A/B design {slot}")
+        self.sv.set(f"Design {slot} ('{a['name']}') is in the editor"); self._ab_fill()
+    def _ab_variant(self,slot):
+        if self.busy: return
+        base=self.tname.split(" [")[0]; lab=self.ab_var.get()
+        fn=dict(TEMPLATE_VARIANTS.get(base,[])).get(lab)
+        if fn is None: return
+        try: t=fn()
+        except Exception: messagebox.showerror("Template variant",traceback.format_exc(),parent=self._ab_top); return
+        keep=(self.iv_tgt.get(),self.iv_flt.get(),self.iv_out.get(),self.ivS.get(),self.ivE.get(),self.ivN.get())
+        self._apply_template(f"{base} [{lab}]",t,base=base)
+        # the variants share their terminals: keep the sweep set up on the Sweep
+        # page (an open, floating terminal belongs to the variant itself)
+        if keep[0] in self._gmap:
+            self.iv_tgt.set(keep[0])
+            self.iv_out.set(keep[2] if keep[2]=="auto" or keep[2] in self._gmap else "auto")
+            self.ivS.set(keep[3]); self.ivE.set(keep[4]); self.ivN.set(keep[5])
+        self._ab_capture(slot,name=lab)
+    def _ab_run(self):
+        if self.busy: return
+        A,B=self.ab["A"],self.ab["B"]
+        if A is None or B is None:
+            messagebox.showinfo("A/B compare","Capture both designs first.",parent=self._ab_top); return
+        try: Vs=float(self.ivS.get()); Ve=float(self.ivE.get()); Np=int(self.ivN.get()); bv=float(self.bv_thr.get())
+        except Exception:
+            messagebox.showerror("A/B compare","Start, end, points and BV knee (Sweep page) must be numbers.",parent=self._ab_top); return
+        if not (1<=Np<=2000): messagebox.showerror("A/B compare","Points must be 1…2000.",parent=self._ab_top); return
+        tkey=self._gmap.get(self.iv_tgt.get())
+        okey=self._gmap.get(self.iv_out.get(),"auto")
+        if not tkey: messagebox.showerror("A/B compare","Choose the swept terminal in the Sweep page.",parent=self._ab_top); return
+        plan=[]
+        for slot,a in (("A",A),("B",B)):
+            cons=a["snap"][0]["cons"]; tgt=group_of(cons,tkey)
+            fkey=a.get("fkey","(none)")
+            flt=group_of(cons,fkey) if fkey!="(none)" else []
+            if not tgt or (fkey!="(none)" and not flt):
+                messagebox.showerror("A/B compare",f"Design {slot} ('{a['name']}') has no terminal "
+                                     f"'{tkey if not tgt else fkey}'.",parent=self._ab_top); return
+            if set(flt)&set(tgt):
+                messagebox.showerror("A/B compare",f"Design {slot}: the open terminal cannot be the swept one.",
+                                     parent=self._ab_top); return
+            plan.append((slot,a,tgt,flt))
+        keepf=bool(self.ab_keep.get()); refine=bool(self.iv_refine.get())
+        job=Job("sweep",Np); job.nthreads=self._nthreads()
+        self.sv.set(f"A/B compare: sweeping {tkey} {Vs:g} → {Ve:g} V on both designs…")
+        self._log(f"A/B compare: '{A['name']}' vs '{B['name']}', {tkey} {Vs:g}→{Ve:g} V ({Np} pts)")
+        def work(job):
+            out=[]
+            for slot,a,tgt,flt in plan:
+                if job.stop: break
+                t,solver,models,T,graded=a["snap"]; cons=t["cons"]
+                job.tag=f"design {slot} · "; job.extra=0
+                sig=device_signature(t,solver,models,T,graded)
+                self._prepare(job,t,solver,models,T,graded,sig,False)
+                vapp=[c.V for c in cons]
+                R=run_sweep(cons,tgt,Vs,Ve,Np,flt,job,vapp=vapp,refine=refine,max_fail=2 if models&M_II else 0)
+                self._c_ok=True
+                Aa=np.array([api_conA(c) for c in range(len(cons))])
+                s=None
+                if keepf:
+                    s=pull()
+                    if s is not None:
+                        s["dev"]=dict(regs=t["regs"],cons=cons,sheets=t.get("sheets",[]),L=(t["Lx"],t["Ly"],t["Lz"]),
+                                      defects=t.get("defects") or [])
+                        s["models"]=models
+                out.append(dict(slot=slot,name=a["name"],tname=a["tname"],R=R,A=Aa,s=s,cons=cons,vapp=vapp,
+                                models=models,flt=flt,fkey=a.get("fkey") if flt else None,T=T))
+            return dict(out=out,stopped=job.stop,dt=time.time()-job.t0,tkey=tkey,okey=okey,bv=bv)
+        self._start(job,work,self._ab_done)
+    def _ab_done(self,r):
+        outs=r["out"]
+        if not outs: self.sv.set("A/B compare stopped"); return
+        for p in self.pins: p["show"]=False             # the comparison on its own (older pins: Pins…)
+        cols={"A":"#38bdf8","B":"#f472b6"}; msg=[]
+        for o in outs:
+            cons=o["cons"]
+            d=dict(R=o["R"],A=o["A"],cons=cons,groups=con_groups(cons),tkey=r["tkey"],fkey=o["fkey"],okey=r["okey"],
+                   bv=r["bv"],labels=[c.label for c in cons],bcs=[c.bc for c in cons],vapp=o["vapp"],
+                   tname=o["tname"],models=o["models"],T=o["T"])
+            self.pins.append(self._pin_record(d,self._unique_pin_name(o["name"]),s=o["s"],color=cols[o["slot"]]))
+            n=len(o["R"]["V"]); msg.append(f"{o['slot']} {int(np.sum(o['R']['conv'])) if n else 0}/{n}")
+        last=outs[-1]
+        if last["s"] is not None:
+            self.sol=last["s"]
+            self._fill_results(last["s"],last["cons"],last["vapp"],last["flt"],None,
+                               note=f"A/B design {last['slot']} '{last['name']}', last sweep point")
+            self._fresh_cuts=True; self._new_solution_views()
+        self.ivd=None
+        state="STOPPED" if r["stopped"] else "done"
+        self.sv.set(f"A/B compare {state}: {', '.join(msg)} points converged in {r['dt']:.0f} s - both curves are pinned")
+        self._log(f"A/B compare {state}: {', '.join(msg)} converged, {r['dt']:.1f} s")
+        self._plot_iv(); self._pins_fill(); self.nb.select(self.ti)
 
     # ─── RESULTS TABLE ─────────────────────────────────────────
     def _fill_results(self,s,cons=None,vapp=None,flt=None,Vx=None,note=""):
@@ -5834,10 +7129,15 @@ class App(tk.Tk):
         if s is None:
             self.res_title.config(text="No solution yet - press ▶ Run (F5)"); return
         cons=cons or self.cons; flt=flt or []
-        nconv=api_conv()
+        nconv=s.get("conv",True)
+        raw=s.get("Iraw") or []
+        kir=""
+        if raw:
+            big=max([abs(x) for x in raw]+[1e-300]); fl=sum(s.get("Ifl") or [0.])
+            kir=(f" · Kirchhoff check of the contact fluxes {abs(sum(raw))/big:.1e}" if big>10.*fl else
+                 " · currents below the resolution floor")
         self.res_title.config(text=f"{self.tname} - {'converged' if nconv else 'NOT converged'}"
-                                   f"{' ('+note+')' if note else ''} · {_mesh_desc(s)} · "
-                                   f"Kirchhoff sum {sum(s['I']):+.2e} A")
+                                   f"{' ('+note+')' if note else ''} · {_mesh_desc(s)}{kir}")
         for k,c in enumerate(cons):
             if k>=len(s["I"]): break
             I_=s["I"][k]; A_=s["A"][k]; fl=s["Ifl"][k]; Vs_=s["Vs"][k]
@@ -5908,20 +7208,25 @@ class App(tk.Tk):
         L={"x":Lx,"y":Ly,"z":Lz}; L3=(Lx,Ly,Lz)
         plane=self.sec_plane.get(); pos=float(self.sec_pos.get())
         H,Vv,N={"XY":("x","y","z"),"YZ":("z","y","x"),"XZ":("x","z","y")}[plane]
-        if self.sec_3d.get():
-            gs=GridSpec(1,3,figure=fig,width_ratios=[1.0,1.55,0.62],wspace=0.08)
-            a3=fig.add_subplot(gs[0],projection="3d"); a2=fig.add_subplot(gs[1]); aLg=fig.add_subplot(gs[2])
-        else:
-            gs=GridSpec(1,2,figure=fig,width_ratios=[2.6,0.62],wspace=0.05)
-            a3=None; a2=fig.add_subplot(gs[0]); aLg=fig.add_subplot(gs[1])
-        aLg.axis("off")
+        vis=self._vis("td")
+        if not vis: self._sec_axes=None; self._no_panels(fig,self.cvd); return
+        W={"3d":1.0 if "sec" in vis else 2.2,"sec":1.55 if "3d" in vis else 2.6,"leg":0.62}
+        ax=row_axes(fig,[(k,W[k],"3d" if k=="3d" else None) for k in vis],
+                    wspace=0.08 if "3d" in vis else 0.05)
+        a3=ax.get("3d"); aLg=ax.get("leg")
+        # section hidden: draw it on an axes of a figure that is never shown (the
+        # legend still lists what the plane cuts)
+        a2=ax.get("sec") or Figure().add_subplot()
+        if aLg is not None: aLg.axis("off")
         a2.set_facecolor(C["bg"])
+        hide=self.lay_hide if self.lay_sec.get() else set()          # the Layers… choices
         ext=lambda r,ax:{"x":(r.x0,r.x1),"y":(r.y0,r.y1),"z":(r.z0,r.z1)}[ax]
         tol=1e-9*max(Lx,Ly,Lz); lab_pts=[]
         for r in self.regs:
             n0,n1=ext(r,N)
-            if not (n0-tol<=pos<=n1+tol): continue
+            if not (n0-tol<=pos<=n1+tol) or id(r) in hide: continue
             fc,al=self._reg_color(r)
+            if self.lay_sec.get() and id(r) in self.lay_alpha: al=self.lay_alpha[id(r)]
             box={a:ext(r,a) for a in "xyz"}
             polys=_section_polys(r.shape,box,H,Vv,N,pos) if r.shape is not None else None
             if polys is None:
@@ -5946,7 +7251,7 @@ class App(tk.Tk):
         for k,c in enumerate(self.cons):
             e=con_extent(c,Lx,Ly,Lz); col=self._CC[k%len(self._CC)]
             n0,n1=e[N]
-            if not (n0-tol<=pos<=n1+tol): hidden+=1; continue
+            if not (n0-tol<=pos<=n1+tol) or id(c) in hide: hidden+=1; continue
             h0,h1=e[H]; v0,v1=e[Vv]
             if c.face==6 and getattr(c,"shape",None) is not None:
                 for pg in _section_polys(c.shape,e,H,Vv,N,pos) or []:
@@ -5966,7 +7271,7 @@ class App(tk.Tk):
             if N!=sh.axis and rg[N][0]-tol<=pos<=rg[N][1]+tol:
                 a2.plot(rg[H],rg[Vv],color="#f0abfc",lw=2,ls="--",zorder=5)
                 hand.append(Line2D([0],[0],color="#f0abfc",lw=2,ls="--",label=f"σ {sh.sigma:+.1e} q/cm²"))
-        if self.defects:
+        if self.defects and (self.lay_def.get() or not self.lay_sec.get()):
             self._draw_defects_2d(a2,self.defects,H,Vv,N,pos,L3)
             hand.extend(self._defect_legend(self.defects))
         m=self._mesh(); pm=self._prism() if self.mesh_type.get()=="tri" else None
@@ -5986,13 +7291,13 @@ class App(tk.Tk):
         if pm is not None: nn=f" · prism mesh {pm.N2:,}×{pm.NL} (axis {'XYZ'[pm.ax]})"
         else: nn=f" · mesh {len(m[0])}×{len(m[1])}×{len(m[2])}" if m is not None else ""
         a2.set_title(f"{plane} section at {N} = {pos:.1f} nm{nn}",fontsize=9,fontweight="bold",color=C["text"])
-        if hand:
+        if hand and aLg is not None:
             if hidden:
                 k=next((i for i,h in enumerate(hand) if h.get_label().startswith("Defects (")),len(hand))
-                hand.insert(k,Line2D([0],[0],color="none",label=f"(+{hidden} contact(s) off this plane)"))
+                hand.insert(k,Line2D([0],[0],color="none",label=f"(+{hidden} contact(s) off this plane or hidden)"))
             aLg.legend(handles=hand,loc="upper left",fontsize=7,borderaxespad=0.,framealpha=0.9,
                        title="Contacts & defects" if self.defects else "Contacts",title_fontsize=8)
-        self._sec_axes=(a2,H,Vv,N,pos)
+        self._sec_axes=(a2,H,Vv,N,pos) if "sec" in vis else None
         self._hover_txt=a2.text(0.01,0.01,"",transform=a2.transAxes,fontsize=7,color=C["yellow"],
                                 va="bottom",ha="left",zorder=10,
                                 bbox=dict(boxstyle="round,pad=0.25",facecolor=C["panel"],edgecolor=C["border"],alpha=0.85))
@@ -6001,20 +7306,8 @@ class App(tk.Tk):
             self._hover_cid=self.cvd.mpl_connect("motion_notify_event",self._struct_hover)
         if a3 is not None:
             a3.set_facecolor(C["bg"])
-            for r in self.regs:
-                if r.mat in INSULATORS: continue
-                fc,al=self._reg_color(r)
-                faces=(_prism_faces(r.shape,{a:ext(r,a) for a in "xyz"}) if r.shape is not None
-                       else self._box_faces(r.x0,r.x1,r.y0,r.y1,r.z0,r.z1))
-                a3.add_collection3d(Poly3DCollection(faces,alpha=min(al,0.35),facecolor=fc,edgecolor=C["border"],linewidth=0.25))
-            for k,c in enumerate(self.cons):
-                e=con_extent(c,Lx,Ly,Lz); col=self._CC[k%len(self._CC)]
-                if c.face==6 and getattr(c,"shape",None) is not None:
-                    faces=_prism_faces(c.shape,e,caps=not c.shape.hole); al=0.45
-                else:
-                    faces=self._box_faces(e["x"][0],e["x"][1],e["y"][0],e["y"][1],e["z"][0],e["z"][1]); al=0.85
-                a3.add_collection3d(Poly3DCollection(faces,alpha=al,facecolor=col,edgecolor=col,linewidth=0.4))
-            self._draw_defects_3d(a3,self.defects,L3)
+            self._draw_struct3(a3,self.regs,self.cons,L3)
+            if self.lay_def.get(): self._draw_defects_3d(a3,self.defects,L3)
             q={"z":[(0,0,pos),(Lx,0,pos),(Lx,Ly,pos),(0,Ly,pos)],
                "x":[(pos,0,0),(pos,Ly,0),(pos,Ly,Lz),(pos,0,Lz)],
                "y":[(0,pos,0),(Lx,pos,0),(Lx,pos,Lz),(0,pos,Lz)]}[N]
@@ -6026,6 +7319,187 @@ class App(tk.Tk):
         try: fig.tight_layout(pad=0.6)
         except Exception: pass
         self.cvd.draw_idle()
+
+    # ─── LAYERS (show / hide parts of the Structure view) ───────
+    def _lay_part(self,kind,k,obj=None):
+        """(hidden, own opacity or None) of region / contact k as the Layers
+        window set it.  obj: a solution's copy of the part - matched to the
+        editor's part by position and label."""
+        lst=self.regs if kind=="r" else self.cons
+        if k>=len(lst) or (obj is not None and lst[k].label!=obj.label): return False,None
+        o=lst[k]
+        return id(o) in self.lay_hide,self.lay_alpha.get(id(o))
+    def _reg_alpha(self,r):
+        """A region's opacity in 3-D without its own setting (the global slider)."""
+        ra=max(0.,min(1.,float(self.lay_ra.get()))); al=self._reg_color(r)[1]
+        return min(al,ra) if ra<=0.35 else ra*min(1.,al/0.35)
+    def _con_alpha(self,c):
+        ca=max(0.,min(1.,float(self.lay_ca.get())))
+        return 0.45*ca/0.85 if (c.face==6 and getattr(c,"shape",None) is not None) else ca
+    def _draw_struct3(self,a3,regs,cons,L3,overlay=None,editor=True):
+        """Regions and contacts in a 3-D axes (plot coordinates x, z, -y) as the
+        Layers window shows them: hidden parts left out, each part's own
+        opacity or the global sliders.  overlay: an opacity for every part
+        without its own (the structure under the Current tab's arrows)."""
+        Lx,Ly,Lz=L3
+        ext=lambda r,ax:{"x":(r.x0,r.x1),"y":(r.y0,r.y1),"z":(r.z0,r.z1)}[ax]
+        for k,r in enumerate(regs):
+            hid,own=self._lay_part("r",k,None if editor else r)
+            if hid or (r.mat in INSULATORS and not self.lay_ins3d.get()): continue
+            fc,_=self._reg_color(r)
+            a=own if own is not None else (overlay if overlay is not None else self._reg_alpha(r))
+            a=max(0.,min(1.,a))
+            faces=(_prism_faces(r.shape,{q:ext(r,q) for q in "xyz"}) if r.shape is not None
+                   else self._box_faces(r.x0,r.x1,r.y0,r.y1,r.z0,r.z1))
+            a3.add_collection3d(Poly3DCollection(faces,alpha=a,facecolor=fc,edgecolor=C["border"],
+                                                 linewidth=0.25 if a>0.02 else 0.4))
+        for k,c in enumerate(cons):
+            hid,own=self._lay_part("c",k,None if editor else c)
+            if hid: continue
+            e=con_extent(c,Lx,Ly,Lz); col=self._CC[k%len(self._CC)]
+            if c.face==6 and getattr(c,"shape",None) is not None: faces=_prism_faces(c.shape,e,caps=not c.shape.hole)
+            else: faces=self._box_faces(e["x"][0],e["x"][1],e["y"][0],e["y"][1],e["z"][0],e["z"][1])
+            a=own if own is not None else (min(1.,1.6*overlay) if overlay is not None else self._con_alpha(c))
+            a=max(0.,min(1.,a))
+            a3.add_collection3d(Poly3DCollection(faces,alpha=a,facecolor=col,edgecolor=col,linewidth=0.4 if a>0.02 else 0.8))
+    def _layers_win(self):
+        top=self._lay_top
+        if top is not None and top.winfo_exists():
+            top.deiconify(); top.lift(); self._lay_fill(); return
+        top=tk.Toplevel(self); top.title("Layers - Structure and Current views"); top.configure(bg=C["panel"])
+        top.transient(self); self._lay_top=top
+        try: top.geometry(f"+{self.winfo_rootx()+80}+{self.winfo_rooty()+90}")
+        except Exception: pass
+        tk.Label(top,text="Click 'Shown' to hide or show a part. Select parts (Ctrl / Shift for several) to give them "
+                          "their own opacity.",bg=C["panel"],fg=C["sub"],font=self.F["small"],anchor="w",justify="left",
+                 wraplength=640).pack(fill=tk.X,padx=10,pady=(8,2))
+        lf=tk.Frame(top,bg=C["panel"]); lf.pack(fill=tk.BOTH,expand=True,padx=8,pady=2)
+        cols=(("show",54,"Shown"),("part",210,"Part"),("kind",80,"Kind"),("opac",70,"Opacity"),("info",230,"Details"))
+        tv=ttk.Treeview(lf,columns=[c for c,_,_ in cols],show="headings",height=14,selectmode="extended")
+        for c,w,t in cols:
+            tv.heading(c,text=t); tv.column(c,width=w,anchor="center" if c in ("show","opac") else "w",
+                                            stretch=c in ("part","info"))
+        vs=ttk.Scrollbar(lf,orient="vertical",command=tv.yview); tv.configure(yscrollcommand=vs.set)
+        tv.pack(side=tk.LEFT,fill=tk.BOTH,expand=True); vs.pack(side=tk.LEFT,fill=tk.Y)
+        tv.bind("<ButtonRelease-1>",self._lay_click); tv.bind("<space>",self._lay_click)
+        tv.bind("<<TreeviewSelect>>",self._lay_selected)
+        self._lay_tv=tv
+        sf=tk.Frame(top,bg=C["panel"]); sf.pack(fill=tk.X,padx=10,pady=(4,2)); sf.columnconfigure(1,weight=1)
+        tk.Label(sf,text="Opacity of the selected parts",bg=C["panel"],fg=C["accent"],font=self.F["ui"]
+                 ).grid(row=0,column=0,sticky="w",padx=(0,8))
+        self._lay_sc=ttk.Scale(sf,from_=0.,to=1.,orient=tk.HORIZONTAL,variable=self.lay_sa,command=self._lay_sel_alpha)
+        self._lay_sc.grid(row=0,column=1,sticky="ew")
+        self._lay_sv=tk.Label(sf,text="",width=5,bg=C["panel"],fg=C["text"],font=self.F["ui"]); self._lay_sv.grid(row=0,column=2,padx=4)
+        b=self._btn(sf,"Auto",self._lay_sel_auto,bg=C["border"]); b.grid(row=0,column=3,padx=2)
+        Tip(b,"The selected parts follow the region and contact sliders again.",self.F["small"])
+        bf=tk.Frame(top,bg=C["panel"]); bf.pack(fill=tk.X,padx=8,pady=4)
+        for txt,fn in (("All visible",lambda:self._lay_set("all")),
+                       ("Semiconductors only",lambda:self._lay_set("semi")),
+                       ("Hide contacts",lambda:self._lay_set("nocon")),
+                       ("See-through contacts",lambda:self._lay_set("glass"))):
+            self._btn(bf,txt,fn,bg=C["border"]).pack(side=tk.LEFT,padx=3)
+        of=tk.Frame(top,bg=C["panel"]); of.pack(fill=tk.X,padx=10,pady=(2,4)); of.columnconfigure(1,weight=1)
+        redraw=lambda *_:self._debounce("_lay_after_id",self._lay_redraw,150)
+        for r,(txt,var) in enumerate((("Region opacity (all)",self.lay_ra),("Contact opacity (all)",self.lay_ca))):
+            tk.Label(of,text=txt,bg=C["panel"],fg=C["text"],font=self.F["ui"]).grid(row=r,column=0,sticky="w",padx=(0,8))
+            ttk.Scale(of,from_=0.,to=1.,orient=tk.HORIZONTAL,variable=var,command=lambda *_:(redraw(),self._lay_fill_later())
+                      ).grid(row=r,column=1,sticky="ew",pady=1)
+        cf=tk.Frame(top,bg=C["panel"]); cf.pack(fill=tk.X,padx=6,pady=(0,8))
+        self._check(cf,"Insulators in 3-D",self.lay_ins3d,self._lay_redraw)
+        self._check(cf,"Defects",self.lay_def,self._lay_redraw)
+        self._check(cf,"Apply to the cross-section too",self.lay_sec,self._lay_redraw)
+        self._lay_fill()
+    def _lay_redraw(self):
+        """Redraw the views the Layers choices act on."""
+        self._ddev()
+        if self.sol is not None and (self.cur_st3.get() or self.cur_bg.get()!="|J|"): self._upd_curr_plot()
+    def _lay_fill_later(self):
+        self._debounce("_lay_fill_id",self._lay_fill,250)
+    def _lay_fill(self):
+        top=self._lay_top
+        if top is None or not top.winfo_exists(): return
+        tv=self._lay_tv; sel=tv.selection()
+        for it in tv.get_children(): tv.delete(it)
+        for k,r in enumerate(self.regs):
+            fc,_=self._reg_color(r); tag="c"+fc.lstrip("#"); tv.tag_configure(tag,foreground=fc)
+            ins=r.mat in INSULATORS
+            info=r.mat+("" if ins else f" {r.dtype} {r.doping:.1e} cm⁻³")
+            hid=id(r) in self.lay_hide or (ins and not self.lay_ins3d.get())
+            a=self.lay_alpha.get(id(r)); op=f"{a:.2f}" if a is not None else f"auto {self._reg_alpha(r):.2f}"
+            tv.insert("","end",iid=f"r{k}",values=("–" if hid else "✓",r.label,"insulator" if ins else "region",op,info),
+                      tags=(tag,))
+        for k,c in enumerate(self.cons):
+            col=self._CC[k%len(self._CC)]; tag="c"+col.lstrip("#"); tv.tag_configure(tag,foreground=col)
+            bc={0:"ohmic",1:"Schottky",2:"gate"}[c.bc]
+            a=self.lay_alpha.get(id(c)); op=f"{a:.2f}" if a is not None else f"auto {self._con_alpha(c):.2f}"
+            tv.insert("","end",iid=f"c{k}",values=("–" if id(c) in self.lay_hide else "✓",c.label,"contact",op,
+                                                   f"{Con.FNAME[c.face]}, {bc}, {c.V:g} V"+(f" [{c.net}]" if c.net else "")),
+                      tags=(tag,))
+        if self.defects:
+            tv.insert("","end",iid="d",values=("✓" if self.lay_def.get() else "–",f"{len(self.defects)} defect(s)","defects",
+                                               "","the Defects page"))
+        keep=[i for i in sel if tv.exists(i)]
+        if keep: tv.selection_set(keep)
+    def _lay_obj(self,it):
+        if not it or it=="d": return None
+        k=int(it[1:]); lst=self.regs if it[0]=="r" else self.cons
+        return lst[k] if k<len(lst) else None
+    def _lay_click(self,e=None):
+        tv=self._lay_tv
+        if e is not None and e.type!=tk.EventType.KeyPress:
+            if tv.identify_column(e.x)!="#1": return            # elsewhere: just select
+            items=[tv.identify_row(e.y)]
+        else: items=list(tv.selection())
+        changed=False
+        for it in items:
+            if not it: continue
+            if it=="d": self.lay_def.set(not self.lay_def.get()); changed=True; continue
+            o=self._lay_obj(it)
+            if o is None: continue
+            if it[0]=="r" and o.mat in INSULATORS and not self.lay_ins3d.get():
+                self.lay_ins3d.set(True); self.lay_hide.discard(id(o))
+            elif id(o) in self.lay_hide: self.lay_hide.discard(id(o))
+            else: self.lay_hide.add(id(o))
+            changed=True
+        if changed: self._lay_fill(); self._lay_redraw()
+    def _lay_selected(self,_=None):
+        """Show the opacity of the first selected part on the slider."""
+        objs=[self._lay_obj(i) for i in self._lay_tv.selection()]; objs=[o for o in objs if o is not None]
+        if not objs: self._lay_sv.config(text=""); return
+        o=objs[0]; a=self.lay_alpha.get(id(o))
+        if a is None: a=self._reg_alpha(o) if isinstance(o,Reg) else self._con_alpha(o)
+        self.lay_sa.set(round(a,2)); self._lay_sv.config(text=f"{a:.2f}")
+    def _lay_sel_alpha(self,*_):
+        objs=[self._lay_obj(i) for i in self._lay_tv.selection()]; objs=[o for o in objs if o is not None]
+        if not objs: return
+        a=max(0.,min(1.,float(self.lay_sa.get())))
+        for o in objs: self.lay_alpha[id(o)]=a
+        self._lay_sv.config(text=f"{a:.2f}")
+        self._lay_fill_later(); self._debounce("_lay_after_id",self._lay_redraw,150)
+    def _lay_sel_auto(self):
+        for i in self._lay_tv.selection():
+            o=self._lay_obj(i)
+            if o is not None: self.lay_alpha.pop(id(o),None)
+        self._lay_fill(); self._lay_selected(); self._lay_redraw()
+    def _lay_set(self,what):
+        if what=="all":
+            self.lay_hide.clear(); self.lay_alpha.clear(); self.lay_def.set(True)
+            self.lay_ca.set(0.85); self.lay_ra.set(0.35)
+        elif what=="semi":
+            self.lay_hide={id(o) for o in self.cons}|{id(r) for r in self.regs if r.mat in INSULATORS}
+            self.lay_ins3d.set(False); self.lay_def.set(False)
+        elif what=="nocon":
+            self.lay_hide|={id(o) for o in self.cons}
+        elif what=="glass":
+            self.lay_hide-={id(o) for o in self.cons}; self.lay_ca.set(0.15)
+            for o in self.cons: self.lay_alpha.pop(id(o),None)
+        self._lay_fill(); self._lay_redraw()
+    def _lay_prune(self):
+        """Forget hidden parts and opacities of parts that no longer exist."""
+        live={id(o) for o in self.regs}|{id(o) for o in self.cons}
+        self.lay_hide&=live
+        self.lay_alpha={k:v for k,v in self.lay_alpha.items() if k in live}
+        self._lay_fill()
 
     def _draw_prism_mesh(self,a2,pm,H,Vv,N,pos,L):
         """Mesh overlay of a triangular-prism mesh in a section plane: the
@@ -6418,9 +7892,13 @@ class App(tk.Tk):
     def _plot_band(self):
         s=self.sol; fig=self.fb; fig.clear()
         if s is None: self.cvb.draw_idle(); return
-        gs=GridSpec(1,2,figure=fig,wspace=0.35,width_ratios=[1.6,1.])
-        ax=fig.add_subplot(gs[0]); ax3=fig.add_subplot(gs[1],projection="3d")
-        ax.set_facecolor(C["bg"]); ax3.set_facecolor(C["bg"])
+        vis=self._vis("tb")
+        if not vis: self._no_panels(fig,self.cvb); return
+        axs=row_axes(fig,[(k,1.6 if k=="band" else 1.,"3d" if k=="ribbon" else None) for k in vis])
+        ax=axs.get("band") or Figure().add_subplot()       # hidden: drawn off screen
+        ax3=axs.get("ribbon")
+        ax.set_facecolor(C["bg"])
+        if ax3 is not None: ax3.set_facecolor(C["bg"])
         A,p1,p2=self.bd_axis.get(),self.bd_p1.get(),self.bd_p2.get()
         x,Ec,(an1,av1),(an2,av2)=self._line_cut_at(s["Ec"],A,p1,p2)
         Ev=self._line_cut_at(s["Ev"],A,p1,p2)[1]; Efn=self._line_cut_at(s["Efn"],A,p1,p2)[1]
@@ -6451,13 +7929,14 @@ class App(tk.Tk):
             a2.set_ylabel("n, p (cm⁻³)",fontsize=8,color=C["sub"]); a2.tick_params(labelsize=7,colors=C["sub"])
         for d in {"X":self.dense_x,"Y":self.dense_y,"Z":self.dense_z}[A]:
             ax.axvline(d,color=C["yellow"],lw=0.8,ls=":",alpha=0.35)
-        Y=np.linspace(0,0.5,5); X2,Y2=np.meshgrid(x,Y)
-        ax3.plot_surface(X2,Y2,np.tile(Ec,(5,1)),color=C["Ec"],alpha=0.7,linewidth=0)
-        ax3.plot_surface(X2,Y2,np.tile(Ev,(5,1)),color=C["Ev"],alpha=0.7,linewidth=0)
-        if self.show_efnp.get():
-            ax3.plot(x,np.full_like(x,.25),Efn,color=C["Efn"],lw=2,ls="--")
-            ax3.plot(x,np.full_like(x,.25),Efp,color=C["Efp"],lw=2,ls="--")
-        sax3(ax3,xl,"","E (eV)",f"Band ribbon along {A}"); ax3.set_yticks([])
+        if ax3 is not None:
+            Y=np.linspace(0,0.5,5); X2,Y2=np.meshgrid(x,Y)
+            ax3.plot_surface(X2,Y2,np.tile(Ec,(5,1)),color=C["Ec"],alpha=0.7,linewidth=0)
+            ax3.plot_surface(X2,Y2,np.tile(Ev,(5,1)),color=C["Ev"],alpha=0.7,linewidth=0)
+            if self.show_efnp.get():
+                ax3.plot(x,np.full_like(x,.25),Efn,color=C["Efn"],lw=2,ls="--")
+                ax3.plot(x,np.full_like(x,.25),Efp,color=C["Efp"],lw=2,ls="--")
+            sax3(ax3,xl,"","E (eV)",f"Band ribbon along {A}"); ax3.set_yticks([])
         try: fig.tight_layout(pad=1.)
         except Exception: pass
         self.cvb.draw_idle()
@@ -6468,10 +7947,13 @@ class App(tk.Tk):
         self._hmaps={k:v for k,v in getattr(self,"_hmaps",{}).items() if k.figure is not fig}
         self.cur_hover.config(text="")
         if s is None: self.cvc.draw_idle(); return
-        gs=GridSpec(2,2,figure=fig,hspace=0.55,wspace=0.42)
-        aJ=fig.add_subplot(gs[0,0]); aR=fig.add_subplot(gs[1,0])
-        aQ=fig.add_subplot(gs[0,1]); aQ3=fig.add_subplot(gs[1,1],projection="3d")
-        for a in (aJ,aR,aQ,aQ3): a.set_facecolor(C["bg"])
+        vis=self._vis("tc")
+        pkey=self._gmap.get(self.cur_prof.get()) if self.cur_prof.get()!="(none)" else None
+        if pkey is None and "prof" in vis: vis.remove("prof")
+        if not vis: self._no_panels(fig,self.cvc); return
+        axs=grid_axes(fig,[(k,"3d" if k=="3d" else None) for k in vis])
+        aJ,aR,aQ,aQ3,aP=(axs.get(k) for k in ("line","rec","map","3d","prof"))
+        for a in axs.values(): a.set_facecolor(C["bg"])
         A,p1,p2=self.cur_axis.get(),self.cur_p1.get(),self.cur_p2.get()
         cx,Jx,(an1,av1),(an2,av2)=self._line_cut_at(s["Jx"],A,p1,p2)
         Jy=self._line_cut_at(s["Jy"],A,p1,p2)[1]; Jz=self._line_cut_at(s["Jz"],A,p1,p2)[1]
@@ -6480,17 +7962,21 @@ class App(tk.Tk):
         xl=f"{'depth y' if A=='Y' else A.lower()} (nm)"
         own=self._owner(s); dev=s.get("dev") or {}; regs=dev.get("regs",[])
         ownl=self._line_cut_at(own,A,p1,p2)[1] if own is not None else None
-        aJ.plot(cx,Jx,color="#34d399",lw=1.6,label="Jx"); aJ.plot(cx,Jy,color="#fbbf24",lw=1.6,label="Jy")
-        aJ.plot(cx,Jz,color="#f87171",lw=1.6,label="Jz")
-        aJ.plot(cx,np.sqrt(Jx**2+Jy**2+Jz**2),color=C["green"],lw=2.2,ls="--",label="|J|")
-        aJ.axhline(0,color=C["border"],lw=0.5); aJ.legend(fontsize=7,framealpha=0.85)
-        sax(aJ,xl,"J (A/cm²)",f"Current density along {A} ({an1} = {av1:.1f}, {an2} = {av2:.1f} nm)")
-        if np.any(np.abs(np.nan_to_num(Rt))>1e-30):
-            aR.plot(cx,Rt,color=C["red"],lw=2.,label="R net"); aR.legend(fontsize=7)
-        else:
-            aR.text(0.5,0.5,"R ≈ 0 (near equilibrium)",transform=aR.transAxes,ha="center",va="center",fontsize=10,color=C["sub"])
-        sax(aR,xl,"R (cm⁻³s⁻¹)",f"Net recombination along {A}")
-        self._ov_line(aJ,cx,ownl,regs); self._ov_line(aR,cx,ownl,regs)
+        if aJ is not None:
+            aJ.plot(cx,Jx,color="#34d399",lw=1.6,label="Jx"); aJ.plot(cx,Jy,color="#fbbf24",lw=1.6,label="Jy")
+            aJ.plot(cx,Jz,color="#f87171",lw=1.6,label="Jz")
+            aJ.plot(cx,np.sqrt(Jx**2+Jy**2+Jz**2),color=C["green"],lw=2.2,ls="--",label="|J|")
+            aJ.axhline(0,color=C["border"],lw=0.5); aJ.legend(fontsize=7,framealpha=0.85)
+            sax(aJ,xl,"J (A/cm²)",f"Current density along {A} ({an1} = {av1:.1f}, {an2} = {av2:.1f} nm)")
+            self._ov_line(aJ,cx,ownl,regs)
+        if aR is not None:
+            if np.any(np.abs(np.nan_to_num(Rt))>1e-30):
+                aR.plot(cx,Rt,color=C["red"],lw=2.,label="R net"); aR.legend(fontsize=7)
+            else:
+                aR.text(0.5,0.5,"R ≈ 0 (near equilibrium)",transform=aR.transAxes,ha="center",va="center",fontsize=10,color=C["sub"])
+            sax(aR,xl,"R (cm⁻³s⁻¹)",f"Net recombination along {A}")
+            self._ov_line(aR,cx,ownl,regs)
+        if aP is not None: self._plot_prof(aP,s,pkey)
         Nz_,Ny_,Nx_=s["Jx"].shape
         # in-plane map: the plane that CONTAINS the cut line
         if A in ("X","Y"):
@@ -6507,10 +7993,14 @@ class App(tk.Tk):
             own2=own[:,:,i].T if own is not None else None; ovax=("z","y","x"); ovpos=s["x"][i]
         M=np.sqrt(U**2+Vq**2)
         n2,n3=self._arrow_n()
-        if np.nanmax(M)>1e-30:
+        bg=self.cur_bg.get(); sa=max(0.,min(1.,float(self.cur_sa.get())))
+        if aQ is None: pass
+        elif np.nanmax(M)>1e-30:
             X1,Y1=np.meshgrid(hx,vy)
-            pc=aQ.pcolormesh(X1,Y1,np.ma.masked_invalid(M),cmap="viridis",shading="nearest")
-            fig.colorbar(pc,ax=aQ,label="|J| (A/cm²)",shrink=0.85,pad=0.02)
+            if bg!="structure":
+                pc=aQ.pcolormesh(X1,Y1,np.ma.masked_invalid(M),cmap="viridis",shading="nearest")
+                fig.colorbar(pc,ax=aQ,label="|J| (A/cm²)",shrink=0.85,pad=0.02)
+            if bg!="|J|": self._struct_plane(aQ,hx,vy,own2,regs,sa)
             if self.cur_show_arrows2d.get():
                 # n2 arrows across, rows spaced alike on screen; J interpolated to the
                 # arrow points (so the count is not limited by the mesh)
@@ -6533,15 +8023,21 @@ class App(tk.Tk):
                           color="white",scale=25./f,width=min(0.006,max(0.0012,0.004*f**0.7)),
                           headwidth=4,headlength=5,alpha=0.9,pivot="mid")
         else:
+            if bg!="|J|": self._struct_plane(aQ,hx,vy,own2,regs,sa)
             aQ.text(0.5,0.5,"J ≈ 0 (no current flow)",transform=aQ.transAxes,ha="center",va="center",fontsize=10,color=C["sub"])
-        if cut[0]=="h": aQ.axhline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
-        else: aQ.axvline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
-        aQ.set_xlim(hx[0],hx[-1]); aQ.set_ylim(vy[0],vy[-1])
-        if invert: aQ.invert_yaxis()
-        self._ov_plane(aQ,hx,vy,own2,regs,dev.get("cons"),ovax,ovpos,dev.get("L"),[cut])
-        sax(aQ,xlab,ylab,ttl+"  (dashed: the line cut)")
-        self._reg_hover(aQ,hx,vy,M,"|J| (A/cm²)",ovax,ovpos)
-        if self.cur_show_arrows3d.get():
+        if aQ is not None:
+            if cut[0]=="h": aQ.axhline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
+            else: aQ.axvline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
+            aQ.set_xlim(hx[0],hx[-1]); aQ.set_ylim(vy[0],vy[-1])
+            if invert: aQ.invert_yaxis()
+            self._ov_plane(aQ,hx,vy,own2,regs,dev.get("cons"),ovax,ovpos,dev.get("L"),[cut])
+            sax(aQ,xlab,ylab,ttl+"  (dashed: the line cut)")
+            self._reg_hover(aQ,hx,vy,M,"|J| (A/cm²)",ovax,ovpos)
+        if aQ3 is not None and self.cur_st3.get() and regs:      # the structure, see-through, under the arrows
+            L3d=dev.get("L") or (float(s["x"][-1]),float(s["y"][-1]),float(s["z"][-1]))
+            self._draw_struct3(aQ3,regs,dev.get("cons") or [],L3d,overlay=sa,editor=False)
+        if aQ3 is None: pass
+        elif self.cur_show_arrows3d.get():
             x,y,z=s["x"],s["y"],s["z"]
             # a regular lattice of n3 x 0.75 n3 x 0.625 n3 arrows (x, depth y, z;
             # 8 x 6 x 5 by default), never more planes than mesh lines along an
@@ -6576,19 +8072,84 @@ class App(tk.Tk):
             self._aspect3(aQ3,x.max(),y.max(),z.max())
             sax3(aQ3,"x","z","depth y",f"3-D current field ({nar} arrows)"); _depth_axis(aQ3)
         else:
-            aQ3.text2D(0.5,0.5,"3-D arrows hidden",transform=aQ3.transAxes,ha="center",fontsize=10,color=C["sub"])
-            sax3(aQ3,"x","z","depth y","3-D current field (off)")
+            x,y,z=s["x"],s["y"],s["z"]
+            if not self.cur_st3.get():
+                aQ3.text2D(0.5,0.5,"3-D arrows hidden",transform=aQ3.transAxes,ha="center",fontsize=10,color=C["sub"])
+            aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
+            self._aspect3(aQ3,x.max(),y.max(),z.max())
+            sax3(aQ3,"x","z","depth y","3-D current field (arrows off)"); _depth_axis(aQ3)
         try: fig.tight_layout(pad=1.)
         except Exception: pass
         self._flush_labels(fig)
         self.cvc.draw_idle()
 
+    def _struct_plane(self,ax,hx,vy,own2,regs,alpha):
+        """The structure in a solution plane: each node in its region's colour,
+        see-through (alpha, or the part's own opacity from Layers…; hidden
+        parts left out) - drawn over the |J| map or alone, under the arrows."""
+        if own2 is None or not regs: return
+        from matplotlib.colors import ListedColormap,BoundaryNorm,to_rgba
+        n=len(regs); tab=np.zeros((n+1,4))
+        for k,r in enumerate(regs):
+            hid,own=self._lay_part("r",k,r)
+            if hid: continue
+            c=to_rgba(self._reg_color(r)[0]); a=own if own is not None else alpha
+            tab[k]=(c[0],c[1],c[2],max(0.,min(1.,a)))
+        idx=np.where(np.asarray(own2)>=0,own2,n)
+        ax.pcolormesh(hx,vy,idx,cmap=ListedColormap(tab),norm=BoundaryNorm(np.arange(-0.5,n+1.5,1.),n+1),
+                      shading="nearest")
+    def _plot_prof(self,ax,s,key):
+        """'Current under a contact' panel: J through the chosen contact(s)."""
+        dev=s.get("dev") or {}; cons=dev.get("cons") or self.cons
+        idx=group_of(cons,key) if key else []
+        ttl=f"Current through '{key}'"
+        pr=contact_profile(s,cons,idx) if idx else None
+        if pr is None:
+            msg=(f"'{key}' is not a contact of this solution" if not idx else
+                 "Box contacts and gates have no face profile -\nuse the line cut instead")
+            ax.text(0.5,0.5,msg,transform=ax.transAxes,ha="center",va="center",fontsize=9,color=C["sub"])
+            sax(ax,"","",ttl); return
+        st=profile_stats(pr); U,Vn=pr["axes"]; parts=pr["parts"]
+        sg=1. if st["mean"]>=0 else -1.
+        lbl="J into the device (A/cm²)" if sg>0 else "J out of the device (A/cm²)"
+        cu,cv=s[U.lower()],s[Vn.lower()]
+        nu=len(np.unique(np.concatenate([p[1] for p in parts]))); nv=max(len(p[2]) for p in parts)
+        if nu>=4 and nv>=4 and len(cv)>=6:                       # a contact area: map it
+            lo=min(float((sg*p[3]).min()) for p in parts); hi=max(float((sg*p[3]).max()) for p in parts)
+            if hi<=lo: hi=lo+1e-30
+            pc=None
+            for lab,u,v,J,w in parts:
+                pc=ax.pcolormesh(u,v,(sg*J).T,cmap="viridis",vmin=lo,vmax=hi,shading="nearest")
+            ax.get_figure().colorbar(pc,ax=ax,label=lbl,shrink=0.85,pad=0.02)
+            ax.set_xlim(cu[0],cu[-1]); ax.set_ylim(cv[0],cv[-1])
+            if Vn=="Y": ax.invert_yaxis()
+            if 1/3<=(cu[-1]-cu[0])/max(cv[-1]-cv[0],1e-12)<=3: ax.set_aspect("equal",adjustable="box")
+            sax(ax,f"{U.lower()} (nm)",f"{Vn.lower()} (nm)",ttl+" - map over the contact")
+        else:                                                    # across the contact
+            col=C["green"]
+            for n,(lab,u,v,J,w) in enumerate(parts):
+                ww=w.sum(axis=1); Ju=sg*(J*w).sum(axis=1)/np.where(ww>0,ww,1.)
+                ax.plot(u,Ju,color=col,lw=1.8,marker="o",ms=3,label=lab if len(parts)<=4 else (key if n==0 else None))
+            ax.axhline(sg*st["mean"],color=C["yellow"],lw=1,ls="--",label=f"mean {sg*st['mean']:.3g} A/cm²")
+            ax.axhline(0,color=C["border"],lw=0.5)
+            ax.set_xlim(cu[0],cu[-1]); ax.legend(fontsize=7,framealpha=0.85)
+            sax(ax,f"{'depth y' if U=='Y' else U.lower()} (nm)",lbl,ttl)
+        txt=f"J max / mean = {st['max']/st['mean'] if sg>0 else st['min']/st['mean']:.2f}"
+        if st["ce"]:
+            c0,e0=st["ce"][0]
+            if e0: txt+=f"\ncentre / edge = {c0/e0:.2f}"
+        if pr["skipped"]: txt+=f"\n(not shown: {', '.join(pr['skipped'][:3])})"
+        ax.text(0.02,0.97,txt,transform=ax.transAxes,va="top",fontsize=8,color=C["yellow"],
+                bbox=dict(boxstyle="round,pad=0.35",facecolor=C["panel"],edgecolor=C["border"],alpha=0.9))
+
     # ─── FIELD & MOBILITY ──────────────────────────────────────
     def _plot_fi(self):
         s=self.sol; fig=self.ff; fig.clear()
         if s is None: self.cvf.draw_idle(); return
-        gs=GridSpec(1,2,figure=fig,wspace=0.38)
-        aE=fig.add_subplot(gs[0]); aM=fig.add_subplot(gs[1])
+        vis=self._vis("tf")
+        if not vis: self._no_panels(fig,self.cvf); return
+        axs=row_axes(fig,[(k,1.,None) for k in vis],wspace=0.38)
+        aE=axs.get("E") or Figure().add_subplot(); aM=axs.get("mu") or Figure().add_subplot()   # hidden: off screen
         aE.set_facecolor(C["bg"]); aM.set_facecolor(C["bg"])
         A,p1,p2=self.fi_axis.get(),self.fi_p1.get(),self.fi_p2.get()
         cx,phi,(an1,av1),(an2,av2)=self._line_cut_at(s["phi"],A,p1,p2)
@@ -6651,6 +8212,10 @@ class App(tk.Tk):
                 Qt=np.nan_to_num(s.get("Qtrap",np.zeros_like(s["phi"])))
                 return (np.where(semi,np.sign(Qt)*np.log10(1.+np.abs(Qt)),np.nan),"RdBu_r",
                         "trapped charge ±log₁₀(1+|ρ/q|) (cm⁻³, + = positive)")
+            if qty=="log10 G avalanche":
+                G=np.nan_to_num(s.get("Gii",np.zeros_like(s["phi"])))
+                return (np.where(semi&(G>0),np.log10(np.maximum(G,1e-300)),np.nan),"inferno",
+                        "log₁₀ G impact ionisation (cm⁻³s⁻¹)"+("" if self.sol.get("models",0)&M_II else " - avalanche off"))
             if qty=="Λn quantum":
                 return (np.where(semi,s.get("Lqn",np.zeros_like(s["phi"])),np.nan),"magma",
                         "Λn quantum potential (eV)"+("" if self.sol.get("models",0)&M_QC else " - MLDA off"))
@@ -6669,31 +8234,43 @@ class App(tk.Tk):
         Zxy=Q3[sz,:,:]; Zxz=Q3[:,sy,:]; Zyz=Q3[:,:,sx]
         fin=Q3[np.isfinite(Q3)]
         vmin,vmax=(float(fin.min()),float(fin.max())) if fin.size else (0.,1.)
-        if qty=="log10|J gate|": vmin=max(vmin,vmax-8.)          # the top 8 decades
+        if qty in ("log10|J gate|","log10 G avalanche"): vmin=max(vmin,vmax-8.)          # the top 8 decades
         if vmin==vmax: vmax=vmin+1e-10
         norm=plt.Normalize(vmin,vmax); sm=plt.cm.ScalarMappable(norm=norm,cmap=cmap)
         fig=self.fsl; fig.clear()
-        gs=GridSpec(3,2,figure=fig,width_ratios=[1.35,1.0],hspace=0.55,wspace=0.18)
-        a3=fig.add_subplot(gs[:,0],projection="3d"); a3.set_facecolor(C["bg"])
-        axy=fig.add_subplot(gs[0,1]); ayz=fig.add_subplot(gs[1,1]); axz=fig.add_subplot(gs[2,1])
-        for a in (axy,ayz,axz): a.set_facecolor(C["bg"])
-        ds=max(1,int((Nx*Ny*Nz/40_000)**0.5)) if Nx*Ny*Nz>200_000 else 1
-        xd,yd,zd=x[::ds],y[::ds],z[::ds]
-        def rgba(Z):
-            c=sm.to_rgba(np.nan_to_num(Z,nan=vmin)); c[...,3]=np.where(np.isfinite(Z),0.9,0.08); return c
-        Xg,Yg=np.meshgrid(xd,yd)
-        a3.plot_surface(Xg,np.full_like(Xg,z[sz]),-Yg,facecolors=rgba(Zxy[::ds,::ds]),shade=False,
-                        rstride=max(1,len(yd)//40),cstride=max(1,len(xd)//40))
-        Xg2,Zg2=np.meshgrid(xd,zd)
-        a3.plot_surface(Xg2,Zg2,np.full_like(Xg2,-y[sy]),facecolors=rgba(Zxz[::ds,::ds]),shade=False,
-                        rstride=max(1,len(zd)//40),cstride=max(1,len(xd)//40))
-        Yg3,Zg3=np.meshgrid(yd,zd)
-        a3.plot_surface(np.full_like(Yg3,x[sx]),Zg3,-Yg3,facecolors=rgba(Zyz[::ds,::ds]),shade=False,
-                        rstride=max(1,len(zd)//40),cstride=max(1,len(yd)//40))
-        a3.set_xlim(x[0],x[-1]); a3.set_ylim(z[0],z[-1]); a3.set_zlim(-y[-1],-y[0])
-        self._aspect3(a3,x[-1]-x[0],y[-1]-y[0],z[-1]-z[0])
-        sax3(a3,"x (nm)","z (nm)","depth y (nm)",f"{lbl}"); _depth_axis(a3)
-        fig.colorbar(sm,ax=a3,shrink=0.55,pad=0.06,label=lbl)
+        vis=self._vis("ts")
+        if not vis: self._no_panels(fig,self.cvsl); return
+        flat=[k for k in vis if k!="3d"]; a3=None; A2={}
+        if "3d" in vis and flat:
+            gs=GridSpec(len(flat),2,figure=fig,width_ratios=[1.35,1.0],hspace=0.55,wspace=0.18)
+            a3=fig.add_subplot(gs[:,0],projection="3d")
+            for i_,k in enumerate(flat): A2[k]=fig.add_subplot(gs[i_,1])
+        elif "3d" in vis: a3=fig.add_subplot(111,projection="3d")
+        else:
+            gs=GridSpec(1,len(flat),figure=fig,wspace=0.32)
+            for i_,k in enumerate(flat): A2[k]=fig.add_subplot(gs[0,i_])
+        for a in A2.values(): a.set_facecolor(C["bg"])
+        axy,ayz,axz=A2.get("xy"),A2.get("yz"),A2.get("xz")
+        if a3 is not None:
+            a3.set_facecolor(C["bg"])
+            ds=max(1,int((Nx*Ny*Nz/40_000)**0.5)) if Nx*Ny*Nz>200_000 else 1
+            xd,yd,zd=x[::ds],y[::ds],z[::ds]
+            def rgba(Z):
+                c=sm.to_rgba(np.nan_to_num(Z,nan=vmin)); c[...,3]=np.where(np.isfinite(Z),0.9,0.08); return c
+            Xg,Yg=np.meshgrid(xd,yd)
+            a3.plot_surface(Xg,np.full_like(Xg,z[sz]),-Yg,facecolors=rgba(Zxy[::ds,::ds]),shade=False,
+                            rstride=max(1,len(yd)//40),cstride=max(1,len(xd)//40))
+            Xg2,Zg2=np.meshgrid(xd,zd)
+            a3.plot_surface(Xg2,Zg2,np.full_like(Xg2,-y[sy]),facecolors=rgba(Zxz[::ds,::ds]),shade=False,
+                            rstride=max(1,len(zd)//40),cstride=max(1,len(xd)//40))
+            Yg3,Zg3=np.meshgrid(yd,zd)
+            a3.plot_surface(np.full_like(Yg3,x[sx]),Zg3,-Yg3,facecolors=rgba(Zyz[::ds,::ds]),shade=False,
+                            rstride=max(1,len(zd)//40),cstride=max(1,len(yd)//40))
+            a3.set_xlim(x[0],x[-1]); a3.set_ylim(z[0],z[-1]); a3.set_zlim(-y[-1],-y[0])
+            self._aspect3(a3,x[-1]-x[0],y[-1]-y[0],z[-1]-z[0])
+            sax3(a3,"x (nm)","z (nm)","depth y (nm)",f"{lbl}"); _depth_axis(a3)
+            fig.colorbar(sm,ax=a3,shrink=0.55,pad=0.06,label=lbl)
+        else: fig.colorbar(sm,ax=list(A2.values()),shrink=0.8,pad=0.03,label=lbl)
         own=self._owner(s); dev=s.get("dev") or {}; regs=dev.get("regs",[])
         def pmap(ax,hc,vc,Z,title,xl,yl,hl=None,vl=None,inv=False,o2=None,ovax=None,ovpos=None):
             cuts=[("v",hl),("h",vl)]
@@ -6731,12 +8308,15 @@ class App(tk.Tk):
             ax.set_xlabel(xl,fontsize=7,color=C["sub"]); ax.set_ylabel(yl,fontsize=7,color=C["sub"])
             ax.tick_params(labelsize=6,colors=C["sub"])
             if ovax is not None: self._reg_hover(ax,hc,vc,Z,lbl,ovax,ovpos)
-        pmap(axy,x,y,Zxy,f"XY @ z = {z[sz]:.1f} nm","x (nm)","depth y (nm)",x[sx],y[sy],True,
-             own[sz,:,:] if own is not None else None,("x","y","z"),z[sz])
-        pmap(ayz,z,y,Zyz.T,f"YZ @ x = {x[sx]:.1f} nm","z (nm)","depth y (nm)",z[sz],y[sy],True,
-             own[:,:,sx].T if own is not None else None,("z","y","x"),x[sx])
-        pmap(axz,x,z,Zxz,f"XZ @ y = {y[sy]:.1f} nm","x (nm)","z (nm)",x[sx],z[sz],False,
-             own[:,sy,:] if own is not None else None,("x","z","y"),y[sy])
+        if axy is not None:
+            pmap(axy,x,y,Zxy,f"XY @ z = {z[sz]:.1f} nm","x (nm)","depth y (nm)",x[sx],y[sy],True,
+                 own[sz,:,:] if own is not None else None,("x","y","z"),z[sz])
+        if ayz is not None:
+            pmap(ayz,z,y,Zyz.T,f"YZ @ x = {x[sx]:.1f} nm","z (nm)","depth y (nm)",z[sz],y[sy],True,
+                 own[:,:,sx].T if own is not None else None,("z","y","x"),x[sx])
+        if axz is not None:
+            pmap(axz,x,z,Zxz,f"XZ @ y = {y[sy]:.1f} nm","x (nm)","z (nm)",x[sx],z[sz],False,
+                 own[:,sy,:] if own is not None else None,("x","z","y"),y[sy])
         self._flush_labels(fig)
         self.cvsl.draw_idle()
 
@@ -6750,22 +8330,22 @@ class App(tk.Tk):
             if m["Ve"]<m["Vs"]: o=o[::-1]
             R=dict(V=V[o],I=np.array([r["I"] for r in recs])[o],F=np.array([r["F"] for r in recs])[o],
                    conv=np.array([r["conv"] for r in recs],bool)[o],
-                   Vf=np.array([np.nan if r["Vf"] is None else r["Vf"] for r in recs],float)[o])
+                   Vf=np.array([np.nan if r["Vf"] is None else r["Vf"] for r in recs],float)[o],
+                   Qn=np.array([r.get("Qn",np.nan) for r in recs],float)[o],
+                   Qp=np.array([r.get("Qp",np.nan) for r in recs],float)[o])
             return dict(R=R,A=None,cons=m["cons"],groups=m["groups"],tkey=m["tkey"],fkey=m["fkey"],
-                        okey=m["okey"],bv=m["bv"],wl=m.get("wl"))
+                        okey=m["okey"],bv=m["bv"],wl=m.get("wl"),models=m.get("models"),tname=self.tname)
         return self.ivd
 
-    def _plot_iv(self,live=False):
-        d=self._iv_data(live); fig=self.fiv
-        if d is None or len(d["R"]["V"])==0:
-            if not live: self._placeholder(fig,self.cviv,"No sweep yet - set it up in the Sweep page and press ↔ Sweep (F6)")
-            return
-        fig.clear()
+    def _iv_prep(self,d):
+        """Terminal (net) currents of a sweep record (the last sweep, a live
+        one, or a pinned one) and which terminal to show."""
         R=d["R"]; V=R["V"]; I=R["I"]; F=R["F"]; cv=R["conv"]
-        cons=d["cons"]; groups=d["groups"]
+        groups=d["groups"]
+        bcs=d.get("bcs") or [c.bc for c in d["cons"]]
         gI={k:I[:,idx].sum(axis=1) for k,idx in groups}
         gF={k:F[:,idx].sum(axis=1) for k,idx in groups}
-        gate={k:all(cons[c].bc==2 for c in idx) for k,idx in groups}
+        gate={k:all(bcs[c]==2 for c in idx) for k,idx in groups}
         A=d.get("A")
         gA={k:(float(sum(A[c] for c in idx)) if A is not None else 0.) for k,idx in groups}
         tkey,fkey=d["tkey"],d["fkey"]
@@ -6776,37 +8356,141 @@ class App(tk.Tk):
             if fkey: okey=max([k for k in cand if k!=tkey] or cand or [tkey],key=big)
             elif tkey in gI and not gate[tkey]: okey=tkey
             else: okey=max(cand or [tkey],key=big)
+        # a floating terminal makes a transfer curve (inverter output) - unless
+        # the swept terminal's own current is observed (an open-base transistor)
+        return dict(V=V,cv=cv,gI=gI,gF=gF,gA=gA,gate=gate,tkey=tkey,fkey=fkey,okey=okey,cand=cand,
+                    groups=groups,R=R,models=d.get("models"),bv=d.get("bv",0.),wl=d.get("wl"),
+                    tname=d.get("tname",""),vtc=bool(fkey) and okey!=tkey,T=d.get("T"),vapp=d.get("vapp"))
+
+    @staticmethod
+    def _bjt_roles(P):
+        """(base, collector, emitter) when the sweep is a Gummel plot - the
+        swept terminal drives the base, the observed one is the collector,
+        the emitter is the other carrier terminal with the largest current;
+        None for anything else (a gain far above 1e5 is not a BJT either)."""
+        t,o=P["tkey"],P["okey"]
+        if P["fkey"] or t==o or P["gate"].get(t) or P["gate"].get(o) or t not in P["gI"]: return None
+        rest=[k for k in P["cand"] if k not in (t,o)]
+        if not rest: return None
+        gI=P["gI"]; e=max(rest,key=lambda k:float(np.nanmax(np.abs(gI[k]))) if len(gI[k]) else 0.)
+        ok=P["cv"]&(np.abs(gI[t])>0)
+        if ok.sum()<3: return None
+        b=np.abs(gI[o][ok])/np.abs(gI[t][ok])
+        if not (0.3<float(np.nanmedian(b))<1e5): return None
+        return t,o,e
+
+    def _bjt_curves(self,P):
+        """beta and f_T along a Gummel sweep record (see bjt_gain_ft); the
+        stored charge is the base's majority carrier: holes when the
+        collector current flows in (NPN), electrons otherwise (PNP)."""
+        roles=self._bjt_roles(P)
+        if roles is None: return None
+        b,c,e=roles; R=P["R"]; Ic=P["gI"][c]
+        j=int(np.nanargmax(np.abs(Ic))) if len(Ic) else 0
+        npn=Ic[j]>=0
+        Q=R.get("Qp" if npn else "Qn")
+        g=bjt_gain_ft(P["V"],P["gI"][b],Ic,Q,P["cv"])
+        if g is None: return None
+        g.update(base=b,coll=c,emit=e,npn=npn,AE=P["gA"].get(e,0.))
+        return g
+
+    def _plot_iv(self,live=False):
+        if not live: self._ptab_fill()
+        d=self._iv_data(live); fig=self.fiv
+        pins=[p for p in self.pins if p.get("show",True)]
+        have=d is not None and len(d["R"]["V"])>0
+        if not have and not pins:
+            if not live: self._placeholder(fig,self.cviv,"No sweep yet - set it up in the Sweep page and press ↔ Sweep (F6)")
+            return
+        P=self._iv_prep(d) if have else None
+        if P is not None:                       # only pins of the same swept terminal overlay
+            pins=[p for p in pins if p["d"]["tkey"]==P["tkey"]]
+        self._pins_drawn=len(pins)
         par=[]
-        if fkey:
-            self._plot_vtc(fig,V,R["Vf"],cv,gI,gF,gate,tkey,fkey,okey,par)
+        if P is not None and P["vtc"]:
+            fig.clear()
+            self._plot_vtc(fig,P,par)
         else:
-            self._plot_ivc(fig,V,cv,gI,gF,gA,gate,tkey,okey,d.get("bv",0.),par,cand,d.get("wl"))
+            vis=self._vis("ti")
+            if not vis: self._no_panels(fig,self.cviv); return
+            fig.clear()
+            self._plot_ivc(fig,P,[p for p in pins if not self._iv_prep(p["d"])["vtc"]],par,vis)
         try: fig.tight_layout(pad=1.)
         except Exception: pass
         self.cviv.draw_idle()
         if not live:
-            hdr=f"{d.get('tname',self.tname)}: sweep of {tkey}"+(f", {fkey} floating" if fkey else "")
+            if P is not None:
+                hdr=f"{P['tname'] or self.tname}: sweep of {P['tkey']}"+(f", {P['fkey']} floating" if P["fkey"] else "")
+            else: hdr="Pinned sweeps"
             self._settext(self.res_par,hdr+"\n"+("\n".join(par) if par else "(no parameters apply to this sweep)"))
+    def _replot_iv(self):
+        if self.ivd is not None or self.pins: self._plot_iv()
 
-    def _plot_ivc(self,fig,V,cv,gI,gF,gA,gate,tkey,okey,bv,par,cand,wl=None):
-        gs=GridSpec(1,2,figure=fig,wspace=0.45)
-        aL=fig.add_subplot(gs[0]); aS=fig.add_subplot(gs[1])
-        aL.set_facecolor(C["bg"]); aS.set_facecolor(C["bg"])
-        Io=gI[okey]; Fo=gF[okey]
-        good=cv&(np.abs(Io)>=Fo); low=cv&~(np.abs(Io)>=Fo)
-        sc,un=_cur_unit(float(np.nanmax(np.abs(Io))) if len(Io) else 0.)
-        if good.any(): aL.plot(V[good],Io[good]/sc,color=C["green"],lw=2,marker="o",ms=3.5,label="converged")
-        if low.any(): aL.plot(V[low],Io[low]/sc,color=C["sub"],marker="o",mfc="none",ms=4,ls="none",label="below resolution")
-        if (~cv).any(): aL.plot(V[~cv],Io[~cv]/sc,color=C["red"],marker="x",ms=6,ls="none",label="not converged")
+    def _plot_ivc(self,fig,P,pins,par,vis):
+        """I-V panels: linear, semi-log (all terminals), BJT gain and f_T;
+        P = the last sweep (None: pinned curves only), pins = pinned sweeps
+        drawn over it (dashed, in their own colours)."""
+        PP=[(p,self._iv_prep(p["d"])) for p in pins]
+        bj=self._bjt_curves(P) if P is not None else None
+        bjp=[(p,self._bjt_curves(Q)) for p,Q in PP]
+        if "bjt" in vis and bj is None and not any(g is not None for _,g in bjp): vis=[k for k in vis if k!="bjt"]
+        if not vis: vis=["lin"]
+        axs=row_axes(fig,[(k,1.,None) for k in vis],wspace=0.45)
+        for a in axs.values(): a.set_facecolor(C["bg"])
+        aL=axs.get("lin") or Figure().add_subplot(); aS=axs.get("log") or Figure().add_subplot()
+        aB=axs.get("bjt")
+        # common current unit for the linear panel
+        mags=[]
+        if P is not None and len(P["gI"][P["okey"]]): mags.append(float(np.nanmax(np.abs(P["gI"][P["okey"]]))))
+        for _,Q in PP:
+            if len(Q["gI"][Q["okey"]]): mags.append(float(np.nanmax(np.abs(Q["gI"][Q["okey"]]))))
+        sc,un=_cur_unit(max([m for m in mags if np.isfinite(m)] or [0.]))
         aL.axhline(0,color=C["border"],lw=0.5); aL.axvline(0,color=C["border"],lw=0.5)
-        aL.legend(fontsize=7); sax(aL,f"V({tkey}) (V)",f"I({okey}) ({un} per cell)",f"{okey} current vs {tkey} voltage")
-        aL.yaxis.get_major_formatter().set_useOffset(False)
-        Aok=gA.get(okey,0.)
-        if Aok>0:
+        aL._iv_sc=sc
+        if P is not None:
+            self._iv_main(aL,aS,P,sc,un,par,bj)
+        for p,Q in PP:
+            Io=Q["gI"][Q["okey"]]; ok=Q["cv"]&np.isfinite(Io)
+            if not ok.any(): continue
+            lab=f"{p['name']}: I({Q['okey']})"
+            aL.plot(Q["V"][ok],Io[ok]/sc,color=p["color"],lw=1.6,ls="--",marker="o",ms=2.5,label=lab)
+            a=np.abs(Io); okl=ok&(a>0)&(a>=Q["gF"][Q["okey"]])
+            if okl.any(): aS.semilogy(Q["V"][okl],a[okl],color=p["color"],lw=1.6,ls="--",marker="o",ms=2.5,label=lab)
+        if P is None and PP:
+            Q=PP[0][1]
+            sax(aL,f"V({Q['tkey']}) (V)",f"I ({un} per cell)","Pinned sweeps")
+            sax(aS,f"V({Q['tkey']}) (V)","|I| (A per cell)","Pinned sweeps (semi-log)")
+        if aL.get_legend_handles_labels()[0]: aL.legend(fontsize=7)
+        if aS.get_legend_handles_labels()[0]: aS.legend(fontsize=6)
+        Aok=getattr(aL,"_iv_Aok",0.)
+        if Aok>0 and "lin" in axs:
             a2=aL.twinx(); y0,y1=aL.get_ylim(); a2.set_ylim(y0*sc/(Aok*1e4),y1*sc/(Aok*1e4))
             from matplotlib.ticker import EngFormatter
             a2.yaxis.set_major_formatter(EngFormatter(places=None,sep=" "))
             a2.set_ylabel("J (A/cm²)",fontsize=8,color=C["sub"]); a2.tick_params(labelsize=7,colors=C["sub"])
+        if aB is not None: self._plot_bjt_panel(aB,P,bj,bjp)
+        for p,Q in PP:
+            tn=Q["tname"] or ""
+            par.append(f"── pinned: {p['name']} - sweep of {Q['tkey']}"+(f" ({tn})" if tn and p["name"] not in tn else "")+" ──")
+            self._iv_params(Q,par,None,None,self._bjt_curves(Q))
+        n=len(self.pins); sh=len(PP)
+        self.iv_pin_lbl.config(text=(f"{n} pinned, {sh} drawn" + ("" if sh==n else
+                                     " (hidden, or another swept terminal)")) if n else "")
+
+    def _iv_main(self,aL,aS,P,sc,un,par,bj):
+        """The last sweep in detail: the observed terminal on the linear
+        panel (converged / below resolution / failed points), every terminal
+        on the semi-log one, and the extracted parameters."""
+        V,cv,gI,gF,gA,gate=P["V"],P["cv"],P["gI"],P["gF"],P["gA"],P["gate"]
+        tkey,okey,cand=P["tkey"],P["okey"],P["cand"]
+        Io=gI[okey]; Fo=gF[okey]
+        good=cv&(np.abs(Io)>=Fo); low=cv&~(np.abs(Io)>=Fo)
+        if good.any(): aL.plot(V[good],Io[good]/sc,color=C["green"],lw=2,marker="o",ms=3.5,label="converged")
+        if low.any(): aL.plot(V[low],Io[low]/sc,color=C["sub"],marker="o",mfc="none",ms=4,ls="none",label="below resolution")
+        if (~cv).any(): aL.plot(V[~cv],Io[~cv]/sc,color=C["red"],marker="x",ms=6,ls="none",label="not converged")
+        sax(aL,f"V({tkey}) (V)",f"I({okey}) ({un} per cell)",f"{okey} current vs {tkey} voltage")
+        aL.yaxis.get_major_formatter().set_useOffset(False)
+        aL._iv_Aok=gA.get(okey,0.)             # the J axis is added once every curve is drawn
         tun=[k for k in gI if gate.get(k) and len(gI[k]) and np.nanmax(np.abs(gI[k]))>0]
         # the semi-log axis spans the plotted output current and its resolution
         # (+3 decades): a 1e-38 A tunnelling current under a uA drain current
@@ -6824,98 +8508,252 @@ class App(tk.Tk):
         if np.any(gF[okey]>0):
             aS.semilogy(V,np.maximum(gF[okey],1e-300),color=C["sub"],lw=0.8,ls=":",label=f"resolution ({okey})")
         if ylo is not None and aS.get_ylim()[0]<ylo: aS.set_ylim(bottom=ylo)
-        aS.legend(fontsize=6); sax(aS,f"V({tkey}) (V)","|I| (A per cell)","All terminals (semi-log)")
-        # ── parameters ──
+        sax(aS,f"V({tkey}) (V)","|I| (A per cell)","All terminals (semi-log)")
+        fk=P["fkey"]
+        if fk:                                  # an open (floating, I = 0) terminal: its voltage
+            Vf=np.asarray(P["R"]["Vf"],float); okf=cv&np.isfinite(Vf)
+            if okf.any():
+                a3=aS.twinx(); a3.plot(V[okf],Vf[okf],color=C["orange"],lw=1.2,ls="-.",label=f"V({fk}), open")
+                a3.set_ylabel(f"V({fk}) - open, I = 0 (V)",fontsize=8,color=C["orange"])
+                a3.tick_params(labelsize=7,colors=C["orange"])
+        self._iv_params(P,par,aL,aS,bj)
+
+    def _iv_params(self,P,par,aL,aS,bj,vals=None):
+        """Parameters extracted from one sweep record: text lines into par,
+        the numbers into vals (name -> (value, unit, how to compare: 'd'
+        difference, 'p' difference and per cent, 'r' ratio); the parameter
+        table) and, with the axes (the last sweep), their markers."""
+        V,cv,gI,gF,gA,gate=P["V"],P["cv"],P["gI"],P["gF"],P["gA"],P["gate"]
+        tkey,okey,bv,wl=P["tkey"],P["okey"],P["bv"],P["wl"]
+        draw=aL is not None
+        def put(k,v,u="",c="d",note=""):
+            if vals is not None: vals[k]=(v,u,c,note)
+        Io=gI[okey]; Fo=gF[okey]; good=cv&(np.abs(Io)>=Fo)
         a=np.abs(Io); okp=good&(a>0)
+        box=lambda ax,txt: ax.text(0.03,0.97,txt,transform=ax.transAxes,va="top",fontsize=8,color=C["yellow"],
+                                   bbox=dict(boxstyle="round,pad=0.4",facecolor=C["panel"],edgecolor=C["border"],alpha=0.9))
         if gate.get(okey,False) and okp.any():
             j=int(np.argmax(a[okp])); Aa=gA.get(okey,0.)
             Jg=a[okp][j]/(Aa*1e4) if Aa>0 else float("nan")
             par.append(f"Gate tunnelling current |I_G| = {a[okp][j]:.3e} A per cell at V = {V[okp][j]:.3f} V"
                        +(f"  (J_G = {Jg:.3e} A/cm²)" if Jg==Jg else ""))
+            put("Gate current |I_G|,max (per cell)",float(a[okp][j]),"A","r")
+            if Jg==Jg: put("Gate current density J_G,max",float(Jg),"A/cm²","r")
             if tkey==okey and okp.sum()>=3 and Aa>0:
                 o=np.argsort(V[okp]); Vk=V[okp][o]; Jk=a[okp][o]/(Aa*1e4)
                 for Vq in (0.5,1.0,-0.5,-1.0):
                     if Vk.min()<=Vq<=Vk.max():
-                        par.append(f"J_G({Vq:+.1f} V) = {10**np.interp(Vq,Vk,np.log10(Jk)):.3e} A/cm²")
+                        Jq=float(10**np.interp(Vq,Vk,np.log10(Jk)))
+                        par.append(f"J_G({Vq:+.1f} V) = {Jq:.3e} A/cm²"); put(f"J_G at {Vq:+.1f} V",Jq,"A/cm²","r")
         if gate.get(tkey,False) and not gate.get(okey,False) and okp.sum()>=3:
+            n0=len(par)
             Vg=V[okp]; Ia=a[okp]
-            lg=np.log10(Ia); dv=np.diff(Vg); dl=np.diff(lg)
-            sub=(Ia[1:]<0.01*Ia.max())&(Ia[:-1]<0.01*Ia.max())&(np.abs(dl)>1e-6)
-            if sub.any():
-                ss=np.abs(dv[sub]/dl[sub])*1e3; SS=float(ss.min()); par.append(f"Subthreshold swing SS = {SS:.1f} mV/dec")
-            gm=np.gradient(Ia,Vg); j=int(np.argmax(np.abs(gm)))
-            if gm[j]!=0:
-                Vth=Vg[j]-Ia[j]/gm[j]
-                edge=j in (0,len(Vg)-1)
-                par.append(f"V_th (max-g_m linear extrapolation) = {Vth:.3f} V"+
-                           ("  - g_m still rising at the sweep end: extend the sweep for a firm value" if edge else ""))
-                par.append(f"g_m,max = {abs(gm[j]):.3e} S per cell at V = {Vg[j]:.3f} V")
-                aL.axvline(Vth,color=C["yellow"],lw=1,ls="--",alpha=0.7)
-                aL.text(Vth,aL.get_ylim()[1],f" V_th {Vth:.2f} V",color=C["yellow"],fontsize=8,va="top")
+            sw=subthreshold_swing(Vg,Ia,floor=Fo[okp])
+            if sw is not None:
+                SS=sw["SS"]; par.append(f"Subthreshold swing SS = {SS:.1f} mV/dec (steepest decade, "
+                                        f"{sw['V0']:.3g} … {sw['V1']:.3g} V)")
+                put("Subthreshold swing SS",SS,"mV/dec","d")
+            # drain-source voltage: observed terminal against the farthest other carrier terminal
+            Vds=None; vapp=P.get("vapp")
+            if vapp is not None:
+                gd=dict(P["groups"])
+                vk=lambda k: float(np.mean([vapp[c] for c in gd[k]]))
+                oth=[k for k in gd if not gate.get(k,False) and k not in (okey,tkey)]
+                if oth:
+                    vo=vk(okey); vs=[vk(k) for k in oth]
+                    Vds = vo-min(vs) if vo>=min(vs) else vo-max(vs)
+            th=threshold_voltage(Vg,Ia,Vds)
+            if th is not None:
+                Vth=th["Vth"]; edge=th["edge"]
+                how=("linear extrapolation at max g_m"+(f", V_DS/2 = {0.5*Vds*1e3:.0f} mV subtracted" if Vds else "")
+                     if th["method"]=="lin" else f"saturation, √I_D extrapolation at V_DS = {Vds:.3g} V")
+                par.append(f"V_th ({how}) = {Vth:.3f} V"+
+                           ("  - still steepening at the sweep end: extend the sweep for a firm value" if edge else ""))
+                par.append(f"g_m,max = {th['gm']:.3e} S per cell at V = {th['Vgm']:.3f} V")
+                put("V_th (extrapolation)" if th["method"]=="lin" else "V_th (√I_D extrapolation, saturation)",
+                    Vth,"V","d","still steepening at the sweep end" if edge else "")
+                put("g_m,max (per cell)",th["gm"],"S","r")
+                if draw:
+                    aL.axvline(Vth,color=C["yellow"],lw=1,ls="--",alpha=0.7)
+                    aL.text(Vth,0.98,f" V_th {Vth:.2f} V",color=C["yellow"],fontsize=8,va="top",
+                            transform=aL.get_xaxis_transform())
             if wl:
                 Icc=1e-7*wl; k=np.where((Ia[:-1]<Icc)&(Ia[1:]>=Icc)|(Ia[:-1]>=Icc)&(Ia[1:]<Icc))[0]
                 if len(k):
                     k=k[0]; l0,l1=np.log(Ia[k]),np.log(Ia[k+1])
                     Vcc=Vg[k]+(Vg[k+1]-Vg[k])*(np.log(Icc)-l0)/(l1-l0)
                     par.append(f"V_th (constant current 100 nA x W/L = {Icc:.2e} A) = {Vcc:.3f} V")
+                    put("V_th (constant current, 100 nA·W/L)",float(Vcc),"V","d")
             Ion,Ioff=Ia[-1],Ia[0]
             if abs(Vg[0])>abs(Vg[-1]): Ion,Ioff=Ioff,Ion
             par.append(f"I_on = {Ion:.3e} A, I_off = {Ioff:.3e} A per cell"+(f"  (I_on/I_off = {Ion/Ioff:.2e})" if Ioff>0 else ""))
-            if par: aS.text(0.03,0.97,"\n".join(p.split("  - ")[0] for p in par[:2]),transform=aS.transAxes,va="top",fontsize=8,color=C["yellow"],
-                            bbox=dict(boxstyle="round,pad=0.4",facecolor=C["panel"],edgecolor=C["border"],alpha=0.9))
-        Aok_cm2=Aok*1e4
+            put("I_on (per cell)",float(Ion),"A","r"); put("I_off (per cell)",float(Ioff),"A","r")
+            if Ioff>0: put("I_on / I_off",float(Ion/Ioff),"","r")
+            if draw and len(par)>n0: box(aS,"\n".join(p.split("  - ")[0] for p in par[n0:n0+2]))
+        Aok_cm2=gA.get(okey,0.)*1e4
         if tkey==okey and Aok_cm2>0 and not gate.get(okey,False):
             J=Io/Aok_cm2
-            fwd=good&(J>1e-20)&(V>0.05)
-            if fwd.sum()>=3 and np.log10(J[fwd].max()/J[fwd].min())>=2.:
-                try:
-                    m_fit,b=np.polyfit(V[fwd],np.log(J[fwd]),1); n_id=1./(m_fit*0.02585); J0=np.exp(b)
-                    if 0.8<n_id<4.:
-                        par.append(f"Diode ideality n = {n_id:.3f}, J0 = {J0:.2e} A/cm²")
-                        aS.text(0.03,0.97,f"n = {n_id:.3f}\nJ₀ = {J0:.2e} A/cm²",transform=aS.transAxes,va="top",
-                                fontsize=8,color=C["yellow"],bbox=dict(boxstyle="round,pad=0.4",facecolor=C["panel"],
-                                edgecolor=C["border"],alpha=0.9))
-                except Exception: pass
-        if bv>0 and Aok_cm2>0 and np.max(np.abs(V))>=3.:
-            Ja=np.where(good,np.abs(Io)/Aok_cm2,0.); Vbd=None
-            for k in range(1,len(Ja)):
-                if Ja[k-1]>1e-30 and Ja[k]/Ja[k-1]>10. and Ja[k]>bv: Vbd=V[k]; break
-            if Vbd is None:
-                for k in range(len(Ja)):
-                    if Ja[k]>bv: Vbd=V[k]; break
-            if Vbd is not None:
+            fwd=good&(J>1e-20)
+            dio=diode_ideality(V[fwd],J[fwd],T=P.get("T") or 300.,floor=(Fo/Aok_cm2)[fwd])
+            if dio is not None and 0.8<dio["n"]<4.:
+                n_id,J0=dio["n"],dio["J0"]
+                par.append(f"Diode ideality n = {n_id:.3f}, J0 = {J0:.2e} A/cm² (straight part {dio['V0']:.3g} … "
+                           f"{dio['V1']:.3g} V, kT/q at {P.get('T') or 300.:g} K)")
+                put("Diode ideality factor n",float(n_id),"","d"); put("Saturation current density J_0",float(J0),"A/cm²","r")
+                if draw: box(aS,f"n = {n_id:.3f}\nJ₀ = {J0:.2e} A/cm²")
+        # output characteristic of a transistor: Early voltage
+        if tkey==okey and not gate.get(okey,False) and len(P["groups"])>=3:
+            ev=early_voltage(V,Io,cv)
+            if ev is not None and ev["VA"]<1e5:
+                par.append(f"Early voltage V_A = {ev['VA']:.3g} V (output conductance g_o = {ev['go']:.3e} S per cell; "
+                           f"straight line over {ev['V0']:.3g} … {ev['V1']:.3g} V)")
+                put("Early voltage V_A",float(ev["VA"]),"V","p"); put("Output conductance g_o (per cell)",float(ev["go"]),"S","r")
+                if draw:
+                    xv=np.linspace(V.min(),V.max(),50); sc=getattr(aL,"_iv_sc",None) or 1.
+                    aL.plot(xv,(ev["a"]+ev["b"]*xv)/sc,color=C["yellow"],lw=1,ls=":",
+                            label=f"V_A = {ev['VA']:.3g} V (line meets I = 0 at -V_A)")
+        # breakdown
+        mdl=P.get("models")
+        aval=mdl is not None and bool(int(mdl)&M_II)
+        if Aok_cm2>0 and not gate.get(okey,False) and np.max(np.abs(V))>=3.:
+            Ja=np.abs(Io)/Aok_cm2                    # (failed points: their partial state)
+            Vbd=None; how=""
+            if aval:
+                Vbd,how=avalanche_bv(V,Ja,cv,thr=bv,floor=np.asarray(Fo)/Aok_cm2)
+                if Vbd is not None:
+                    par.append(f"Avalanche breakdown BV = {abs(Vbd):.4g} V ({how}; impact ionisation on)")
+                    put("Breakdown voltage BV (avalanche)",float(abs(Vbd)),"V","p")
+                else:
+                    Vm=float(V[np.argmax(np.abs(V))])
+                    par.append(f"No avalanche breakdown up to V = {Vm:.4g} V (impact ionisation on)")
+                    put("Breakdown voltage BV (avalanche)",f"> {abs(Vm):.4g} V","V","")
+            elif bv>0:
+                for k in range(1,len(Ja)):
+                    if good[k] and good[k-1] and Ja[k-1]>1e-30 and Ja[k]/Ja[k-1]>10. and Ja[k]>bv: Vbd=V[k]; break
+                if Vbd is None:
+                    for k in range(len(Ja)):
+                        if good[k] and Ja[k]>bv: Vbd=V[k]; break
+                if Vbd is not None:
+                    par.append(f"Current knee at V = {Vbd:.2f} V (|J| > {bv:g} A/cm²; heuristic - impact ionisation "
+                               f"is off: Solver page)")
+                    put(f"Current knee (|J| > {bv:g} A/cm², avalanche off)",float(Vbd),"V","p")
+            if draw and Vbd is not None:
                 for ax in (aL,aS): ax.axvline(Vbd,color="#ff4444",lw=2,ls="--",alpha=0.8)
-                par.append(f"Current knee at V = {Vbd:.2f} V (|J| > {bv:g} A/cm²; heuristic - no avalanche model)")
+                aL.text(Vbd,0.98,f" BV {abs(Vbd):.4g} V" if aval else f" knee {Vbd:.3g} V",
+                        color="#ff6666",fontsize=8,va="top",transform=aL.get_xaxis_transform())
+        # Gummel plot of a BJT: gain and transit frequency
+        if bj is not None:
+            Ic=bj["Ic"]; beta=bj["beta"]; k=int(np.nanargmax(beta))
+            par.append(f"Current gain β = I_C/I_B: {beta[k]:.1f} at most (I_C = {Ic[k]:.3e} A per cell), "
+                       f"{beta[-1]:.1f} at I_C = {Ic[-1]:.3e} A")
+            put("Current gain β,max",float(beta[k]),"","p"); put("I_C at β,max (per cell)",float(Ic[k]),"A","r")
+            hk=np.where((np.arange(len(beta))>k)&(beta<0.5*beta[k]))[0]
+            if len(hk):
+                par.append(f"β halves (high injection, Kirk effect, series resistance) by I_C = {Ic[hk[0]]:.3e} A")
+                put("I_C where β has halved (per cell)",float(Ic[hk[0]]),"A","r")
+            fT=bj["fT"]; IcT=bj["IcT"]
+            if np.isfinite(fT).any():
+                j=int(np.nanargmax(fT)); AE=bj["AE"]
+                Jc=f", J_C = {IcT[j]/(AE*1e4):.3e} A/cm² over the {bj['emit']} contact" if AE>0 else ""
+                par.append(f"f_T,max = {fT[j]/1e9:.3g} GHz at I_C = {IcT[j]:.3e} A{Jc} (quasi-static ΔI_C / 2π ΔQ)")
+                put("Transit frequency f_T,max",float(fT[j]),"Hz","p","still rising at the sweep end" if j==len(fT)-1 else "")
+                put("I_C at f_T,max (per cell)",float(IcT[j]),"A","r")
+                if AE>0: put("J_C at f_T,max",float(IcT[j]/(AE*1e4)),"A/cm²","r")
+                if j<len(fT)-1 and np.nanmin(fT[j:])<0.7*fT[j]:
+                    par.append("   past the f_T peak the base widens into the collector (Kirk effect) and "
+                               "high injection sets in")
+                elif j==len(fT)-1:
+                    par.append("   f_T still rising at the sweep end - extend the sweep to see its peak")
 
-    def _plot_vtc(self,fig,V,Vf,cv,gI,gF,gate,tkey,fkey,okey,par):
+    def _plot_bjt_panel(self,ax,P,bj,bjp):
+        """β (left axis) and f_T (right axis) against I_C, log scale."""
+        a2=ax.twinx(); anyft=False; Ic_all=[]
+        def draw(g,col,ls,lab,lw):
+            nonlocal anyft
+            ok=g["Ic"]>0
+            ax.semilogx(g["Ic"][ok],g["beta"][ok],color=col,lw=lw,ls=ls,marker="o",ms=2.5,label=f"β {lab}")
+            Ic_all.extend(list(g["Ic"][ok]))
+            f=g["fT"]; IT=g["IcT"]; okf=np.isfinite(f)&(f>0)&(IT>0)
+            if okf.any():
+                anyft=True
+                a2.semilogx(IT[okf],f[okf]/1e9,color=col,lw=lw,ls=":" if ls=="-" else "-.",label=f"f_T {lab}")
+                j=int(np.nanargmax(np.where(okf,f,-1.)))
+                a2.plot([IT[j]],[f[j]/1e9],marker="*",ms=11,color=col,ls="none")
+        if bj is not None: draw(bj,C["green"],"-","(last sweep)",2.)
+        for p,g in bjp:
+            if g is not None: draw(g,p["color"],"--",p["name"],1.5)
+        if bj is not None and np.isfinite(bj["fT"]).any():
+            j=int(np.nanargmax(bj["fT"]))
+            ax.axvline(bj["IcT"][j],color=C["yellow"],lw=1,ls="--",alpha=0.7)
+            ax.text(bj["IcT"][j],0.98,f" f_T,max {bj['fT'][j]/1e9:.3g} GHz",color=C["yellow"],fontsize=8,va="top",
+                    transform=ax.get_xaxis_transform())
+        sax(ax,"I_C (A per cell)","β = I_C / I_B","BJT: gain β (left axis) and f_T (right axis) vs I_C")
+        a2.set_ylabel("f_T (GHz, quasi-static)" if anyft else "f_T: no stored-charge data",fontsize=8,color=C["orange"])
+        a2.tick_params(labelsize=7,colors=C["orange"])
+        if anyft: a2.set_ylim(bottom=0)
+        ax.set_ylim(bottom=0)
+        h1,l1=ax.get_legend_handles_labels(); h2,l2=a2.get_legend_handles_labels()
+        if h1 or h2: ax.legend(h1+h2,l1+l2,fontsize=6,loc="lower left",framealpha=0.85)
+
+    def _vtc_params(self,P,par,vals=None):
+        """Inverter parameters of a sweep with a floating output (a voltage
+        transfer curve): V_M, gain, V_OH/V_OL, V_IL/V_IH, noise margins and
+        the peak supply current - text into par, numbers into vals."""
+        def put(k,v,u="",c="d",note=""):
+            if vals is not None: vals[k]=(v,u,c,note)
+        V,cv,gI,okey=P["V"],P["cv"],P["gI"],P["okey"]
+        Vf=np.asarray(P["R"]["Vf"],float)
+        ok=cv&np.isfinite(Vf)
+        Vi,idx=np.unique(V[ok],return_index=True); Vo=Vf[ok][idx]
+        r=dict(Vi=Vi,Vo=Vo,g=None,VM=None,VIL=None,VIH=None)
+        if len(Vi)>=3:
+            g=np.gradient(Vo,Vi); r["g"]=g
+            d_=Vo-Vi; k=np.where(np.diff(np.sign(d_))!=0)[0]
+            if len(k):
+                k=k[0]; VM=Vi[k]+(Vi[k+1]-Vi[k])*d_[k]/(d_[k]-d_[k+1]); r["VM"]=VM
+                par.append(f"Switching threshold V_M = {VM:.3f} V"); put("Switching threshold V_M",float(VM),"V","d")
+            gi=int(np.argmax(np.abs(g))); par.append(f"Max |gain| = {abs(g[gi]):.1f} at V_in = {Vi[gi]:.3f} V")
+            put("Max |gain| dV_out/dV_in",float(abs(g[gi])),"","p")
+            VOH,VOL=(Vo[0],Vo[-1]) if Vo[0]>Vo[-1] else (Vo[-1],Vo[0])
+            par.append(f"V_OH = {VOH:.4f} V, V_OL = {VOL:.4f} V")
+            put("Output high V_OH",float(VOH),"V","d"); put("Output low V_OL",float(VOL),"V","d")
+            c=np.where(np.diff(np.sign(g+1.))!=0)[0]
+            if len(c)>=2:
+                f=lambda j:Vi[j]+(Vi[j+1]-Vi[j])*(-1.-g[j])/(g[j+1]-g[j])
+                VIL,VIH=f(c[0]),f(c[-1]); r["VIL"],r["VIH"]=VIL,VIH
+                par.append(f"V_IL = {VIL:.3f} V, V_IH = {VIH:.3f} V (gain = -1)")
+                par.append(f"Noise margins NM_L = {VIL-VOL:.3f} V, NM_H = {VOH-VIH:.3f} V")
+                put("Input low V_IL (gain = -1)",float(VIL),"V","d"); put("Input high V_IH (gain = -1)",float(VIH),"V","d")
+                put("Noise margin NM_L",float(VIL-VOL),"V","d"); put("Noise margin NM_H",float(VOH-VIH),"V","d")
+        Ia=np.abs(gI[okey])[cv]
+        if len(Ia):
+            j=int(np.argmax(Ia)); par.append(f"Peak |I({okey})| = {Ia[j]:.3e} A per cell at V_in = {V[cv][j]:.3f} V")
+            put(f"Peak supply current |I| (per cell)",float(Ia[j]),"A","r")
+        return r
+
+    def _plot_vtc(self,fig,P,par):
+        V,cv,gI,gF,gate=P["V"],P["cv"],P["gI"],P["gF"],P["gate"]
+        tkey,fkey,okey=P["tkey"],P["fkey"],P["okey"]
+        Vf=np.asarray(P["R"]["Vf"],float)
         gs=GridSpec(1,2,figure=fig,wspace=0.45)
         aT=fig.add_subplot(gs[0]); aI=fig.add_subplot(gs[1])
         aT.set_facecolor(C["bg"]); aI.set_facecolor(C["bg"])
         ok=cv&np.isfinite(Vf)
-        Vi,idx=np.unique(V[ok],return_index=True); Vo=Vf[ok][idx]
+        r=self._vtc_params(P,par)
+        Vi,Vo,g=r["Vi"],r["Vo"],r["g"]
         aT.plot(V[ok],Vf[ok],color=C["green"],lw=2,marker="o",ms=3,label=f"V({fkey})")
         if (~cv).any(): aT.plot(V[~cv],Vf[~cv],color=C["red"],marker="x",ls="none",ms=6,label="not converged")
         if len(V): aT.plot([V.min(),V.max()],[V.min(),V.max()],color=C["sub"],ls=":",lw=1,label="V_out = V_in")
-        if len(Vi)>=3:
-            g=np.gradient(Vo,Vi); a2=aT.twinx()
+        if g is not None:
+            a2=aT.twinx()
             a2.plot(Vi,g,color=C["orange"],lw=1.2,ls="--",label="gain")
             a2.set_ylabel("gain dV_out/dV_in",fontsize=8,color=C["orange"]); a2.tick_params(labelsize=7,colors=C["orange"])
-            d_=Vo-Vi; k=np.where(np.diff(np.sign(d_))!=0)[0]
-            if len(k):
-                k=k[0]; VM=Vi[k]+(Vi[k+1]-Vi[k])*d_[k]/(d_[k]-d_[k+1])
+            if r["VM"] is not None:
+                VM=r["VM"]
                 aT.axvline(VM,color=C["yellow"],lw=1,ls="--",alpha=0.8)
                 aT.text(VM,max(Vo),f" V_M = {VM:.3f} V",color=C["yellow"],fontsize=8,va="top")
-                par.append(f"Switching threshold V_M = {VM:.3f} V")
-            gi=int(np.argmax(np.abs(g))); par.append(f"Max |gain| = {abs(g[gi]):.1f} at V_in = {Vi[gi]:.3f} V")
-            VOH,VOL=(Vo[0],Vo[-1]) if Vo[0]>Vo[-1] else (Vo[-1],Vo[0])
-            par.append(f"V_OH = {VOH:.4f} V, V_OL = {VOL:.4f} V")
-            c=np.where(np.diff(np.sign(g+1.))!=0)[0]
-            if len(c)>=2:
-                f=lambda j:Vi[j]+(Vi[j+1]-Vi[j])*(-1.-g[j])/(g[j+1]-g[j])
-                VIL,VIH=f(c[0]),f(c[-1])
-                par.append(f"V_IL = {VIL:.3f} V, V_IH = {VIH:.3f} V (gain = -1)")
-                par.append(f"Noise margins NM_L = {VIL-VOL:.3f} V, NM_H = {VOH-VIH:.3f} V")
-                for vv in (VIL,VIH): aT.axvline(vv,color=C["sub"],lw=0.8,ls=":")
+            if r["VIL"] is not None:
+                for vv in (r["VIL"],r["VIH"]): aT.axvline(vv,color=C["sub"],lw=0.8,ls=":")
         aT.legend(fontsize=7,loc="center left")
         sax(aT,f"V({tkey}) (V)",f"V({fkey}) (V)","Voltage transfer curve (output floating, I = 0)")
         for n,k in enumerate([k for k in gI if not gate[k] and k!=fkey]):
@@ -6925,9 +8763,222 @@ class App(tk.Tk):
                             marker="o" if k==okey else None,ms=3,label=f"|I| {k}")
         if np.any(gF[okey]>0): aI.semilogy(V,np.maximum(gF[okey],1e-300),color=C["sub"],lw=0.8,ls=":",label="resolution")
         aI.legend(fontsize=7); sax(aI,f"V({tkey}) (V)","|I| (A per cell)","Supply / terminal currents")
-        Ia=np.abs(gI[okey])[cv]
-        if len(Ia):
-            j=int(np.argmax(Ia)); par.append(f"Peak |I({okey})| = {Ia[j]:.3e} A per cell at V_in = {V[cv][j]:.3f} V")
+
+    # ─── PARAMETER TABLE ───────────────────────────────────────
+    def _sweep_vals(self,d,P=None):
+        """The parameter table's numbers for one sweep record (cached on
+        pinned records, which never change)."""
+        if P is None: P=self._iv_prep(d)
+        vals={}; par=[]
+        try:
+            if P["vtc"]: self._vtc_params(P,par,vals)
+            else: self._iv_params(P,par,None,None,self._bjt_curves(P),vals)
+        except Exception:
+            self._log("parameter table: "+traceback.format_exc().strip().splitlines()[-1])
+        Io=np.asarray(P["gI"][P["okey"]],float); ok=P["cv"]&np.isfinite(Io)
+        if ok.any():
+            j=int(np.where(ok)[0][-1])
+            vals[f"|I_out| at the sweep end (per cell)"]=(float(abs(Io[j])),"A","r","")
+        return vals,P
+
+    def _ptab_cols(self):
+        """[(name, colour, prepared record, values)] of the last sweep and the
+        pinned sweeps the table shows."""
+        out=[]
+        allp=bool(self.ptab_all.get())
+        for p in self.pins:
+            if not (allp or p.get("show",True)): continue
+            if "_vals" not in p: p["_vals"],p["_P"]=self._sweep_vals(p["d"])
+            out.append((p["name"],p["color"],p["_P"],p["_vals"]))
+        d=self.ivd
+        if d is not None and len(d["R"]["V"]):
+            if "_ptab" not in d: d["_ptab"]=self._sweep_vals(d)        # (a new sweep is a new record)
+            vals,P=d["_ptab"]
+            out.append(("Last sweep",C["green"],P,vals))
+        return out
+
+    @staticmethod
+    def _ptab_fmt(v,u):
+        """A table value with an SI prefix where that reads better."""
+        if isinstance(v,str): return v
+        if v is None or not np.isfinite(v): return "–"
+        if u in ("A","S","Hz"):
+            a=abs(v)
+            if a==0: return f"0 {u}"
+            for f_,pre in ((1e12,"T"),(1e9,"G"),(1e6,"M"),(1e3,"k"),(1.,""),(1e-3,"m"),(1e-6,"µ"),(1e-9,"n"),
+                           (1e-12,"p"),(1e-15,"f"),(1e-18,"a")):
+                if a>=f_*0.99995: return f"{v/f_:.4g} {pre}{u}"
+            return f"{v:.3e} {u}"
+        if u=="A/cm²": return f"{v:.3e} {u}"
+        if u=="V": return f"{v:.4g} V"
+        if u: return f"{v:.4g} {u}"
+        return f"{v:.4g}"
+
+    @classmethod
+    def _ptab_diff(cls,v,r,u,how):
+        """The comparison of v with the reference value r: a difference
+        (mV for small voltage differences), with per cent, or a ratio."""
+        if isinstance(v,str) or isinstance(r,str) or v is None or r is None: return ""
+        if not (np.isfinite(v) and np.isfinite(r)) or not how: return ""
+        if how=="r":
+            if r==0 or v/r<=0: return ""
+            q=v/r; return f"×{q:.3g}" if 1e-3<=q<1e4 else f"×{q:.2e}"
+        dv=v-r
+        if u=="V" and abs(dv)<1.: txt=f"{dv*1e3:+.4g} mV"
+        elif u in ("A","S","Hz"): txt=("+" if dv>=0 else "")+cls._ptab_fmt(dv,u)
+        elif u: txt=f"{dv:+.4g} {u}"
+        else: txt=f"{dv:+.4g}"
+        if how=="p" and r!=0: txt+=f" ({100.*dv/abs(r):+.3g}%)"
+        return txt
+
+    def _ptab_rows(self):
+        """Header, rows of display text and the raw table (for Copy and CSV)."""
+        cols=self._ptab_cols()
+        names=[c[0] for c in cols]
+        ref=self.ptab_ref.get()
+        if ref not in names: ref=names[0] if names else ""
+        ri=names.index(ref) if ref in names else -1
+        mode=self.ptab_mode.get()
+        info=[]
+        for nm,col,P,vals in cols:
+            V=P["V"]; n=len(V); nc=int(np.sum(P["cv"]))
+            sw=f"V({P['tkey']}) {V.min():.3g} … {V.max():.3g} V" if n else P["tkey"]
+            if P["fkey"]: sw+=f", {P['fkey']} open"
+            T=P.get("T"); mdl=P.get("models")
+            if mdl is None: ml="-"
+            else:                       # relative to the Solver page's defaults: short, and shows what differs
+                mdl=int(mdl); mn=self.MODEL_NAMES
+                add=[v for b,v in mn.items() if mdl&b and not M_DEFAULT&b]
+                rem=[v for b,v in mn.items() if M_DEFAULT&b and not mdl&b]
+                if len(rem)>2: ml=", ".join(v for b,v in mn.items() if mdl&b) or "none"
+                else: ml="default"+(" + "+", ".join(add) if add else "")+(" − "+", ".join(rem) if rem else "")
+            info.append((P["tname"] or "-",sw,P["okey"],"-" if T is None else f"{T:g} K",ml,f"{nc}/{n}"))
+        keys=[]
+        for _,_,_,vals in cols:
+            for k in vals:
+                if k not in keys: keys.append(k)
+        rows=[]
+        for t,lab in enumerate(("Device","Sweep","Observed terminal","Temperature","Physics models","Converged points")):
+            rows.append(("info",lab,"",[i[t] for i in info],[i[t] for i in info]))
+        for k in keys:
+            ent=[c[3].get(k) for c in cols]
+            u=next((e[1] for e in ent if e is not None),"")
+            how=next((e[2] for e in ent if e is not None and e[2]),"")
+            rv=ent[ri][0] if ri>=0 and ent[ri] is not None else None
+            disp=[]; raw=[]
+            for j,e in enumerate(ent):
+                if e is None: disp.append("–"); raw.append(""); continue
+                v,_,_,note=e
+                txt=self._ptab_fmt(v,u)+(" *" if note else "")
+                raw.append(v)
+                if j!=ri and mode!="Values":
+                    dtx=self._ptab_diff(v,rv,u,how)
+                    if mode=="Differences only": txt=dtx or txt
+                    elif dtx: txt=f"{txt}   ({dtx})"
+                disp.append(txt)
+            rows.append(("par",k,u,disp,raw,ent))
+        return cols,names,ri,rows
+
+    def _ptab_win(self):
+        top=self._ptab_top
+        if top is not None and top.winfo_exists():
+            top.deiconify(); top.lift(); self._ptab_fill(); return
+        top=tk.Toplevel(self); top.title("Sweep parameters - last sweep and pinned sweeps"); top.configure(bg=C["panel"])
+        top.transient(self); self._ptab_top=top
+        try: top.geometry(f"1000x520+{self.winfo_rootx()+90}+{self.winfo_rooty()+90}")
+        except Exception: pass
+        tk.Label(top,text="Parameters extracted from each sweep (as in the I-V tab's text), side by side. Differences are "
+                          "taken against the reference column: voltages in mV or V, currents and frequencies as ratios "
+                          "(×), gain and breakdown also in per cent. * = see the I-V tab's note (e.g. still rising at the "
+                          "sweep end). Pin a sweep (I-V tab) to add a column.",
+                 bg=C["panel"],fg=C["sub"],font=self.F["small"],justify="left",anchor="w",wraplength=960
+                 ).pack(fill=tk.X,padx=10,pady=(8,2))
+        cf=tk.Frame(top,bg=C["panel"]); cf.pack(fill=tk.X,padx=8,pady=2)
+        tk.Label(cf,text="Reference",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(2,2))
+        self.ptab_rcb=ttk.Combobox(cf,textvariable=self.ptab_ref,values=[],state="readonly",width=28,font=self.F["ui"])
+        self.ptab_rcb.pack(side=tk.LEFT,padx=2); self.ptab_rcb.bind("<<ComboboxSelected>>",lambda e:self._ptab_fill())
+        tk.Label(cf,text="Show",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(10,2))
+        cb=ttk.Combobox(cf,textvariable=self.ptab_mode,values=["Values","Values and differences","Differences only"],
+                        state="readonly",width=22,font=self.F["ui"])
+        cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda e:self._ptab_fill())
+        self._check(cf,"Hidden pins too",self.ptab_all,self._ptab_fill)
+        lf=tk.Frame(top,bg=C["panel"]); lf.pack(fill=tk.BOTH,expand=True,padx=8,pady=2)
+        tv=ttk.Treeview(lf,columns=("u",),show="tree headings",height=16,selectmode="extended")
+        vs=ttk.Scrollbar(lf,orient="vertical",command=tv.yview); hs=ttk.Scrollbar(lf,orient="horizontal",command=tv.xview)
+        tv.configure(yscrollcommand=vs.set,xscrollcommand=hs.set)
+        tv.grid(row=0,column=0,sticky="nsew"); vs.grid(row=0,column=1,sticky="ns"); hs.grid(row=1,column=0,sticky="ew")
+        lf.rowconfigure(0,weight=1); lf.columnconfigure(0,weight=1)
+        tv.tag_configure("info",foreground=C["sub"]); tv.tag_configure("odd",background="#0e1a2b")
+        self._ptab_tv=tv
+        bf=tk.Frame(top,bg=C["panel"]); bf.pack(fill=tk.X,padx=8,pady=(4,8))
+        self._btn(bf,"Copy (tab-separated)",self._ptab_copy).pack(side=tk.LEFT,padx=3)
+        self._btn(bf,"Export CSV…",self._ptab_csv,bg=C["border"]).pack(side=tk.LEFT,padx=3)
+        self._btn(bf,"Pins…",self._pins_win,bg=C["border"]).pack(side=tk.LEFT,padx=3)
+        self.ptab_note=tk.Label(bf,text="",bg=C["panel"],fg=C["sub"],font=self.F["small"],anchor="w")
+        self.ptab_note.pack(side=tk.LEFT,padx=8,fill=tk.X,expand=True)
+        self._btn(bf,"Close",top.destroy,bg=C["border"]).pack(side=tk.RIGHT,padx=3)
+        self._ptab_fill()
+
+    def _ptab_fill(self):
+        top=getattr(self,"_ptab_top",None)
+        if top is None or not top.winfo_exists(): return
+        tv=self._ptab_tv
+        cols,names,ri,rows=self._ptab_rows()
+        self.ptab_rcb.configure(values=names)
+        if names and self.ptab_ref.get() not in names: self.ptab_ref.set(names[ri if ri>=0 else 0])
+        ids=[f"c{j}" for j in range(len(cols))]
+        tv.configure(columns=["u"]+ids)
+        tv.heading("#0",text="Parameter",anchor="w"); tv.column("#0",width=310,minwidth=160,stretch=False)
+        tv.heading("u",text="Unit"); tv.column("u",width=62,minwidth=40,anchor="center",stretch=False)
+        wid=200 if self.ptab_mode.get()=="Values and differences" else 130
+        for j,(nm,col,_,_) in enumerate(cols):
+            tv.heading(ids[j],text=("★ " if j==ri else "")+nm)
+            tv.column(ids[j],width=wid,minwidth=80,anchor="w",stretch=True)
+        for it in tv.get_children(): tv.delete(it)
+        k=0
+        for row in rows:
+            kind,lab,u,disp=row[0],row[1],row[2],row[3]
+            tags=("info",) if kind=="info" else (("odd",) if k%2 else ())
+            if kind!="info": k+=1
+            tv.insert("","end",text=lab,values=[u]+disp,tags=tags)
+        npar=sum(1 for r in rows if r[0]=="par")
+        if not cols:
+            self.ptab_note.config(text="No sweep yet: run one (↔ Sweep, F6) and pin it, or pin several to compare.")
+        else:
+            self.ptab_note.config(text=f"{len(cols)} sweep{'s' if len(cols)!=1 else ''}, {npar} parameters"
+                                       +(f" · reference: {names[ri]}" if ri>=0 and len(cols)>1 else ""))
+
+    def _ptab_table(self):
+        """The table as rows of raw values (numbers in base units) with the
+        comparison against the reference: for Copy and the CSV file."""
+        cols,names,ri,rows=self._ptab_rows()
+        hdr=["Parameter","Unit"]+names
+        others=[j for j in range(len(names)) if j!=ri] if ri>=0 else []
+        hdr+=[f"{names[j]} vs {names[ri]}" for j in others]
+        out=[hdr]
+        for row in rows:
+            if row[0]=="info": out.append([row[1],""]+[str(x) for x in row[4]]+[""]*len(others)); continue
+            _,lab,u,disp,raw,ent=row
+            line=[lab,u]+[("%.6g"%x if isinstance(x,float) else str(x)) for x in raw]
+            rv=ent[ri][0] if ri>=0 and ent[ri] is not None else None
+            for j in others:
+                e=ent[j]
+                line.append(self._ptab_diff(e[0],rv,u,e[2]) if e is not None and rv is not None else "")
+            out.append(line)
+        return out
+
+    def _ptab_copy(self):
+        t=self._ptab_table()
+        txt="\n".join("\t".join(str(x) for x in r) for r in t)
+        self.clipboard_clear(); self.clipboard_append(txt)
+        self.ptab_note.config(text=f"Copied {len(t)-1} rows - paste into a spreadsheet")
+    def _ptab_csv(self):
+        p=filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV","*.csv")],parent=self._ptab_top,
+                                       initialfile="sweep_parameters.csv")
+        if not p: return
+        import csv
+        with open(p,"w",newline="",encoding="utf-8") as f: csv.writer(f).writerows(self._ptab_table())
+        self.sv.set(f"Parameter table → {p}"); self._log(f"Parameter table exported to {p}")
 
     # ─── EXPORT / FILES ────────────────────────────────────────
     def _xcsv(self):
@@ -6979,7 +9030,14 @@ class App(tk.Tk):
                                        initialfile=f"{self.tname or 'device'}.json".replace(" ","_").replace(":",""))
         if not p: return
         try:
-            d=dict(format="semisim3d-device",version=1,name=self.tname,
+            d=self._device_json()
+            with open(p,"w") as f: json.dump(d,f,indent=1)
+            self.sv.set(f"Device saved → {p}"); self._log(f"Device saved to {p}")
+        except Exception:
+            messagebox.showerror("Save device",traceback.format_exc())
+    def _device_json(self):
+        """The editor's device as the device-file dict (what Save writes)."""
+        return dict(format="semisim3d-device",version=1,name=self.tname,
                    Lx=self.Lx.get(),Ly=self.Ly.get(),Lz=self.Lz.get(),Nx=self.Nx.get(),Ny=self.Ny.get(),Nz=self.Nz.get(),
                    graded=self.use_graded.get(),dense_x=self.dense_x,dense_y=self.dense_y,dense_z=self.dense_z,
                    meta=self.tmeta,regs=[obj_dict(r) for r in self.regs],cons=[obj_dict(c) for c in self.cons],
@@ -6992,18 +9050,16 @@ class App(tk.Tk):
                                tol_p=self.tol_p.get(),tol_c=self.tol_c.get(),bgn=self.m_bgn.get(),
                                tau=self.m_tau.get(),vsat=self.m_vsat.get(),qc=self.m_qc.get(),
                                lombardi=self.m_lb.get(),tunnel=self.m_tun.get(),
-                               metal_te=self.m_te.get(),metal_tunnel=self.m_sbt.get(),tau0=self.tau0.get()))
-            with open(p,"w") as f: json.dump(d,f,indent=1)
-            self.sv.set(f"Device saved → {p}"); self._log(f"Device saved to {p}")
-        except Exception:
-            messagebox.showerror("Save device",traceback.format_exc())
+                               metal_te=self.m_te.get(),metal_tunnel=self.m_sbt.get(),
+                               avalanche=self.m_ii.get(),tau0=self.tau0.get()))
     def _open_device(self):
         if self.busy: return
         p=filedialog.askopenfilename(filetypes=[("SemiSim device","*.json"),("All files","*")])
         if not p: return
         try:
             with open(p) as f: d=json.load(f)
-            if d.get("format")!="semisim3d-device": raise ValueError("not a SemiSim 3D device file")
+            if not isinstance(d,dict) or d.get("format")!="semisim3d-device": raise ValueError("not a SemiSim 3D device file")
+            warn=check_device_json(d)
             regs=[Reg(**r) for r in d["regs"]]; cons=[Con(**c) for c in d["cons"]]
             sheets=[Sheet(**s) for s in d.get("sheets",[])]
             defects=[SD.Defect.from_dict(x) for x in d.get("defects",[])]
@@ -7011,7 +9067,18 @@ class App(tk.Tk):
             if bad: raise ValueError(f"unknown defect kind(s): {', '.join(map(str,sorted(set(bad))))}")
         except Exception as e:
             messagebox.showerror("Open device",f"Cannot read {p}:\n{e}"); return
-        self.tname=d.get("name") or os.path.basename(p); self.tmeta=d.get("meta") or {}
+        for w in warn: self._log(f"Open device: {w}")
+        self._apply_device_json(d,regs,cons,sheets,defects,src=p)
+    def _device_parts(self,d):
+        """Regions, contacts, sheets and defects of a device-file dict."""
+        regs=[Reg(**r) for r in d["regs"]]; cons=[Con(**c) for c in d["cons"]]
+        sheets=[Sheet(**s) for s in d.get("sheets",[])]
+        defects=[SD.Defect.from_dict(x) for x in d.get("defects",[])]
+        return regs,cons,sheets,defects
+    def _apply_device_json(self,d,regs,cons,sheets,defects,src="",label=None):
+        """Put a device-file dict into the editor (Open device, A/B 'Load')."""
+        p=src
+        self.tname=d.get("name") or os.path.basename(p); self.tmeta=copy.deepcopy(d.get("meta") or {})
         for v,k in ((self.Lx,"Lx"),(self.Ly,"Ly"),(self.Lz,"Lz"),(self.Nx,"Nx"),(self.Ny,"Ny"),(self.Nz,"Nz")): v.set(d[k])
         self.use_graded.set(d.get("graded",True))
         ms=d.get("mesh") or {}
@@ -7026,23 +9093,25 @@ class App(tk.Tk):
         for v,k in ((self.T,"T"),(self.max_p,"max_p"),(self.max_c,"max_c"),(self.max_g,"max_g"),
                     (self.tol_p,"tol_p"),(self.tol_c,"tol_c"),(self.m_bgn,"bgn"),(self.m_tau,"tau"),(self.m_vsat,"vsat"),
                     (self.m_qc,"qc"),(self.m_lb,"lombardi"),(self.m_tun,"tunnel"),
-                    (self.m_te,"metal_te"),(self.m_sbt,"metal_tunnel")):
-            v.set(so[k] if k in so else (False if k in ("qc","lombardi","tunnel") else
+                    (self.m_te,"metal_te"),(self.m_sbt,"metal_tunnel"),(self.m_ii,"avalanche")):
+            v.set(so[k] if k in so else (False if k in ("qc","lombardi","tunnel","avalanche") else
                                          True if k in ("metal_te","metal_tunnel") else v.get()))
         self.tau0.set(str(so.get("tau0","") or ""))
         self._refresh_groups(tgt=sw.get("tgt"),flt=sw.get("flt") or "(none)",out=sw.get("out") or "auto")
         self._rfr(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._show_sheets()
         self._def_centre(); self._def_sc_whole()
-        self.t_name.config(text=self.tname); self.t_cat.config(text=f"from {os.path.basename(p)}")
+        self.t_name.config(text=self.tname); self.t_cat.config(text=label or f"from {os.path.basename(p)}")
         self.t_doc.configure(state="normal"); self.t_doc.delete("1.0","end")
-        self.t_doc.insert("end",template_doc(self.tname) if self.tname in TEMPLATES else f"Device loaded from {p}")
+        base=self.tname.split(" [")[0]
+        self.t_doc.insert("end",template_doc(base) if base in TEMPLATES else f"Device loaded from {p}")
         self.t_doc.configure(state="disabled"); self.tmpl_btn.config(text=self.tname[:30])
         self.sol=None; self.ivd=None; self._clear_solution_plots(); self._fill_results(None)
         self._fresh_cuts=True
         view=self.tmeta.get("view")
         if view: self.sec_plane.set(view[0]); self._sec_range(view[1])
         else: self._sec_range(None)
-        self._mesh_update(); self.sv.set(f"Opened {p}"); self._log(f"Device opened from {p}")
+        self._mesh_update()
+        if label is None: self.sv.set(f"Opened {p}"); self._log(f"Device opened from {p}")
 
     # ─── HELP / ABOUT / TEMPLATE BROWSER ───────────────────────
     def _text_window(self,title,w=900,h=640):
@@ -7147,12 +9216,12 @@ class App(tk.Tk):
 ## Physics
 - heterojunctions, oxide gates (tox, Nox, layer stacks), SiO2/Al2O3/HfO2/Si3N4, buried electrodes, interface sheet charge
 - metal contacts: measured/pinned Schottky barriers, thermionic emission with image-force lowering, barrier tunnelling
-- Arora mobility + velocity saturation + Lombardi surface mobility, SRH τ(N) + Auger + radiative, Klaassen band-gap narrowing
+- Masetti (Si) / Caughey-Thomas (other materials) mobility with material temperature exponents, velocity saturation with Canali's temperature laws (Si), Lombardi surface mobility, SRH τ(N) + Auger + radiative, Klaassen band-gap narrowing, impact ionisation
 - defects: deep levels (SRH + trapped charge), interface traps, fixed charge, voids and particles, dislocations, radiation damage
 - quantum confinement (MLDA), gate tunnelling (Tsu-Esaki/WKB: direct + Fowler-Nordheim)
 ## Not modelled
-- impact ionisation, band-to-band tunnelling, optical generation, subband quantisation
-- thermionic heterointerfaces, ballistic transport, self-heating, transient trapping
+- band-to-band tunnelling, optical generation, subband quantisation, incomplete ionisation, Fermi-Dirac statistics
+- negative differential mobility (GaAs, InP, GaN), thermionic heterointerfaces, ballistic transport, self-heating, transient trapping
 ## Build
 - the core is built from `semiconductor_3d.c` on the first start (and after an update of it) by `semibuild.py`: gcc or clang, -O3 -ffast-math, OpenMP (on macOS through Homebrew's libomp); `python3 semibuild.py` rebuilds it by hand
 - `semimesh.py` (the triangular-prism mesher), `semidefects.py` (defects) and `semibuild.py` must sit next to main.py
