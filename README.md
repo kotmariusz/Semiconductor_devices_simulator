@@ -18,6 +18,10 @@ photodiodes.
 
 ![FinFET with a tapered, rounded fin on the triangular-prism mesh](docs/screenshots/finfet_structure.png)
 
+| Electron flow in a 55 V VDMOS cell: the map, with equal-current flowlines | … and through the 3-D view |
+|---|---|
+| ![Animated electron flow in a 55 V VDMOS cell: particles move along equal-current flowlines from the channels through the JFET neck and fan out into the drift region](docs/screenshots/vdmos_flow_2d.gif) | ![Animated electron flow through the 3-D view of the same VDMOS cell: particles funnel through the JFET neck between the see-through p-bodies and spread down to the substrate](docs/screenshots/vdmos_flow_3d.gif) |
+
 | | |
 |---|---|
 | ![Current flow in an n-JFET](docs/screenshots/jfet_current.png) | ![CMOS inverter transfer curve](docs/screenshots/cmos_transfer.png) |

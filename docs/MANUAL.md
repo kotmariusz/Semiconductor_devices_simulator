@@ -159,7 +159,8 @@ View → `WSL: turn maximise into fill screen` switches this off.
   pace, `Hide below` keeps them out of the leakage. `GIF…` saves the
   animation - the map and the 3-D view as it is turned - as an animated GIF.
 
-  ![VDMOS electron flow: flowlines and particles](screenshots/vdmos_flow.png)
+  ![VDMOS electron flow in the map: flowlines and particles](screenshots/vdmos_flow_2d.gif)
+  ![VDMOS electron flow through the 3-D view](screenshots/vdmos_flow_3d.gif)
 * `Current` → `Map` puts the device structure under the arrows of the
   in-plane map: `|J|` (the current density, as before), `structure` (the
   region colours) or `|J| + structure` (both, the structure see-through on

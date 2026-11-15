@@ -8832,11 +8832,13 @@ class App(tk.Tk):
             sax3(aQ3,"x","z","depth y",f"3-D {what} field ({nar} arrows)"); _depth_axis(aQ3)
         else:
             x,y,z=s["x"],s["y"],s["z"]
-            if not self.cur_st3.get():
+            moving=self._anim_on and self.cur_anim3.get()            # particles instead of arrows
+            if not self.cur_st3.get() and not moving:
                 aQ3.text2D(0.5,0.5,"3-D arrows hidden",transform=aQ3.transAxes,ha="center",fontsize=10,color=C["sub"])
             aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
             self._aspect3(aQ3,x.max(),y.max(),z.max())
-            sax3(aQ3,"x","z","depth y","3-D current field (arrows off)"); _depth_axis(aQ3)
+            what="current" if sym=="J" else fname
+            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({'particles' if moving else 'arrows off'})"); _depth_axis(aQ3)
         if aQ3 is not None and self._anim_on and self.cur_anim3.get():
             self._anim3_build(aQ3,FX,FY,FZ,s["x"],s["y"],s["z"],thr)
         try: fig.tight_layout(pad=1.)

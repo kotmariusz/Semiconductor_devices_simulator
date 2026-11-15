@@ -10,6 +10,8 @@
   frame is projected at the present angle over the kept background), and
   untick `3-D arrows` to see the particles alone. `GIF…` saves the 3-D view
   too, as it is turned. The map and the 3-D view can run together or alone.
+- README and manual: animated GIFs of the electron flow in the 55 V VDMOS
+  cell - the map with its flowlines, and the 3-D view.
 - Validation: 3-D particles in a helical field keep their distance from the
   axis (5.5e-4 after a quarter turn, in a flattened view box) and move with
   the drift: 240 checks (185 without the templates).
