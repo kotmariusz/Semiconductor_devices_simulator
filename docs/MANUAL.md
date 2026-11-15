@@ -151,10 +151,13 @@ View → `WSL: turn maximise into fill screen` switches this off.
   funnel. When current leaves the plane (3-D devices) evenly spaced
   streamlines are drawn instead, and the note in the corner says so.
 * `Current` → `▶ Animate`: particles flow along the current in the in-plane
-  map. They start where the current is (probability ∝ |J|); their speed grows
-  with log |J|, so the fast channel and the slow spreading region both show.
-  `Particles` sets their number, `Speed` the pace, `Hide below` keeps them out
-  of the leakage. `GIF…` saves the animated map as an animated GIF.
+  map and, with `3-D` ticked, through the 3-D view along the current of the
+  whole device (drag to turn the view while it runs; untick `3-D arrows` to
+  see the particles alone). They start where the current is (probability
+  ∝ |J|); their speed grows with log |J|, so the fast channel and the slow
+  spreading region both show. `Particles` sets their number, `Speed` the
+  pace, `Hide below` keeps them out of the leakage. `GIF…` saves the
+  animation - the map and the 3-D view as it is turned - as an animated GIF.
 
   ![VDMOS electron flow: flowlines and particles](screenshots/vdmos_flow.png)
 * `Current` → `Map` puts the device structure under the arrows of the
@@ -541,8 +544,8 @@ channel charge near threshold.
 
 ## Validation
 
-`python3 validate.py` runs 183 checks against closed-form theory (about 12 min
-on two cores); `--templates` adds section 9: all 238 checks in about 23 min.
+`python3 validate.py` runs 185 checks against closed-form theory (about 12 min
+on two cores); `--templates` adds section 9: all 240 checks in about 23 min.
 Each check prints PASS/FAIL with its tolerance, and the script doubles as an
 example of driving the core without the interface. The references are in
 [SOURCES](SOURCES.md).
@@ -567,7 +570,7 @@ example of driving the core without the interface. The references are in
 | 16 | Adaptive refinement vs finer meshes; sweep predictor | coarse diode 3.0 % → 0.04 %; same currents, 671 vs 829 iterations |
 | 17 | Avalanche breakdown of Si p⁺/n junctions vs the ionisation integral and Baliga; 400 K; stored charge; short-base diode transit time; Early voltage and f_T extraction | BV within 0.2 % of the ionisation integral (1e16, 1e17 cm⁻³, 400 K), 3 % under Baliga; BV ×1.21 at 400 K; charge sums exact; transit time −3 %; V_A, f_T, β within 0.03 % |
 | 18 | Material parameters and analysis: Si mobility vs Masetti (1e15–1e20, 300 and 400 K), 4H-SiC holes vs Schaffer, nᵢ and V_bi at 250/400 K, the 32-contact limit, NaN from bad getter indices, ideality factor (n = 1 and 1.7, series resistance, 250–400 K), V_th (linear and saturation), SS above a noisy floor | mobility exact; n within 0.15 %; V_th exact; SS 0.0003 % |
-| 19 | MOSFET analysis: junction capacitance vs the depletion formula (0–10 V), MOS capacitor C/C_ox vs the exact low-frequency curve (accumulation to inversion), oxide field vs Gauss, C_o(tr)/C_o(er) of an analytic C(V), R_DS(on) slope and Joule shares of a resistor bar, VDMOS flowlines (stream function × width = drain current), VDMOS off-state capacitances (reciprocity, charge conservation), particles in a rotation, SiC D_it band tail | C within 0.03 %; MOS C within 0.03 %; reciprocity 1e-6; flowlines exact (5e-8); Joule shares within 1.1 % |
+| 19 | MOSFET analysis: junction capacitance vs the depletion formula (0–10 V), MOS capacitor C/C_ox vs the exact low-frequency curve (accumulation to inversion), oxide field vs Gauss, C_o(tr)/C_o(er) of an analytic C(V), R_DS(on) slope and Joule shares of a resistor bar, VDMOS flowlines (stream function × width = drain current), VDMOS off-state capacitances (reciprocity, charge conservation), particles in a rotation and 3-D particles in a helix, SiC D_it band tail | C within 0.03 %; MOS C within 0.03 %; reciprocity 1e-6; flowlines exact (5e-8); Joule shares within 1.1 % |
 
 ## Device templates
 

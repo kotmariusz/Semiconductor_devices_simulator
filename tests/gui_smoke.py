@@ -98,7 +98,21 @@ try:
         from PIL import Image
         with Image.open(gif) as im: assert im.n_frames == 8, im.n_frames
         app.cur_thr.set("off"); app.cur_lines.set(False); app.cur_log.set(False); app._upd_curr_plot(); pump(0.3)
-    step("Current tab: electron / hole flow, threshold, flowlines, animation, GIF", flow)
+        # the 3-D view animated alone, turned while it runs, and saved as a GIF
+        vis0 = {k: v.get() for k, v in app.pv["tc"].items()}
+        for k in app.pv["tc"]: app.pv["tc"][k].set(k == "3d")
+        app.cur_anim3.set(True); app._anim_toggle(); pump(1.5)
+        ok2, ok3 = app._anim_ready(); assert ok3 and not ok2, (ok2, ok3)
+        Q0 = app._anim3.P.copy(); pump(0.6)
+        assert np.abs(app._anim3.P - Q0).max() > 0, "3-D particles move"
+        app._anim3_ax.view_init(elev=30, azim=-40); app.cvc.draw(); pump(0.6)
+        assert app._anim_ready()[1], "3-D background kept after a turn"
+        app._anim_toggle(); pump(0.3); assert app._anim3 is None and app._anim3_art is None
+        app._anim_gif(path=gif, frames=6); pump(0.3)
+        with Image.open(gif) as im: assert im.n_frames == 6, im.n_frames
+        for k, v in vis0.items(): app.pv["tc"][k].set(v)
+        app._upd_curr_plot(); pump(0.3)
+    step("Current tab: electron / hole flow, threshold, flowlines, animation (map and 3-D), GIF", flow)
 
     def mosfet():                                # C-V sweep, capacitances and on-resistance tools, R_DS(on)
         app._load("RW: Si MOSFET 55V (IRLZ44N)"); pump(0.5)

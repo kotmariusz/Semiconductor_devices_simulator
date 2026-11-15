@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3 (2026-11-15) - the current animated in 3-D
+
+- Current tab: `▶ Animate` with `3-D` ticked also animates the 3-D view -
+  particles travel through the device along the 3-D current (the field of
+  the whole device, not one plane), started with probability ∝ |J| and
+  moving at a speed that grows with log |J|, measured in the drawn box so a
+  thin device does not slow them. The view can be turned while it runs (the
+  frame is projected at the present angle over the kept background), and
+  untick `3-D arrows` to see the particles alone. `GIF…` saves the 3-D view
+  too, as it is turned. The map and the 3-D view can run together or alone.
+- Validation: 3-D particles in a helical field keep their distance from the
+  axis (5.5e-4 after a quarter turn, in a flattened view box) and move with
+  the drift: 240 checks (185 without the templates).
+
 ## 0.2.2 (2026-11-15) - current flow pictures, R_DS(on), capacitances
 
 - Current tab: `Show` picks the total current J, the electron flow (−J_n,

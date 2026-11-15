@@ -1,8 +1,9 @@
-# SemiSim 3D — semiconductor device simulator (v0.2.2)
+# SemiSim 3D — semiconductor device simulator (v0.2.3)
 
 A 3-D drift-diffusion simulator for semiconductor devices with a desktop
 interface: build a device from blocks of material and doping, solve it, and
-look at its bands, fields, current flow (flowlines and animated particles)
+look at its bands, fields, current flow (flowlines, particles animated in
+the map and in 3-D)
 and I-V curves, extract MOSFET on-resistance and capacitances - and compare
 designs side by side, curves and a table of their parameters. A C core (OpenMP) does the numerics; the interface is
 Python/Tk. 55 ready-made devices are included: diodes, BJTs (among them
@@ -12,7 +13,7 @@ Early effect and avalanche breakdown), MOSFETs, FinFETs, a CMOS inverter,
 JFETs, GaN HEMTs, Si and SiC power devices, solar cells, LEDs and
 photodiodes.
 
-> **v0.2.2 is an early public version and still a test version.** Its results
+> **v0.2.3 is an early public version and still a test version.** Its results
 > can be wrong - see [Status](#status).
 
 ![FinFET with a tapered, rounded fin on the triangular-prism mesh](docs/screenshots/finfet_structure.png)
@@ -64,7 +65,7 @@ maximise button). On a Mac, ⌘R runs and ⌘. stops.
 
 ## Status
 
-- The physics is checked against textbook theory (`validate.py`, 238
+- The physics is checked against textbook theory (`validate.py`, 240
   checks), not yet against measurements of real devices.
 - Results can be wrong; band-to-band tunnelling, light, self-heating and
   transients are not modelled, avalanche breakdown is a local-field model,

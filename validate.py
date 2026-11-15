@@ -1365,6 +1365,21 @@ def s19_mosfet_analysis():
     r1 = np.hypot(*fp.to_data(fp.P).T); kk = (r0 < 0.9) & (r1 < 0.95)
     check(19, "animation particles stay on their current line (rotation, radius change)",
           float(np.max(np.abs(r1 - r0)[kk] / r0[kk])), 0., 2e-3, "range")
+    # 3-D particles (the shipped grid, a flattened view box): a helix - rotation
+    # about z plus a drift along +z - keeps their distance from the axis
+    g3 = np.linspace(-1, 1, 101); gz = np.linspace(0., 1., 5)
+    Zg, Yg, Xg = np.meshgrid(gz, g3, g3, indexing="ij")              # arrays (Nz, Ny, Nx)
+    fp3 = M.FlowParticles3D(-Yg, Xg, 0.3 * np.ones_like(Xg), g3, g3, gz, thr=1e-3, n=300,
+                            box=(1., 0.5, 0.3), seed=4)
+    fp3.life[:] = 1e9; a0 = fp3.age.copy()
+    P0 = fp3.to_phys(fp3.P); r0 = np.hypot(P0[:, 0], P0[:, 1]); z0 = P0[:, 2].copy()
+    for _ in range(100): fp3.step(0.02, 1.0)
+    P1 = fp3.to_phys(fp3.P); r1 = np.hypot(P1[:, 0], P1[:, 1])
+    kk = (fp3.age > a0 + 1.99) & (r0 > 0.1) & (r0 < 0.9) & (r1 < 0.95)     # never reborn
+    check(19, "3-D animation particles stay on their current line (helix, radius change)",
+          float(np.max(np.abs(r1 - r0)[kk] / r0[kk])) if kk.any() else 1., 0., 2e-3, "range")
+    check(19, "3-D animation particles move with the current (helix drift along +z)",
+          float(np.mean(P1[kk, 2] > z0[kk])) if kk.any() else 0., 1., 1., "range")
     # band-tail D_it (4H-SiC/SiO2): the levels hold D_edge * E_t of acceptor states
     lv = M.SD.dit_levels(5.7e13, 1e-15, 3.23, tail=0.067)
     check(19, "D_it band tail: total acceptor states = D_edge E_t (1 - e^-8)", sum(n for _, n in lv),

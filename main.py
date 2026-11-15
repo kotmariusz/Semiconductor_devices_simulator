@@ -4046,6 +4046,94 @@ class FlowParticles:
         f=np.tile(np.arange(self.tail-1)/(self.tail-1),self.n)
         return seg,f
 
+class FlowParticles3D:
+    """Particles carried along the 3-D current field (animation of the 3-D
+    view) - FlowParticles in three dimensions.  The field (FX, FY, FZ: arrays
+    (Nz, Ny, Nx) on the node lines x, y, z) is resampled onto a uniform grid
+    of at most G points per axis.  A particle lives in the unit cube of the
+    device; it moves along the field line (the physical direction of J) at a
+    speed, measured in the 3-D view (box = the drawn size of the x, y, z
+    edges, as set_box_aspect), that grows with log10 |J| - the longest edge is
+    crossed in ~4 s at the maximum |J| - and is reborn at a place drawn with
+    probability proportional to |J| when it leaves the device, enters the
+    region below the threshold (thr x max |J|) or ends its life (1.5-4 s)."""
+    def __init__(self,FX,FY,FZ,x,y,z,thr=1e-4,n=400,tail=8,G=48,box=None,seed=2):
+        cs=[np.asarray(c,float) for c in (x,y,z)]
+        F=[np.nan_to_num(np.asarray(A,float)) for A in (FX,FY,FZ)]
+        for ax,c in ((2,cs[0]),(1,cs[1]),(0,cs[2])):          # a single plane of nodes: give it a thickness
+            if len(c)<2:
+                F=[np.concatenate([A,A],axis=ax) for A in F]
+        cs=[c if len(c)>1 else np.array([c[0],c[0]+1.]) for c in cs]
+        self.c0=np.array([c[0] for c in cs]); self.L=np.array([max(float(c[-1]-c[0]),1e-12) for c in cs])
+        B=np.asarray(box,float) if box is not None else self.L.copy()
+        B=np.where(np.isfinite(B)&(B>0),B,1.); self.B=B/B.max()
+        g=[np.linspace(c[0],c[-1],int(np.clip(2*len(c),2,G))) for c in cs]
+        U,V,W=(_lin_axis(_lin_axis(_lin_axis(A,cs[0],g[0],2),cs[1],g[1],1),cs[2],g[2],0) for A in F)
+        self.shape=U.shape                                     # (nz, ny, nx)
+        M=np.sqrt(U*U+V*V+W*W); Mx=float(M.max()) if M.size else 0.
+        thr=float(thr) if thr and thr>0 else 1e-12
+        self.ok=(M>thr*Mx)&(M>0) if Mx>0 else np.zeros(M.shape,bool)
+        # the direction as drawn (unit cube scaled by the box), unit length,
+        # then back to unit-cube rates: the path is the physical field line
+        dd=[A*b/l for A,b,l in zip((U,V,W),self.B,self.L)]
+        nr=np.sqrt(dd[0]**2+dd[1]**2+dd[2]**2); safe=np.where(nr>0,nr,1.)
+        self.d=[np.where(nr>0,a/safe,0.)/b for a,b in zip(dd,self.B)]
+        lo=np.log10(max(thr*Mx,1e-300)) if Mx>0 else 0.; hi=np.log10(Mx) if Mx>0 else 1.
+        with np.errstate(divide="ignore",invalid="ignore"):
+            f=np.clip((np.log10(np.where(M>0,M,1e-300))-lo)/max(hi-lo,1e-9),0.,1.)
+        self.sp=np.where(self.ok,0.15+0.85*f,0.)
+        w=np.where(self.ok,M,0.).ravel(); tot=float(w.sum())
+        self.cdf=np.cumsum(w)/tot if tot>0 else None
+        self.rng=np.random.default_rng(seed); self.n=int(max(1,n)); self.tail=int(max(2,tail))
+        self.P=self._sample(self.n); self.H=np.repeat(self.P[:,None,:],self.tail,axis=1)
+        self.life=self.rng.uniform(1.5,4.,self.n); self.age=self.rng.uniform(0.,1.,self.n)*self.life
+    @property
+    def empty(self): return self.cdf is None
+    def _sample(self,m):
+        if self.cdf is None: return np.full((m,3),0.5)
+        nz,ny,nx=self.shape
+        idx=np.minimum(np.searchsorted(self.cdf,self.rng.random(m)),nz*ny*nx-1)
+        kz,jy,ix=np.unravel_index(idx,self.shape)
+        r=self.rng.random((m,3))-0.5
+        return np.clip(np.stack([(ix+r[:,0])/(nx-1),(jy+r[:,1])/(ny-1),(kz+r[:,2])/(nz-1)],1),0.,1.)
+    def _at(self,F,P):
+        """F trilinear at the unit-cube points P (n, 3)."""
+        nz,ny,nx=F.shape
+        u=np.clip(P[:,0],0.,1.)*(nx-1); v=np.clip(P[:,1],0.,1.)*(ny-1); w=np.clip(P[:,2],0.,1.)*(nz-1)
+        i=np.minimum(u.astype(int),nx-2); j=np.minimum(v.astype(int),ny-2); k=np.minimum(w.astype(int),nz-2)
+        a=u-i; b=v-j; c=w-k
+        lo=(F[k,j,i]*(1-a)+F[k,j,i+1]*a)*(1-b)+(F[k,j+1,i]*(1-a)+F[k,j+1,i+1]*a)*b
+        hi=(F[k+1,j,i]*(1-a)+F[k+1,j,i+1]*a)*(1-b)+(F[k+1,j+1,i]*(1-a)+F[k+1,j+1,i+1]*a)*b
+        return lo*(1-c)+hi*c
+    def _vel(self,P,k):
+        s=self._at(self.sp,P)*k
+        return np.stack([self._at(d,P)*s for d in self.d],1)
+    def step(self,dt,speed=1.):
+        """Advance dt seconds (midpoint rule)."""
+        if self.cdf is None: return
+        k=0.25*float(speed); P=self.P
+        Pm=P+0.5*dt*self._vel(P,k); Pn=P+dt*self._vel(Pm,k)
+        self.H[:,1:]=self.H[:,:-1]; self.H[:,0]=Pn; self.P=Pn; self.age+=dt
+        nz,ny,nx=self.shape
+        iu=np.clip(np.rint(Pn[:,0]*(nx-1)).astype(int),0,nx-1); iv=np.clip(np.rint(Pn[:,1]*(ny-1)).astype(int),0,ny-1)
+        iw=np.clip(np.rint(Pn[:,2]*(nz-1)).astype(int),0,nz-1)
+        dead=((Pn<0)|(Pn>1)).any(1)|(~self.ok[iw,iv,iu])|(self.age>self.life)
+        if dead.any():
+            m=int(dead.sum()); New=self._sample(m)
+            self.P[dead]=New; self.H[dead]=New[:,None,:]; self.age[dead]=0.
+            self.life[dead]=self.rng.uniform(1.5,4.,m)
+    def to_phys(self,P):
+        """Unit-cube points to the device coordinates (x, y, z) in nm."""
+        return self.c0+np.asarray(P)*self.L
+    def segments(self):
+        """Tail segments in the coordinates of the 3-D view - (x, z, -depth y)
+        - shape (n (tail-1), 2, 3), and the fraction along the tail of each
+        (0 = the head)."""
+        c=self.to_phys(self.H); H=np.stack([c[...,0],c[...,2],-c[...,1]],-1)
+        seg=np.stack([H[:,:-1],H[:,1:]],2).reshape(-1,2,3)
+        f=np.tile(np.arange(self.tail-1)/(self.tail-1),self.n)
+        return seg,f
+
 def _interp_axis(A,c_old,c_new,axis):
     c_old=np.asarray(c_old,float); c_new=np.asarray(c_new,float)
     i=np.clip(np.searchsorted(c_old,c_new)-1,0,len(c_old)-2)
@@ -4204,7 +4292,7 @@ import queue, json, copy, textwrap
 import tkinter.font as tkfont
 from matplotlib.ticker import FuncFormatter
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 SETTINGS_FILE=os.path.join(os.path.expanduser("~"),".semisim3d.json")
 # label-based buttons (FlatButton) and themed check boxes: macOS draws the
 # classic Tk ones natively, without the app's colours; SEMISIM_FLAT_BUTTONS=1
@@ -4400,7 +4488,7 @@ Typical workflow for a new design: load the closest template, change regions and
 ("Status and terms", """
 # Status and terms
 SemiSim 3D 0.2 is an early public version - a test version: it is still being tested, so read its results with care.
-- The physics is checked against textbook theory (`validate.py`, 238 checks), not yet against measurements of real devices.
+- The physics is checked against textbook theory (`validate.py`, 240 checks), not yet against measurements of real devices.
 - Results can be wrong, and some effects are not modelled at all (see Limitations). Check anything important against measurements, the literature or an established simulator.
 - The `RW:` templates are modelled on the device class and ratings of real parts, not on their real dies; currents are per simulated cell.
 - macOS support and the WSL2 full-screen workaround are new and have been tried on few computers so far.
@@ -4593,7 +4681,7 @@ Pinned sweeps get the same parameters, listed below those of the last sweep; `Ta
 - `Current` → `Show`: `current J` (the total, conventional current, from + to −), `electron flow` (where the electrons go: −J_n - in an n-channel MOSFET from the source through the channel to the drain) or `hole flow` (J_p). Line cut, map, arrows, flowlines and particles all follow it.
 - `Current` → `Hide below`: nothing is drawn where the current density is below this fraction of its maximum (in the map's plane for the map, in the device for the 3-D arrows) - the leakage paths disappear and the main current path stands out. `log |J|` colours the map on a log scale (from the threshold up).
 - `Current` → `Flowlines`: lines that each carry the same share of the in-plane current (contours of the stream function built from the finite-volume face currents: exact in a 2-D device). They crowd where the current is dense - a MOSFET channel, a JFET neck - and fan out where it spreads: in a VDMOS cell the electrons come out of the two channels, squeeze through the JFET region between the p-bodies and spread at about 45° into the drift region (a reversed funnel). The box sets their number. When current leaves the plane (a 3-D device, or a single carrier where it recombines) evenly spaced streamlines are drawn instead; the note in the corner says which.
-- `Current` → `▶ Animate`: particles flow along the current of the in-plane map. They start where the current is, with a probability proportional to |J|; their speed grows with log |J| (|J| spans many decades - fast in the channel, slow where the current fans out). `Hide below` keeps them out of the leakage, `Particles` sets their number and `Speed` the pace. `GIF…` saves the animated map (with its labels and colour bar) as an animated GIF.
+- `Current` → `▶ Animate`: particles flow along the current of the in-plane map and, with `3-D` ticked, through the 3-D view - along the current of the whole device; drag to turn the view while it runs (untick `3-D arrows` to see the particles alone). They start where the current is, with a probability proportional to |J|; their speed grows with log |J| (|J| spans many decades - fast in the channel, slow where the current fans out). `Hide below` keeps them out of the leakage, `Particles` sets their number and `Speed` the pace. `GIF…` saves the animation - the map (with its labels and colour bar) and the 3-D view as it is turned - as an animated GIF.
 - `Panels ▾` (every plot tab): hide panels to give the others the room - the Structure tab's 3-D view, cross-section and legend; the Slicer's 3-D view and its three planes; the band diagram and ribbon; the five Current panels; E-field and mobility; the linear, semi-log and BJT panels of the I-V tab.
 - `Layers…` (Structure and Current tabs): click 'Shown' to hide or show a region, contact or the defects in the 3-D view. Select one or more parts (Ctrl/Shift for several) and move 'Opacity of the selected parts' to give them their own opacity - a see-through substrate under an opaque channel, say; 'Auto' hands them back to the sliders for all regions and all contacts ('See-through contacts' sets 0.15). 'Insulators in 3-D' draws the oxides too; 'Apply to the cross-section too' uses the same choices in the section.
 - `Current` → `Map`: what lies under the arrows of the in-plane map - `|J|`, the device `structure` (region colours) or `|J| + structure`. `Structure in 3-D` draws the regions and contacts around the 3-D arrows. `Opacity` sets how see-through that structure is; parts hidden in `Layers…` stay hidden and a part with its own opacity there keeps it.
@@ -4991,6 +5079,8 @@ class App(tk.Tk):
         try: spd=max(0.2,min(4.,float(self.cfg.get("aspeed",1.))))
         except Exception: spd=1.
         self.cur_spd=tk.DoubleVar(value=spd)
+        self.cur_anim3=tk.BooleanVar(value=bool(self.cfg.get("anim3d",True)))   # animate the 3-D view too
+        self._anim3=None; self._anim3_art=None; self._anim3_ax=None; self._anim3_bg=None
         self._anim=None; self._anim_on=False; self._anim_art=None; self._anim_ax=None
         self._anim_bg=None; self._anim_t=None; self._anim_id=None; self._anim_box=None
         self.fi_axis=tk.StringVar(value="X"); self.fi_p1=tk.IntVar(value=0); self.fi_p2=tk.IntVar(value=0)
@@ -5089,7 +5179,8 @@ class App(tk.Tk):
                    workarea=self._workarea,wsl_max_fix=bool(self.wsl_fix.get()),filled=bool(big),
                    arrows2d=self._arrow_n()[0],arrows3d=self._arrow_n()[1],
                    cur_thr=self.cur_thr.get(),flowlines=bool(self.cur_lines.get()),nlines=self._nlines(),
-                   jlog=bool(self.cur_log.get()),particles=self._nparticles(),aspeed=float(self.cur_spd.get()))
+                   jlog=bool(self.cur_log.get()),particles=self._nparticles(),aspeed=float(self.cur_spd.get()),
+                   anim3d=bool(self.cur_anim3.get()))
             with open(SETTINGS_FILE,"w") as f: json.dump(d,f)
         except Exception: pass
     def _quit(self):
@@ -6300,12 +6391,12 @@ class App(tk.Tk):
             ttk.Radiobutton(parent,text=v,variable=var,value=v,command=cmd).pack(side=tk.LEFT,padx=2)
     def _check(self,parent,text,var,cmd,fg=None):
         if FLAT_BUTTONS:       # macOS draws tk.Checkbutton natively: use the themed one
-            ttk.Checkbutton(parent,text=text,variable=var,command=cmd,
-                            style=self._check_style(fg or C["text"])).pack(side=tk.LEFT,padx=4)
-            return
-        tk.Checkbutton(parent,text=text,variable=var,command=cmd,bg=C["panel"],fg=fg or C["text"],
-                       selectcolor="#07111e",activebackground=C["panel"],activeforeground=fg or C["text"],
-                       font=self.F["ui"],highlightthickness=0).pack(side=tk.LEFT,padx=4)
+            w=ttk.Checkbutton(parent,text=text,variable=var,command=cmd,style=self._check_style(fg or C["text"]))
+            w.pack(side=tk.LEFT,padx=4); return w
+        w=tk.Checkbutton(parent,text=text,variable=var,command=cmd,bg=C["panel"],fg=fg or C["text"],
+                         selectcolor="#07111e",activebackground=C["panel"],activeforeground=fg or C["text"],
+                         font=self.F["ui"],highlightthickness=0)
+        w.pack(side=tk.LEFT,padx=4); return w
     def _check_style(self,fg):
         st=f"C{fg.lstrip('#')}.TCheckbutton"
         done=self.__dict__.setdefault("_chk_styles",set())
@@ -6568,16 +6659,22 @@ class App(tk.Tk):
             self._check(cf3,"log |J|",self.cur_log,self._upd_curr_plot,"#e2e8f0")
             ttk.Separator(cf3,orient="vertical").pack(side=tk.LEFT,fill=tk.Y,padx=6,pady=2)
             self._anim_btn=self._btn(cf3,"▶ Animate",self._anim_toggle,bg="#0a8f5a"); self._anim_btn.pack(side=tk.LEFT,padx=2)
-            Tip(self._anim_btn,"Particles flow along the current in the in-plane map; their speed grows with\n"
-                               "log |J| (fast in the channel, slow in the spreading region).  'Hide below'\n"
-                               "keeps them out of the leakage paths.",self.F["small"])
+            Tip(self._anim_btn,"Particles flow along the current in the in-plane map - and through the 3-D\n"
+                               "view when '3-D' is ticked; their speed grows with log |J| (fast in the\n"
+                               "channel, slow in the spreading region).  'Hide below' keeps them out of the\n"
+                               "leakage paths.",self.F["small"])
+            c3=self._check(cf3,"3-D",self.cur_anim3,self._anim_rebuild,"#e2e8f0")
+            Tip(c3,"Animate the 3-D view too: particles travel through the device along the 3-D\n"
+                   "current.  Drag to rotate while it runs; untick '3-D arrows' to see the particles\n"
+                   "alone.",self.F["small"])
             tk.Label(cf3,text="Particles",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(6,2))
             self._spin_int(cf3,self.cur_np,PARTICLES,50,"Number of particles in the animation.",
                            lambda:self._anim_rebuild())
             tk.Label(cf3,text="Speed",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(6,2))
             ttk.Scale(cf3,from_=0.2,to=4.,orient=tk.HORIZONTAL,variable=self.cur_spd,length=90).pack(side=tk.LEFT,padx=2)
             b=self._btn(cf3,"GIF…",self._anim_gif,bg=C["border"]); b.pack(side=tk.LEFT,padx=6)
-            Tip(b,"Save the animation of the in-plane map as an animated GIF.",self.F["small"])
+            Tip(b,"Save the animation as an animated GIF: the in-plane map and, when it is\n"
+                  "animated, the 3-D view (as it is turned now).",self.F["small"])
         self.cur_lbl1,self.cur_lbl2,self.cur_scale1,self.cur_scale2=self._build_cut_controls(
             self.tc,self.cur_axis,self.cur_p1,self.cur_p2,self._upd_curr_axis,
             lambda _:self._debounce('_cur_after_id',self._upd_curr_plot),extras)
@@ -8585,6 +8682,7 @@ class App(tk.Tk):
     def _plot_curr(self):
         s=self.sol; fig=self.fc; fig.clear()
         self._anim_art=None; self._anim_ax=None; self._anim_bg=None; self._anim_cax=None
+        self._anim=None; self._anim3=None; self._anim3_art=None; self._anim3_ax=None; self._anim3_bg=None
         self._hmaps={k:v for k,v in getattr(self,"_hmaps",{}).items() if k.figure is not fig}
         self.cur_hover.config(text="")
         if s is None:
@@ -8739,6 +8837,8 @@ class App(tk.Tk):
             aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
             self._aspect3(aQ3,x.max(),y.max(),z.max())
             sax3(aQ3,"x","z","depth y","3-D current field (arrows off)"); _depth_axis(aQ3)
+        if aQ3 is not None and self._anim_on and self.cur_anim3.get():
+            self._anim3_build(aQ3,FX,FY,FZ,s["x"],s["y"],s["z"],thr)
         try: fig.tight_layout(pad=1.)
         except Exception: pass
         self._flush_labels(fig)
@@ -8787,12 +8887,18 @@ class App(tk.Tk):
         ax.text(0.01,0.01,note,transform=ax.transAxes,fontsize=7,color="white",alpha=0.8,va="bottom",
                 bbox=dict(boxstyle="round,pad=0.2",facecolor="black",alpha=0.35,edgecolor="none"))
 
-    # ── animation of the in-plane map (particles along the current) ──
+    # ── animation: particles along the current (in-plane map and 3-D view) ──
+    def _anim_ready(self):
+        """(2-D map ready, 3-D view ready) - built, and their backgrounds kept."""
+        ok2=self._anim is not None and self._anim_art is not None and self._anim_bg is not None
+        ok3=self._anim3 is not None and self._anim3_art is not None and self._anim3_bg is not None
+        return ok2,ok3
     def _anim_toggle(self):
         if self._anim_on: self._anim_stop(); return
         if self.sol is None:
             self.sv.set("Solve a device first (▶ Run): the animation follows its current"); return
-        if "map" not in self._vis("tc"): self.pv["tc"]["map"].set(True)
+        vis=self._vis("tc")
+        if "map" not in vis and not ("3d" in vis and self.cur_anim3.get()): self.pv["tc"]["map"].set(True)
         self._anim_on=True; self._anim_btn.config(text="■ Stop"); self._anim_t=time.time()
         self._plot_curr(); self._anim_sched()
     def _anim_stop(self,redraw=True):
@@ -8803,10 +8909,12 @@ class App(tk.Tk):
             self._anim_id=None
         try: self._anim_btn.config(text="▶ Animate")
         except Exception: pass
-        if self._anim_art is not None:
-            try: self._anim_art.remove()
-            except Exception: pass
+        for art in (self._anim_art,self._anim3_art):
+            if art is not None:
+                try: art.remove()
+                except Exception: pass
         self._anim_art=None; self._anim=None; self._anim_bg=None
+        self._anim3_art=None; self._anim3=None; self._anim3_bg=None; self._anim3_ax=None
         if redraw: self.cvc.draw_idle()
     def _anim_sched(self,ms=ANIM_MS):
         self._anim_id=self.after(ms,self._anim_tick)
@@ -8815,34 +8923,67 @@ class App(tk.Tk):
         if not self._anim_on: return
         try: shown=self.nb.select()==str(self.tc)
         except Exception: shown=False
-        if not shown or self._anim is None or self._anim_art is None or self._anim_bg is None:
+        ok2,ok3=self._anim_ready()
+        if not shown or not (ok2 or ok3):
             self._anim_t=time.time(); self._anim_sched(250); return
         now=time.time(); dt=min(0.1,max(0.,now-(self._anim_t or now))); self._anim_t=now
         try:
-            self._anim.step(dt,float(self.cur_spd.get())); self._anim_draw()
+            self._anim_step(dt); self._anim_draw()
         except Exception: pass
         self._anim_sched()
+    def _anim_step(self,dt):
+        sp=float(self.cur_spd.get())
+        if self._anim is not None: self._anim.step(dt,sp)
+        if self._anim3 is not None: self._anim3.step(dt,sp)
     def _anim_draw(self):
-        seg,f=self._anim.segments()
-        col=np.ones((len(f),4)); col[:,3]=0.95*(1.-f)**1.5
-        self._anim_art.set_segments(seg); self._anim_art.set_color(col)
-        self._anim_art.set_linewidths(0.6+1.6*(1.-f))
-        cv=self.cvc; cv.restore_region(self._anim_bg)
-        self._anim_ax.draw_artist(self._anim_art); cv.blit(self._anim_ax.bbox)
+        """One frame: the tails over the kept backgrounds (blitting) - in the
+        map and in the 3-D view (projected with the view's present angle)."""
+        ok2,ok3=self._anim_ready(); cv=self.cvc
+        if ok2:
+            seg,f=self._anim.segments()
+            col=np.ones((len(f),4)); col[:,3]=0.95*(1.-f)**1.5
+            self._anim_art.set_segments(seg); self._anim_art.set_color(col)
+            self._anim_art.set_linewidths(0.6+1.6*(1.-f))
+            cv.restore_region(self._anim_bg)
+            self._anim_ax.draw_artist(self._anim_art); cv.blit(self._anim_ax.bbox)
+        if ok3:
+            seg,f=self._anim3.segments()
+            col=np.ones((len(f),4)); col[:,3]=0.95*(1.-f)**1.5
+            a=self._anim3_art; a.set_segments(seg); a.set_color(col); a.set_linewidths(0.7+1.8*(1.-f))
+            cv.restore_region(self._anim3_bg)
+            a.do_3d_projection(); self._anim3_ax.draw_artist(a); cv.blit(self._anim3_ax.bbox)
     def _anim_on_draw(self,ev):
-        """A full redraw (the animated tails are left out of it): keep the map as the background."""
-        if self._anim_ax is None or self._anim_art is None: self._anim_bg=None; return
-        try: self._anim_bg=self.cvc.copy_from_bbox(self._anim_ax.bbox)
-        except Exception: self._anim_bg=None
+        """A full redraw (the animated tails are left out of it; after a turn of
+        the 3-D view too): keep the map and the 3-D view as the backgrounds."""
+        self._anim_bg=self._anim3_bg=None
+        if self._anim_ax is not None and self._anim_art is not None:
+            try: self._anim_bg=self.cvc.copy_from_bbox(self._anim_ax.bbox)
+            except Exception: self._anim_bg=None
+        if self._anim3_ax is not None and self._anim3_art is not None:
+            try: self._anim3_bg=self.cvc.copy_from_bbox(self._anim3_ax.bbox)
+            except Exception: self._anim3_bg=None
     def _anim_build(self,ax,U,V,hx,vy,thr):
         from matplotlib.collections import LineCollection
         self._anim=FlowParticles(U,V,hx,vy,thr=thr if thr>0 else 1e-6,n=self._nparticles())
         self._anim_art=LineCollection([],animated=True,capstyle="round"); ax.add_collection(self._anim_art)
         self._anim_ax=ax; self._anim_bg=None
+    def _anim3_build(self,ax,FX,FY,FZ,x,y,z,thr):
+        """Particles through the 3-D view: the field of the whole device, the
+        speed measured in the drawn box (its aspect: x, z, depth y)."""
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+        try:
+            ba=np.asarray(ax.get_box_aspect(),float); box=(ba[0],ba[2],ba[1])
+        except Exception: box=None
+        self._anim3=FlowParticles3D(FX,FY,FZ,x,y,z,thr=thr if thr>0 else 1e-6,n=self._nparticles(),box=box)
+        if self._anim3.empty: self._anim3=None; return
+        self._anim3_art=Line3DCollection([],animated=True,capstyle="round")
+        ax.add_collection(self._anim3_art,autolim=False)
+        self._anim3_ax=ax; self._anim3_bg=None
     def _anim_rebuild(self):
         if self._anim_on: self._debounce('_cur_after_id',self._upd_curr_plot,250)
     def _anim_gif(self,path=None,frames=90,fps=15):
-        """Save the animated in-plane map (with its labels and colour bar) as a GIF."""
+        """Save the animation as a GIF: the in-plane map (with its labels and
+        colour bar) and, when it is animated, the 3-D view as it is turned now."""
         if self.sol is None: messagebox.showinfo("Animation","Solve a device first (▶ Run)."); return
         try: from PIL import Image
         except ImportError: messagebox.showerror("Animation","Saving a GIF needs Pillow (pip install pillow)."); return
@@ -8851,23 +8992,29 @@ class App(tk.Tk):
                                               initialfile=f"{(self.tname or 'device').replace(' ','_')}_current.gif")
             if not path: return
         was=self._anim_on
-        if "map" not in self._vis("tc"): self.pv["tc"]["map"].set(True)
+        vis=self._vis("tc")
+        if "map" not in vis and not ("3d" in vis and self.cur_anim3.get()): self.pv["tc"]["map"].set(True)
         self._anim_on=True
         try:
             self._plot_curr(); self.cvc.draw()
-            if self._anim is None or self._anim_art is None or self._anim_bg is None or self._anim.empty:
-                messagebox.showinfo("Animation","No current to animate in this plane."); return
+            ok2,ok3=self._anim_ready()
+            ok2=ok2 and not self._anim.empty
+            if not (ok2 or ok3):
+                messagebox.showinfo("Animation","No current to animate (is it below the threshold everywhere?)."); return
             from matplotlib.transforms import Bbox
-            r=self.cvc.get_renderer(); bbs=[self._anim_ax.get_tightbbox(r)]
-            if self._anim_cax is not None: bbs.append(self._anim_cax.get_tightbbox(r))
+            r=self.cvc.get_renderer(); bbs=[]
+            if ok2:
+                bbs.append(self._anim_ax.get_tightbbox(r))
+                if self._anim_cax is not None: bbs.append(self._anim_cax.get_tightbbox(r))
+            if ok3: bbs.append(self._anim3_ax.get_tightbbox(r))
             bb=Bbox.union(bbs); buf=np.asarray(self.cvc.buffer_rgba()); H,W=buf.shape[:2]
             sc=W/float(self.fc.bbox.width)
             c0,c1=max(0,int(bb.x0*sc)-4),min(W,int(np.ceil(bb.x1*sc))+4)
             r0,r1=max(0,H-int(np.ceil(bb.y1*sc))-4),min(H,H-int(bb.y0*sc)+4)
-            for _ in range(30): self._anim.step(1./fps,float(self.cur_spd.get()))    # tails formed
+            for _ in range(30): self._anim_step(1./fps)                 # tails formed
             out=[]
             for k in range(int(frames)):
-                self._anim.step(1./fps,float(self.cur_spd.get())); self._anim_draw()
+                self._anim_step(1./fps); self._anim_draw()
                 img=np.asarray(self.cvc.buffer_rgba())[r0:r1,c0:c1,:3].copy()
                 out.append(Image.fromarray(img).convert("P",palette=Image.ADAPTIVE,colors=128))
                 if k%15==0: self.sv.set(f"Writing GIF… frame {k}/{frames}"); self.update_idletasks()
