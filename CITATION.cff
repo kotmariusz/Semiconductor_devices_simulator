@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use SemiSim 3D in your work, please cite it as below."
 title: "SemiSim 3D: a 3-D drift-diffusion semiconductor device simulator"
 type: software
-version: "0.2.1"
-date-released: "2026-11-10"
+version: "0.2.2"
+date-released: "2026-11-15"
 authors:
   - family-names: "Kot"
     given-names: "Mariusz"
@@ -13,8 +13,9 @@ abstract: >-
   A 3-D drift-diffusion simulator for semiconductor devices with a Python/Tk
   interface and a C (OpenMP) core: box method on graded rectangular or
   triangular-prism meshes, Scharfetter-Gummel fluxes, impact ionisation,
-  55 device templates, side-by-side comparison of designs and a validation
-  suite of 213 checks against closed-form theory.
+  55 device templates, current-flow animation, R_DS(on) and quasi-static
+  capacitance extraction, side-by-side comparison of designs and a
+  validation suite of 238 checks against closed-form theory.
 keywords:
   - semiconductor device simulation
   - drift-diffusion

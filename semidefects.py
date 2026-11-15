@@ -152,6 +152,15 @@ _p("Interface traps 4H-SiC/SiO2", "Interfaces", "interface",
    "channel charge.", dit=3e11, dit_sigma=1e-15,
    levels=[L("A", "Ec", 0.10, 1e-15, 1e-15, 1e12), L("A", "Ec", 0.20, 1e-15, 1e-15, 6e11),
            L("A", "Ec", 0.30, 1e-15, 1e-15, 3e11)], shape="everywhere", host="4H-SiC")
+_p("Interface traps 4H-SiC/SiO2: band tail", "Interfaces", "interface",
+   "Acceptor-like interface states rising exponentially towards the conduction band, "
+   "D_it(E) = D_edge exp(-(Ec - E)/E_t): the SiC/SiO2 picture of Potbhare et al. (J. Appl. Phys. 100, "
+   "044515, 2006; IEEE Trans. Electron Devices 55, 2029, 2008), D_edge ~5.7e13 cm⁻²eV⁻¹ (the D_it field "
+   "holds D_edge), E_t = 67 meV at 25 °C. Filled near threshold, they hold a large part of the channel "
+   "charge: V_th rises, the subthreshold swing stretches, and the channel conducts better as the "
+   "temperature empties them. These are values of older oxides; NO-annealed interfaces are ~5-10x lower "
+   "near Ec - lower D_it. For the midgap floor (~2.4e11) add 'Interface traps Si/SiO2 (D_it)'.",
+   dit=5.7e13, dit_sigma=1e-15, tail=0.067, shape="everywhere", host="4H-SiC")
 _p("Oxide fixed charge (Qf)", "Interfaces", "interface",
    "Fixed charge at semiconductor/insulator interfaces inside the shape (q/cm², + or −): shifts the "
    "flat band and threshold by −Q/C_ox. Good thermal oxide on Si ~5e10, poor 1e11–1e12.",
@@ -550,9 +559,16 @@ class DefectData:
         return sum(len(t[1]) for t in self.traps)
 
 
-def dit_levels(dit, sigma, Eg, nb=24):
+def dit_levels(dit, sigma, Eg, nb=24, tail=None):
     """A constant D_it (cm^-2 eV^-1) across a gap Eg as nb amphoteric levels
-    (acceptor above midgap, donor below): [(Level, sheet density cm^-2)]."""
+    (acceptor above midgap, donor below): [(Level, sheet density cm^-2)].
+    tail (eV): instead an acceptor band tail under the conduction band,
+    D_it(E) = dit exp(-(Ec - E)/tail) (dit = its value at Ec), sampled at the
+    midpoints of nb slices of Ec - min(Eg/2, 8 tail) ... Ec."""
+    if tail:
+        Emax = min(0.5 * Eg, 8. * tail); dE = Emax / nb
+        return [(Level("A", "Ec", (k + 0.5) * dE, sigma, sigma), dit * math.exp(-(k + 0.5) * dE / tail) * dE)
+                for k in range(nb)]
     dE = Eg / nb; out = []
     for k in range(nb):
         E = (k + 0.5) * dE                       # above Ev
@@ -667,7 +683,7 @@ def apply(defects, view, L, semis, insulators, eg_of, barrier_of=None, gate_face
                     out.add_level(Level("D", "Ec", pb + 0.05, 1e-15, 1e-15), uk, Ns * area_m2 / Vk)
                     out.add_level(Level("A", "Ec", max(pb - 0.05, 0.01), 1e-15, 1e-15), uk, Ns * area_m2 / Vk)
                 elif d.dit > 0:
-                    for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name)):
+                    for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name), tail=p.get("tail")):
                         out.add_level(lv, uk, ns * 1e4 * area_m2 / Vk)
             if not len(ins) or Vin > 3. * Vs:
                 # smaller than the mesh there: replacing whole control volumes would
@@ -764,7 +780,7 @@ def apply(defects, view, L, semis, insulators, eg_of, barrier_of=None, gate_face
                 if d.dit > 0:
                     for name in set(mat[nod]):
                         m = mat[nod] == name
-                        for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name)):
+                        for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name), tail=p.get("tail")):
                             out.add_level(lv, nod[m], _spread(out, view, nod[m], ns * area_cm2 * float(m.sum()) / len(nod)))
         elif g == "interface":
             if d.shape == "everywhere": cand = np.arange(view.N, dtype=np.int64)
@@ -788,7 +804,7 @@ def apply(defects, view, L, semis, insulators, eg_of, barrier_of=None, gate_face
                 for name in set(mat[uk]):
                     m = mat[uk] == name
                     if d.dit > 0:
-                        for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name)):
+                        for lv, ns in dit_levels(d.dit, p["dit_sigma"], eg_of(name), tail=p.get("tail")):
                             out.add_level(lv, uk[m], ns * 1e4 * area[m] / Vk[m])
                     for lv in d.levels():                   # discrete interface levels (cm^-2 via w)
                         out.add_level(lv, uk[m], lv.w * 1e4 * area[m] / Vk[m])

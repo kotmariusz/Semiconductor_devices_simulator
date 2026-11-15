@@ -132,6 +132,31 @@ View → `WSL: turn maximise into fill screen` switches this off.
   between the mesh nodes, so the count is not limited by the mesh; denser
   arrows are drawn shorter and thinner. Arrow length is log-scaled, so weak
   and strong currents both show.
+* `Current` → `Show`: `current J` (the total, conventional current),
+  `electron flow` (where the electrons go, −J_n: in an n-channel MOSFET from
+  the source through the channel to the drain) or `hole flow` (J_p). The line
+  cut, map, arrows, flowlines and particles all follow it.
+* `Current` → `Hide below`: no arrows, flowlines or particles where the
+  current density is below this fraction of its maximum (in the map's plane;
+  in the device for the 3-D arrows), so leakage paths disappear and the main
+  path stands out. `log |J|` colours the map on a log scale.
+* `Current` → `Flowlines`: lines that each carry the same share of the
+  in-plane current - contours of the stream function, built from the
+  finite-volume face currents of the solution, so they are exact in a 2-D
+  device (the current between two lines equals the drain current divided by
+  their number to the solver's round-off). They crowd in a channel or a
+  JFET neck and fan out where the current spreads. In a VDMOS cell the
+  electrons leave the two channels, squeeze through the JFET region between
+  the p-bodies and spread at about 45° into the drift region - a reversed
+  funnel. When current leaves the plane (3-D devices) evenly spaced
+  streamlines are drawn instead, and the note in the corner says so.
+* `Current` → `▶ Animate`: particles flow along the current in the in-plane
+  map. They start where the current is (probability ∝ |J|); their speed grows
+  with log |J|, so the fast channel and the slow spreading region both show.
+  `Particles` sets their number, `Speed` the pace, `Hide below` keeps them out
+  of the leakage. `GIF…` saves the animated map as an animated GIF.
+
+  ![VDMOS electron flow: flowlines and particles](screenshots/vdmos_flow.png)
 * `Current` → `Map` puts the device structure under the arrows of the
   in-plane map: `|J|` (the current density, as before), `structure` (the
   region colours) or `|J| + structure` (both, the structure see-through on
@@ -164,6 +189,9 @@ View → `WSL: turn maximise into fill screen` switches this off.
 * File → Save/Open device stores the whole editor state as JSON (defects and
   the adaptive mesh lines included). Export solution/sweep CSV and the
   visible plot (PNG/PDF/SVG) are also in the File menu.
+* Analysis → `Capacitances at this bias…` and `On-resistance by region…`
+  work on the present solution (see [MOSFET: R_DS(on),
+  capacitances](#mosfet-r_dson-capacitances)).
 
 **Gate stacks.** A gate on a semiconductor face takes an optional layer
 stack in the Contacts page, semiconductor side first, in nm:
@@ -455,10 +483,66 @@ variants)`, 2-D sections, seconds per bias point):
 | Avalanche: Si p+n diode breakdown | impact ionisation on / off | Anode 0 → −56 V | BV ≈ 52 V (ionisation integral 51.9 V, Baliga 53.4 V); with impact ionisation off no breakdown at all |
 | Avalanche: NPN BV_CBO, BV_CES, BV_CEO | base shorted to the emitter / base open / emitter left out (pick two) | Collector 0 → 60 V | BV_CBO ≈ 56 V > BV_CES ≈ 34 V (the avalanche holes flowing to the base contact turn the emitter edge on) > BV_CEO ≈ 21 V (open base: M = 1 + 1/β; Miller's BV_CBO/β^(1/4) gives 22 V) |
 
+## MOSFET: R_DS(on), capacitances
+
+**R_DS(on).** Sweep the drain from 0 V with the gate held on: the I-V tab
+gives R_DS(on) from the slope of the output curve at V_DS → 0, per simulated
+cell, specific (mΩ·cm², times the cell footprint - the x-z face of the cell)
+and, when the Sweep page has an active area, for the die (with the series
+resistance outside the cell and the package added). A gate sweep at a small
+V_DS gives V_DS/I_D at its highest gate voltage. For the temperature
+coefficient sweep at 298 K and 423 K (Solver page), pin both and read the
+ratio in `Table…`. Analysis → `On-resistance by region…` splits the
+dissipated power of the present solution over the regions,
+P_i = ∫ (J_n·∇E_Fn + J_p·∇E_Fp) dV, and gives each region's share of the
+on-resistance R_i = P_i/I² - channel (in the p-body), JFET and drift region,
+substrate - with the total checked against Σ V·I.
+
+**Power device (Sweep page).** `Active area` (mm²) scales R_DS(on) and the
+capacitances from the cell to the die. `Series outside` (mΩ·cm²) adds what
+the mesh leaves out - a substrate is ρ·t: 4H-SiC 20 mΩ·cm × 350 µm =
+0.70 mΩ·cm², about as much as the drift region of a 1.2 kV cell; Si
+2 mΩ·cm × 100 µm = 0.02 mΩ·cm² - plus contact resistivity. `Package` (mΩ)
+adds bond wires and leads (TO-220/TO-247: about 0.5-2 mΩ).
+
+**Capacitances.** `Capacitances (quasi-static C-V)` on the Sweep page adds,
+at every point, the capacitance matrix C_ij = dQ_i/dV_j: each terminal is
+moved by a few mV and re-solved (2-4 extra solves per point). A terminal's
+charge is Gauss's law around its part of the device - its contact nodes and
+the semiconductor of the same majority carrier connected to them (the n-drift
+region belongs to the drain, a p-body tied to the source to the source); a
+gate's charge is the flux through its oxide; an inversion layer with no
+source of its own (a MOS capacitor) belongs to the bulk that feeds it. With a
+gate and a swept drain the terminals are gate (all gate contacts), drain and
+source (the rest), which gives the datasheet curves: C_iss = dQ_G/dV_G,
+C_oss = dQ_D/dV_D, C_rss = −dQ_G/dV_D. Sweep the drain from 0 V with the gate
+at 0 V. From 0 V the I-V tab also gives Q_oss, E_oss and the effective output
+capacitances C_o(tr) = Q_oss/V and C_o(er) = 2 E_oss/V². Otherwise the swept
+terminal is taken against all the others: C(V) of a diode or a MOS capacitor
+(the low-frequency curve). Analysis → `Capacitances at this bias…` gives the
+full matrix at the present solution.
+
+The method is exact at low frequency in the off state, where no DC current
+joins two terminals: it is then reciprocal (C_gd = C_dg) and conserves charge,
+and the I-V tab reports both errors. With a channel on, its charge is split
+between source and drain where their regions meet (an approximation, flagged).
+There is no AC solver: no high-frequency MOS curve and no switching gate
+charge.
+
+**Gate oxide field.** The Results tab title shows the largest field in the
+insulators and where it is - a design limit of SiC trench MOSFETs (about
+3-4 MV/cm long term).
+
+**SiC interface traps.** Defects → `Interface traps 4H-SiC/SiO2: band tail`:
+acceptor states rising exponentially towards E_c,
+D_it(E) = D_edge exp(−(E_c − E)/E_t), with D_edge = 5.7e13 cm⁻²eV⁻¹ (the
+D_it field) and E_t = 67 meV (Potbhare et al.). They hold a large part of the
+channel charge near threshold.
+
 ## Validation
 
-`python3 validate.py` runs 158 checks against closed-form theory (about 10 min
-on two cores); `--templates` adds section 9: all 213 checks in about 21 min.
+`python3 validate.py` runs 183 checks against closed-form theory (about 12 min
+on two cores); `--templates` adds section 9: all 238 checks in about 23 min.
 Each check prints PASS/FAIL with its tolerance, and the script doubles as an
 example of driving the core without the interface. The references are in
 [SOURCES](SOURCES.md).
@@ -483,6 +567,7 @@ example of driving the core without the interface. The references are in
 | 16 | Adaptive refinement vs finer meshes; sweep predictor | coarse diode 3.0 % → 0.04 %; same currents, 671 vs 829 iterations |
 | 17 | Avalanche breakdown of Si p⁺/n junctions vs the ionisation integral and Baliga; 400 K; stored charge; short-base diode transit time; Early voltage and f_T extraction | BV within 0.2 % of the ionisation integral (1e16, 1e17 cm⁻³, 400 K), 3 % under Baliga; BV ×1.21 at 400 K; charge sums exact; transit time −3 %; V_A, f_T, β within 0.03 % |
 | 18 | Material parameters and analysis: Si mobility vs Masetti (1e15–1e20, 300 and 400 K), 4H-SiC holes vs Schaffer, nᵢ and V_bi at 250/400 K, the 32-contact limit, NaN from bad getter indices, ideality factor (n = 1 and 1.7, series resistance, 250–400 K), V_th (linear and saturation), SS above a noisy floor | mobility exact; n within 0.15 %; V_th exact; SS 0.0003 % |
+| 19 | MOSFET analysis: junction capacitance vs the depletion formula (0–10 V), MOS capacitor C/C_ox vs the exact low-frequency curve (accumulation to inversion), oxide field vs Gauss, C_o(tr)/C_o(er) of an analytic C(V), R_DS(on) slope and Joule shares of a resistor bar, VDMOS flowlines (stream function × width = drain current), VDMOS off-state capacitances (reciprocity, charge conservation), particles in a rotation, SiC D_it band tail | C within 0.03 %; MOS C within 0.03 %; reciprocity 1e-6; flowlines exact (5e-8); Joule shares within 1.1 % |
 
 ## Device templates
 
@@ -652,7 +737,20 @@ described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdo
   scatter.
 * **Drift-diffusion transport.** No ballistic transport, strain or
   remote-phonon scattering; Lombardi has Si parameters only.
-* **Not modelled:** self-heating, field plates, transients/AC.
+* **Not modelled:** self-heating, field plates, transients/AC. Capacitances
+  are quasi-static (low frequency): no high-frequency MOS C-V and no
+  switching gate charge; with a channel on, the split of its charge between
+  source and drain is approximate.
+* **SiC MOSFET channels.** The Lombardi surface mobility is silicon only: a
+  4H-SiC inversion channel keeps its bulk mobility (hundreds of cm²/Vs,
+  against the 20-40 cm²/Vs measured, which Coulomb scattering on the
+  interface charge sets), so its channel resistance comes out several times
+  too low. The band-tail D_it preset adds the trapped charge, not the
+  scattering. 4H-SiC also conducts about 20 % better along its c-axis
+  (vertical drift regions) - not modelled.
+* **Uniform doping.** Every region is uniformly doped: the lateral doping
+  gradient of a DMOS channel, which sets both V_th and the channel length, is
+  approximated by boxes.
 * **Adaptive mesh refinement** works on the rectangular mesh only; a new line
   runs through the whole device. It resolves what the indicator sees
   (space charge, band bending, quasi-Fermi curvature); quantities that hinge

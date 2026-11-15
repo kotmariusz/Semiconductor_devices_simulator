@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.2.2 (2026-11-15) - current flow pictures, R_DS(on), capacitances
+
+- Current tab: `Show` picks the total current J, the electron flow (−J_n,
+  where the electrons go) or the hole flow; `Hide below` drops arrows,
+  flowlines and particles where |J| is under a fraction of its maximum
+  (leakage paths vanish); `log |J|` colours the map on a log scale.
+- Flowlines: lines that each carry the same share of the in-plane current -
+  contours of a stream function built from the finite-volume face currents
+  of the solution, exact in a 2-D device (path-independent to round-off);
+  in a VDMOS cell they show the electrons squeezing through the JFET neck
+  and fanning out at about 45° into the drift region. Where current leaves
+  the plane (3-D devices) evenly spaced streamlines are drawn and labelled.
+- `▶ Animate`: particles flow along the current of the in-plane map, started
+  with probability ∝ |J| and moving at a speed that grows with log |J|;
+  `Particles`, `Speed`, and `GIF…` saves the animated map.
+- R_DS(on): the I-V tab extracts it from an output curve (slope at
+  V_DS → 0) or a transfer curve taken at a small V_DS - per simulated cell,
+  specific (mΩ·cm², cell footprint) and, with the new `Power device` section
+  of the Sweep page (active area, series resistance outside the mesh,
+  package), for the die. Analysis → `On-resistance by region…` splits the
+  dissipated power J·∇E_F over the regions (channel, JFET, drift,
+  substrate) and gives each one's share R_i = P_i/I².
+- Capacitances: `Capacitances (quasi-static C-V)` on the Sweep page adds the
+  capacitance matrix C_ij = dQ_i/dV_j at every point (each terminal moved by
+  a few mV and re-solved). A terminal's charge is Gauss's law around its part
+  of the device (its contacts and the semiconductor of the same majority
+  carrier connected to them), so no large node charges cancel. A MOSFET
+  drain sweep gives the datasheet curves C_iss, C_oss, C_rss (new C-V panel,
+  log axis) and Q_oss, E_oss, C_o(tr), C_o(er); a diode or MOS capacitor
+  gives C(V). Exact at low frequency in the off state (reciprocity and
+  charge conservation are reported, ~1e-6); approximate when a channel
+  joins two terminals (flagged). Analysis → `Capacitances at this bias…`
+  gives the full matrix. CSV export includes the curves.
+- Results: the largest field in the insulators (a gate oxide) and where it
+  is - the design limit of SiC trench MOSFETs.
+- Defects: `Interface traps 4H-SiC/SiO2: band tail`, acceptor states rising
+  exponentially towards E_c (Potbhare et al. 2006/2008: D_edge 5.7e13
+  cm⁻²eV⁻¹, E_t 67 meV).
+- Limitations documented: the Lombardi surface mobility is silicon only (a
+  4H-SiC channel keeps its bulk mobility, so SiC channel resistance comes
+  out several times too low), no c-axis mobility anisotropy, uniform
+  doping only, capacitances quasi-static (no AC solver, no switching gate
+  charge).
+- Device files keep the C-V option and the power-device settings (checked
+  when a file is opened).
+- Validation: section 19 (25 checks: junction and MOS capacitance against
+  the depletion formula and the exact low-frequency curve, Gauss oxide
+  field, reciprocity and charge conservation of a VDMOS, C_o(tr)/C_o(er),
+  R_DS(on) slope and Joule shares of a resistor bar, VDMOS flowlines against
+  the drain current, particle tracking, the SiC band tail): 238 checks (183
+  without the templates).
+
 ## 0.2.1 (2026-11-10) - fixes from the physics and code review
 
 - Material parameters: silicon low-field mobility is now Masetti et al.

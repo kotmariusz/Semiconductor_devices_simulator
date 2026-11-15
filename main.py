@@ -148,6 +148,14 @@ api_mat_ni=_f("api3_mat_ni",D,I); api_mat_Eg=_f("api3_mat_Eg",D,I)
 api_bulk=_f("api3_bulk_copy",V,I,DP)  # which, out
 IP=ctypes.POINTER(I)
 api_Emax=_f("api3_get_Emax",D)        # max E-field (V/m) for breakdown
+# terminal charges (quasi-static capacitance): partition the nodes into
+# terminals (cterm per contact -> meeting edges, -1 error), then the Gauss
+# charge of each terminal (nt + 1 values: the last is the flux into no terminal)
+api_qpart=_f("api3_charge_partition",I,IP)
+api_qterm=_f("api3_terminal_charges",I,I,DP)
+api_qown=_f("api3_charge_owner",I,IP)
+api_insE=_f("api3_ins_field_max",D,DP)   # largest field in insulators (V/m), position (m)
+api_faceJ=_f("api3_face_J",I,I,I,DP)     # face current density along an axis (A/m2; total / electrons), tensor mesh
 _IV_N=400
 _V_arr=(D*_IV_N)(); _J_arr=(D*_IV_N)(); _C_arr=(I*_IV_N)()
 api_iv=_f("api3_iv_sweep",V,I,D,D,I,DP,DP,ctypes.POINTER(I))
@@ -540,6 +548,12 @@ def check_device_json(d):
     if len(d["cons"])>32: raise ValueError(f"{len(d['cons'])} contacts: the solver holds at most 32")
     so=d.get("solver") or {}
     if "T" in so: num(so["T"],"temperature (solver T)",20.,2000.)
+    pw=d.get("power")
+    if pw is not None:                       # power-device settings (v0.2.2)
+        if not isinstance(pw,dict): raise ValueError("'power' must be an object")
+        for k,what,hi in (("area","active area (mm²)",1e5),("rsp","series resistance outside (mΩ·cm²)",1e6),
+                          ("rpkg","package resistance (mΩ)",1e6)):
+            if k in pw: num(pw[k],what,0.,hi)
     ms=(d.get("mesh") or {}).get("type","rect")
     if ms not in ("rect","tri"): raise ValueError(f"unknown mesh type {ms!r} (rect or tri)")
     return warn
@@ -3119,6 +3133,7 @@ def _setup_tri(t, solver, models, T, volt):
 # ══════════════════════════════════════════════════════════════
 _PULL_Q=[("phi",0,1.),("n",1,1e-6),("p",2,1e-6),("Ec",3,1.),("Ev",4,1.),
          ("Efn",5,1.),("Efp",6,1.),("Jx",7,1e-4),("Jy",8,1e-4),("Jz",9,1e-4),
+         ("Jnx",20,1e-4),("Jny",21,1e-4),("Jnz",22,1e-4),       # electron current (holes: J - Jn)
          ("mn",10,1e4),("mp",11,1e4),("R",12,1e-6),("kind",13,1.),("Nnet",14,1e-6),
          ("Jg",27,1e-4),("Lqn",28,1.),("Lqp",29,1.),
          ("Qtrap",31,1e-6),("Ntrap",32,1e-6),
@@ -3138,6 +3153,10 @@ def pull():
         for key,idx,sc in _PULL_Q:
             api_bulk(idx,buf)
             d[key]=np.frombuffer(buf,dtype=np.float64,count=N).copy().reshape(sh)*sc
+        # the finite-volume face currents (A/cm2, float32): exact flowlines (stream function)
+        for key,ax,cr in (("Fx",0,0),("Fy",1,0),("Fz",2,0),("Fnx",0,1),("Fny",1,1),("Fnz",2,1)):
+            if api_faceJ(ax,cr,buf):
+                d[key]=(np.frombuffer(buf,dtype=np.float64,count=N)*1e-4).astype(np.float32).reshape(sh)
     # oxide / metal nodes carry no carriers: blank them (NaN) in carrier plots
     semi = d["kind"]==0
     for key in ("n","p","mn","mp","R","Efn","Efp"):
@@ -3152,6 +3171,8 @@ def pull():
     d["Vs"]=[api_Vsol(c) for c in range(nc)]
     d["Iraw"]=[api_conIraw(c) for c in range(nc)]     # each contact's own flux (no Kirchhoff substitution)
     d["conv"]=bool(api_conv())                         # convergence of THIS solution
+    pos=(D*3)(); E=api_insE(pos)                       # largest field in the insulators (gate oxide)
+    d["Eins"]=(float(E),[pos[0]*1e9,pos[1]*1e9,pos[2]*1e9]) if E==E and E>0 else (float("nan"),None)
     return d
 
 def _pull_prism(pm):
@@ -3324,7 +3345,7 @@ def solve_floating(fidx,V0,lo,hi,job=None,slope=None,vtol=1e-9,maxev=40,max_bad=
         if x2!=x1 and (f2-f1)/(x2-x1)>0: sl=(f2-f1)/(x2-x1)
     return xr,fx,found,len(hist),(sl or slope)
 
-def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine=True,max_fail=0):
+def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine=True,max_fail=0,cap=None):
     """Sweep the node `tgt` (contact indices, driven together) from Vs to Ve in
     Np points, continuing from the present C state (setup_device first).
     Every point also records the electron and hole charge stored in the
@@ -3340,15 +3361,21 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
     just past avalanche breakdown the Gummel iteration fails at every point,
     and each failed point costs the solver its whole step-halving search);
     0 = never (the GUI uses 2 when impact ionisation is on).
+    cap: dict(groups, ref[, dV]) (cap_roles) - also the quasi-static
+    capacitance matrix of those terminals at every converged point (K,
+    points x n x n, F per cell; capm/capr/capn: meeting edges, reciprocity
+    and charge-conservation errors - see cap_matrix); not with flt.
     Returns a dict of numpy arrays ordered along the sweep (+ 'stop_fail':
     the voltage where max_fail stopped it, NaN if it did not)."""
     nc=len(cons); Np=max(1,int(Np))
     vapp=list(vapp) if vapp is not None else [c.V for c in cons]
     tgt=list(tgt); flt=[c for c in (flt or []) if c not in tgt]
+    if flt: cap=None
     for c in range(nc):
         if c not in tgt and c not in flt: api_setV(c,vapp[c])
     Vv=np.linspace(Vs,Ve,Np) if Np>1 else np.array([float(Vs)])
     R=dict(V=[],I=[],F=[],conv=[],Vf=[],nev=[],t=[],Qn=[],Qp=[])
+    if cap: R.update(K=[],capm=[],capr=[],capn=[])
     fixed=[vapp[c] for c in range(nc) if c not in flt and c not in tgt]
     span=max(fixed+[Vs,Ve])-min(fixed+[Vs,Ve]) or 1.
     st={"slope":None}
@@ -3365,6 +3392,14 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
         Vr=api_Vsol(tgt[0]); Qn,Qp=carrier_charge()
         rec=dict(V=(Vr if Vr==Vr else Vt),I=[api_conI(c) for c in range(nc)],
                  F=[api_conF(c) for c in range(nc)],conv=bool(ok),Vf=Vx,nev=ne,t=time.time(),Qn=Qn,Qp=Qp)
+        if cap:
+            n=len(cap["groups"]); r=None
+            if ok and not (job is not None and job.stop):
+                vc=list(vapp)
+                for c in tgt: vc[c]=Vt
+                r=cap_matrix(cons,cap["groups"],vapp=vc,dV=cap.get("dV"),ref=cap.get("ref"),restore=True,job=job)
+            rec.update(K=r["K"] if r else np.full((n,n),np.nan),capm=r["meet"] if r else -1,
+                       capr=r["recip"] if r else np.nan,capn=r["neutral"] if r else np.nan)
         for kk in R: R[kk].append(rec[kk])
         if on_point: on_point(len(R["V"])-1,rec)
         return rec
@@ -3396,6 +3431,8 @@ def run_sweep(cons,tgt,Vs,Ve,Np,flt=None,job=None,on_point=None,vapp=None,refine
                 if job is not None: job.extra=getattr(job,"extra",0)+1
                 stack.append((m,b)); stack.append((a,m))
         prev=rec
+    if cap and R["V"] and not (job is not None and job.stop):
+        api_resolve()              # currents and fields of the last point, not of its last C-V perturbation
     out={k:np.array(v) for k,v in R.items()}
     if len(out["V"]):
         o=np.argsort(out["V"],kind="stable")
@@ -3684,6 +3721,331 @@ def set_state(state):
     arrs=[np.ascontiguousarray(a,dtype=np.float64) for a in state]
     return bool(api_setstate(*[a.ctypes.data_as(DP) for a in arrs]))
 
+# ── quasi-static capacitance (GUI-independent; the I-V tab and validate.py use these) ──
+def cap_terminals(cons,groups):
+    """Terminal index of every contact (its net / group in `groups`)."""
+    cterm=[-1]*len(cons)
+    for t,(_,idx) in enumerate(groups):
+        for c in idx: cterm[c]=t
+    return cterm
+
+def charge_partition(cterm):
+    """Split the nodes into terminals at the present solution (see
+    api3_charge_partition): the number of meeting edges (0 = off state), -1 = error."""
+    arr=(I*max(1,len(cterm)))(*[int(c) for c in cterm]); return int(api_qpart(arr))
+
+def terminal_charges(nt):
+    """Charge of each terminal (C per simulated cell) for the last partition,
+    plus the flux into no terminal as the last entry; None on error."""
+    out=(D*(nt+1))()
+    if not api_qterm(int(nt),out): return None
+    return np.array(out[:nt+1],float)
+
+def cap_matrix(cons,groups,vapp=None,dV=None,ref=None,restore=True,job=None):
+    """Quasi-static capacitance matrix at the present solution (solved at the
+    contact voltages vapp): K[i,j] = dQ_i/dV_j (F per simulated cell) of the
+    terminals `groups` (con_groups).  Every terminal but the reference `ref`
+    (default: the last) is moved by +-dV and re-solved (central differences);
+    the reference column follows from the rows summing to zero (moving every
+    terminal together changes nothing).  The nodes are split into terminals
+    once, at the central point.  The off-diagonal branch capacitances are
+    C_ij = -K[i,j]; with one gate G, drain D and source S: C_iss = K[G,G],
+    C_oss = K[D,D], C_rss = -K[G,D].
+    restore: put the central solution back afterwards (no extra solve; its
+    terminal currents are those of the last perturbed solve until the next one).
+    Returns dict(K, Q (central charges), meet (meeting edges of the partition:
+    0 = off state, where the method is exact), recip (largest relative
+    asymmetry |K_ij - K_ji| of the pairs computed both ways), neutral (largest
+    column sum / max |K|: charge conservation), ok (every solve converged),
+    nsolve, dV)."""
+    nc=len(cons); nt=len(groups)
+    vapp=list(vapp) if vapp is not None else [c.V for c in cons]
+    if nt<2: return None
+    if ref is None: ref=nt-1
+    cterm=cap_terminals(cons,groups)
+    st0=get_state() if restore else None
+    meet=charge_partition(cterm)
+    if meet<0: return None
+    Q0=terminal_charges(nt)
+    if Q0 is None: return None
+    span=(max(vapp)-min(vapp)) if nc else 0.
+    if dV is None: dV=max(5e-3,1e-3*span)
+    K=np.full((nt,nt),np.nan); ok=True; ns=0
+    for j in range(nt):
+        if j==ref: continue
+        if job is not None and job.stop: ok=False; break
+        idx=groups[j][1]; Qs=[]
+        for sg in (1.,-1.):
+            for c in idx: api_setV(c,vapp[c]+sg*dV)
+            ok=bool(api_resolve()) and ok; ns+=1
+            Q=terminal_charges(nt)
+            Qs.append(Q[:nt] if Q is not None else np.full(nt,np.nan))
+        for c in idx: api_setV(c,vapp[c])
+        K[:,j]=(Qs[0]-Qs[1])/(2.*dV)
+    others=[j for j in range(nt) if j!=ref]
+    K[:,ref]=-np.nansum(K[:,others],axis=1) if others else np.nan
+    if st0 is not None: set_state(st0)
+    sc=float(np.nanmax(np.abs(K))) if np.isfinite(K).any() else 0.
+    rec=0.
+    for a in others:
+        for b in others:
+            if b<=a: continue
+            m=max(abs(K[a,b]),abs(K[b,a]))
+            if m>1e-6*sc: rec=max(rec,abs(K[a,b]-K[b,a])/m)
+    neu=max((abs(float(np.sum(K[:,j])))/sc for j in others),default=0.) if sc>0 else 0.
+    return dict(K=K,Q=Q0[:nt],meet=meet,recip=rec,neutral=neu,ok=ok,nsolve=ns,dV=dV)
+
+def cap_roles(groups,bcs,tkey):
+    """Terminals of a C-V sweep of the terminal tkey.  With insulated gates
+    and a swept terminal that is not a gate: the MOSFET set - gate (every gate
+    contact), drain (the swept terminal), source (all the rest) - whose
+    matrix gives the datasheet capacitances C_iss = K[0,0] (input, drain
+    shorted to source), C_oss = K[1,1] (output, gate shorted to source) and
+    C_rss = -K[0,1] (reverse transfer, C_gd).  Otherwise the swept terminal
+    against all the others tied together (a diode, a MOS capacitor, a gate
+    sweep: C = K[0,0]).  -> dict(kind 'mos' / 'two', groups [(key, contacts)],
+    ref) or None."""
+    gd=dict(groups)
+    if tkey not in gd: return None
+    sw=list(gd[tkey]); rest=[c for k,idx in groups if k!=tkey for c in idx]
+    if not rest: return None
+    gate=[c for c in rest if bcs[c]==2]
+    if gate and not all(bcs[c]==2 for c in sw):
+        src=[c for c in rest if bcs[c]!=2]
+        if src: return dict(kind="mos",groups=[("gate",gate),(tkey,sw),("source",src)],ref=2)
+    return dict(kind="two",groups=[(tkey,sw),("others",rest)],ref=1)
+
+def cv_curves(roles,K):
+    """Named capacitance curves (F per simulated cell) of a C-V sweep from its
+    matrices K (points x n x n) for the roles of cap_roles."""
+    K=np.asarray(K,float)
+    if K.ndim!=3 or not len(K): return {}
+    if roles and roles.get("kind")=="mos":
+        return {"C_iss":K[:,0,0],"C_oss":K[:,1,1],"C_rss":-K[:,0,1],
+                "C_gs":K[:,0,0]+K[:,0,1],"C_ds":K[:,1,1]+K[:,0,1]}
+    return {"C":K[:,0,0]}
+
+def oss_metrics(V,C,V0=None):
+    """Charge-equivalent quantities of an output capacitance C(V) (F) from V0
+    (default: the first point) - Q_oss(V) = int C dV, E_oss(V) = int (v-V0) C dv,
+    C_o(tr) = Q_oss/(V-V0) (same charging time), C_o(er) = 2 E_oss/(V-V0)^2
+    (same stored energy); arrays along the sorted voltages."""
+    V=np.asarray(V,float); C=np.asarray(C,float)
+    ok=np.isfinite(V)&np.isfinite(C)
+    if ok.sum()<2: return None
+    o=np.argsort(np.abs(V[ok]-(V[ok][0] if V0 is None else V0))); Vs=V[ok][o]; Cs=C[ok][o]
+    V0=Vs[0] if V0 is None else V0
+    u=np.abs(Vs-V0)
+    Qo=np.concatenate([[0.],np.cumsum(0.5*(Cs[1:]+Cs[:-1])*np.diff(u))])
+    Eo=np.concatenate([[0.],np.cumsum(0.5*(Cs[1:]*u[1:]+Cs[:-1]*u[:-1])*np.diff(u))])
+    with np.errstate(invalid="ignore",divide="ignore"):
+        Ctr=np.where(u>0,Qo/np.where(u>0,u,1.),np.nan); Cer=np.where(u>0,2.*Eo/np.where(u>0,u*u,1.),np.nan)
+    return dict(V=Vs,u=u,Q=Qo,E=Eo,Ctr=Ctr,Cer=Cer)
+
+def rdson_lin(V,I,conv,V0=0.,frac=0.1):
+    """On-resistance of an output curve near V_DS = 0: 1 / slope of I(V_DS)
+    over the converged points with |V_DS| up to frac of the swept range (at
+    least the two closest to 0).  V0: the source voltage.  -> (R in ohm per
+    simulated cell, points used) or None."""
+    V=np.asarray(V,float)-V0; I=np.asarray(I,float); ok=np.asarray(conv,bool)&np.isfinite(V)&np.isfinite(I)
+    if ok.sum()<2: return None
+    Vk,Ik=V[ok],I[ok]; a=np.abs(Vk); o=np.argsort(a)
+    lim=max(frac*a.max(),a[o[1]])
+    m=a<=lim*(1+1e-12)
+    if m.sum()<2: return None
+    b=np.polyfit(Vk[m],Ik[m],1)[0] if m.sum()>2 else (Ik[m][1]-Ik[m][0])/(Vk[m][1]-Vk[m][0]) if Vk[m][1]!=Vk[m][0] else 0.
+    if not b or not np.isfinite(b): return None
+    return 1./b,int(m.sum())
+
+def _mgrad(F,c,axis,ok):
+    """dF/dc along `axis` (node coordinates c) from the nodes where `ok`:
+    the mean of the adjacent differences that join two such nodes (one-sided
+    at the edge of `ok`, 0 where neither is there)."""
+    F=np.moveaxis(np.where(ok,F,0.),axis,-1); okm=np.moveaxis(ok,axis,-1); c=np.asarray(c,float)
+    if F.shape[-1]<2: return np.zeros(np.moveaxis(F,-1,axis).shape)
+    h=np.diff(c); dd=np.diff(F,axis=-1)/np.where(h>0,h,1.); v=okm[...,1:]&okm[...,:-1]
+    dd=np.where(v,dd,0.); num=np.zeros(F.shape); cnt=np.zeros(F.shape)
+    num[...,1:]+=dd; cnt[...,1:]+=v; num[...,:-1]+=dd; cnt[...,:-1]+=v
+    return np.moveaxis(np.where(cnt>0,num/np.maximum(cnt,1.),0.),-1,axis)
+
+def _dual_len(c):
+    """Box-method lengths of node lines c (half cells at the ends)."""
+    c=np.asarray(c,float)
+    if len(c)<2: return np.ones(len(c))
+    L=np.zeros(len(c)); L[1:]+=0.5*np.diff(c); L[:-1]+=0.5*np.diff(c); return L
+
+def joule_breakdown(s,owner,nreg):
+    """Where a solution dissipates its power: H = J_n . grad E_Fn + J_p . grad E_Fp
+    (>= 0 in every node: the carriers lose the energy they gain from the field)
+    summed over the nodes of each region (owner: region index per node, -1 none).
+    -> dict(P: W per simulated cell for each region, Ptot) or None without
+    the per-carrier currents.  With one current I through the device,
+    R_i = P_i / I^2 is the share of the on-resistance in region i."""
+    if s is None or "Jnx" not in s or owner is None: return None
+    x,y,z=s["x"],s["y"],s["z"]; semi=np.asarray(s.get("semi",s["kind"]==0),bool)
+    P=np.zeros(nreg); Ptot=0.
+    for Ef,Js in (("Efn",("Jnx","Jny","Jnz")),("Efp",None)):
+        E=np.asarray(s[Ef],float); ok=semi&np.isfinite(E)
+        if Js is None: Jc=[s["Jx"]-s["Jnx"],s["Jy"]-s["Jny"],s["Jz"]-s["Jnz"]]
+        else: Jc=[s[k] for k in Js]
+        H=np.zeros(E.shape)
+        for ax,(Jk,cc) in enumerate(zip(Jc,(x,y,z))):
+            g=_mgrad(E,cc,2-ax,ok)                       # eV/nm = V/nm; arrays are (z, y, x)
+            H+=np.nan_to_num(Jk)*g*1e7                   # A/cm2 x V/cm = W/cm3
+        H=np.where(ok,H,0.)
+        vol=(_dual_len(z)[:,None,None]*_dual_len(y)[None,:,None]*_dual_len(x)[None,None,:])*1e-21   # cm3
+        Pn=H*vol; Ptot+=float(Pn.sum())
+        ow=np.asarray(owner)
+        for r in range(nreg): P[r]+=float(Pn[ow==r].sum())
+    return dict(P=P,Ptot=Ptot)
+
+# ── current flow pictures (GUI-independent) ──
+def stream_function(U,V,hx,vy):
+    """Stream function of a 2-D current density (U along hx, V along vy;
+    arrays (len(vy), len(hx)), A/cm2, coordinates nm): U = dpsi/dvy,
+    V = -dpsi/dhx, so the current between two points is the difference of psi
+    (A per cm of the third direction).  psi is integrated along two paths
+    (first along hx then vy, and the reverse) and averaged; err = their largest
+    difference / the range of psi: small when the in-plane current is
+    divergence-free (steady state, no current leaving the plane - every DC
+    solution of a 2-D device, generation and recombination included)."""
+    U=np.nan_to_num(np.asarray(U,float)); V=np.nan_to_num(np.asarray(V,float))
+    hx=np.asarray(hx,float); vy=np.asarray(vy,float)
+    def ct(F,c,axis):      # cumulative trapezoid from the first node
+        F=np.moveaxis(F,axis,-1); d=np.diff(c)
+        out=np.concatenate([np.zeros(F.shape[:-1]+(1,)),np.cumsum(0.5*(F[...,1:]+F[...,:-1])*d,axis=-1)],axis=-1)
+        return np.moveaxis(out,-1,axis)
+    a1=-ct(V[:1,:],hx,1)                # along the first row
+    p1=a1+ct(U,vy,0)                    # then down every column
+    b2=ct(U[:,:1],vy,0)                 # down the first column
+    p2=b2-ct(V,hx,1)                    # then along every row
+    psi=0.5*(p1+p2)*1e-7                # A/cm2 x nm -> A/cm
+    rng=float(psi.max()-psi.min())
+    err=float(np.max(np.abs(p1-p2))*1e-7/rng) if rng>0 else 0.
+    return psi,err
+
+def stream_function_faces(Fh,Fv,hx,vy):
+    """Exact stream function of a 2-D finite-volume current field, on the
+    corners of the node cells (coordinates: the first node, the midpoints,
+    the last node).  Fh (len(vy), len(hx)-1): current density (A/cm2) through
+    the face between nodes i and i+1 of every row (+hx); Fv (len(vy)-1,
+    len(hx)): through the face between rows j and j+1 (+vy).  The flux of
+    each face (times its dual-cell length) is the jump of psi across it; what
+    enters through the domain boundary (contacts) is what the boundary nodes
+    pass on to their neighbours.  Integrated along columns and along rows;
+    err = their largest difference / the range of psi - round-off when the
+    in-plane current is divergence-free (every steady state of a 2-D device),
+    large when current leaves the plane.  -> (psi A/cm, corner hx, corner vy, err)."""
+    hx=np.asarray(hx,float); vy=np.asarray(vy,float); nh,nv=len(hx),len(vy)
+    fh=np.nan_to_num(np.asarray(Fh,float))*(_dual_len(vy)*1e-7)[:,None]    # A per cm of width
+    fv=np.nan_to_num(np.asarray(Fv,float))*(_dual_len(hx)*1e-7)[None,:]
+    out=np.zeros((nv,nh))                     # net outflow through the inner faces = boundary inflow
+    if nh>1: out[:,:-1]+=fh; out[:,1:]-=fh
+    if nv>1: out[:-1,:]+=fv; out[1:,:]-=fv
+    btop=out[0,:].copy(); bbot=-out[-1,:].copy() if nv>1 else np.zeros(nh)   # flux along +vy through top / bottom
+    bl=np.zeros(nv); br=np.zeros(nv)                                          # flux along +hx through left / right
+    if nv>2: bl[1:-1]=out[1:-1,0]; br[1:-1]=-out[1:-1,-1]
+    if nv==1: bbot=np.zeros(nh)
+    p1=np.zeros((nv+1,nh+1)); p2=np.zeros((nv+1,nh+1))
+    p1[0,1:]=-np.cumsum(btop)                                 # along the top, then down every column
+    cross=np.zeros((nv,nh+1)); cross[:,0]=bl; cross[:,-1]=br
+    if nh>1: cross[:,1:-1]=fh
+    p1[1:,:]=p1[0,:]+np.cumsum(cross,axis=0)
+    p2[1:,0]=np.cumsum(bl)                                    # down the left side, then along every row
+    row=np.zeros((nv+1,nh)); row[0,:]=btop; row[-1,:]=bbot
+    if nv>1: row[1:-1,:]=fv
+    p2[:,1:]=p2[:,:1]-np.cumsum(row,axis=1)
+    psi=0.5*(p1+p2); rng=float(psi.max()-psi.min())
+    err=float(np.max(np.abs(p1-p2))/rng) if rng>0 else 0.
+    ch=np.r_[hx[0],0.5*(hx[1:]+hx[:-1]),hx[-1]] if nh>1 else np.r_[hx[0],hx[0]]
+    cv=np.r_[vy[0],0.5*(vy[1:]+vy[:-1]),vy[-1]] if nv>1 else np.r_[vy[0],vy[0]]
+    return psi,ch,cv,err
+
+def to_corners(M):
+    """Node values (rows, cols) -> the corners of the node cells (rows+1, cols+1): mean of the adjacent nodes."""
+    Mp=np.pad(np.asarray(M,float),1,mode="edge")
+    return 0.25*(Mp[:-1,:-1]+Mp[1:,:-1]+Mp[:-1,1:]+Mp[1:,1:])
+
+def flowline_levels(psi,n,mask=None):
+    """n stream-function levels splitting the current into equal tubes (each
+    line carries 1/n of the current between the extreme values of psi)."""
+    p=np.asarray(psi,float)[mask] if mask is not None else np.asarray(psi,float)
+    p=p[np.isfinite(p)]
+    if p.size==0: return np.array([])
+    lo,hi=float(p.min()),float(p.max())
+    if hi<=lo: return np.array([])
+    return lo+(np.arange(n)+0.5)*(hi-lo)/n
+
+class FlowParticles:
+    """Particles carried along a 2-D current field (animation, 'wind map').
+    The field (U along hx, V along vy, on the node lines) is resampled onto a
+    uniform G x G grid of the plotted box, normalised to the unit square, so
+    the particles follow the current lines whatever the aspect ratio.  A
+    particle moves along the field direction at a speed that grows with
+    log10 |J| - slow at the threshold, fastest at the maximum: |J| spans many
+    decades, so a linear speed would freeze everything but the hot spot - and
+    is reborn at a place drawn with probability proportional to |J| when it
+    leaves the box, enters the region below the threshold (thr x max |J|) or
+    ends its life (1.5-4 s).  A short history of every particle makes its tail."""
+    def __init__(self,U,V,hx,vy,thr=1e-4,n=400,tail=8,G=160,seed=1):
+        hx=np.asarray(hx,float); vy=np.asarray(vy,float)
+        self.x0,self.y0=float(hx[0]),float(vy[0]); self.Lx=max(float(hx[-1]-hx[0]),1e-12); self.Ly=max(float(vy[-1]-vy[0]),1e-12)
+        self.G=G=int(max(16,G))
+        gx=np.linspace(hx[0],hx[-1],G); gy=np.linspace(vy[0],vy[-1],G)
+        Us=_lin_axis(_lin_axis(np.nan_to_num(np.asarray(U,float)),hx,gx,1),vy,gy,0)
+        Vs=_lin_axis(_lin_axis(np.nan_to_num(np.asarray(V,float)),hx,gx,1),vy,gy,0)
+        M=np.hypot(Us,Vs); Mx=float(M.max()) if M.size else 0.
+        thr=float(thr) if thr and thr>0 else 1e-12
+        self.ok=(M>thr*Mx)&(M>0) if Mx>0 else np.zeros(M.shape,bool)
+        du=Us/self.Lx; dv=Vs/self.Ly; nr=np.hypot(du,dv)
+        self.du=np.where(nr>0,du/np.where(nr>0,nr,1.),0.); self.dv=np.where(nr>0,dv/np.where(nr>0,nr,1.),0.)
+        lo=np.log10(max(thr*Mx,1e-300)) if Mx>0 else 0.; hi=np.log10(Mx) if Mx>0 else 1.
+        with np.errstate(divide="ignore",invalid="ignore"):
+            f=np.clip((np.log10(np.where(M>0,M,1e-300))-lo)/max(hi-lo,1e-9),0.,1.)
+        self.sp=np.where(self.ok,0.15+0.85*f,0.)
+        w=np.where(self.ok,M,0.).ravel(); tot=float(w.sum())
+        self.cdf=np.cumsum(w)/tot if tot>0 else None
+        self.rng=np.random.default_rng(seed); self.n=int(max(1,n)); self.tail=int(max(2,tail))
+        self.P=self._sample(self.n); self.H=np.repeat(self.P[:,None,:],self.tail,axis=1)
+        self.life=self.rng.uniform(1.5,4.,self.n); self.age=self.rng.uniform(0.,1.,self.n)*self.life
+    @property
+    def empty(self): return self.cdf is None
+    def _sample(self,m):
+        if self.cdf is None: return np.full((m,2),0.5)
+        idx=np.minimum(np.searchsorted(self.cdf,self.rng.random(m)),self.G*self.G-1)
+        jy,ix=np.divmod(idx,self.G)
+        u=np.clip((ix+self.rng.random(m)-0.5)/(self.G-1),0.,1.); v=np.clip((jy+self.rng.random(m)-0.5)/(self.G-1),0.,1.)
+        return np.stack([u,v],1)
+    def _at(self,F,P):
+        """F bilinear at the unit-square points P (n, 2)."""
+        G=self.G; u=np.clip(P[:,0],0.,1.)*(G-1); v=np.clip(P[:,1],0.,1.)*(G-1)
+        i=np.minimum(u.astype(int),G-2); j=np.minimum(v.astype(int),G-2); a=u-i; b=v-j
+        return (F[j,i]*(1-a)*(1-b)+F[j,i+1]*a*(1-b)+F[j+1,i]*(1-a)*b+F[j+1,i+1]*a*b)
+    def _vel(self,P,k):
+        s=self._at(self.sp,P)*k
+        return np.stack([self._at(self.du,P)*s,self._at(self.dv,P)*s],1)
+    def step(self,dt,speed=1.):
+        """Advance dt seconds (midpoint rule); speed 1 crosses the box in ~4 s at the maximum |J|."""
+        if self.cdf is None: return
+        k=0.25*float(speed); P=self.P
+        Pm=P+0.5*dt*self._vel(P,k); Pn=P+dt*self._vel(Pm,k)
+        self.H[:,1:]=self.H[:,:-1]; self.H[:,0]=Pn; self.P=Pn; self.age+=dt
+        G=self.G; iu=np.clip(np.rint(Pn[:,0]*(G-1)).astype(int),0,G-1); iv=np.clip(np.rint(Pn[:,1]*(G-1)).astype(int),0,G-1)
+        dead=(Pn[:,0]<0)|(Pn[:,0]>1)|(Pn[:,1]<0)|(Pn[:,1]>1)|(~self.ok[iv,iu])|(self.age>self.life)
+        if dead.any():
+            m=int(dead.sum()); New=self._sample(m)
+            self.P[dead]=New; self.H[dead]=New[:,None,:]; self.age[dead]=0.
+            self.life[dead]=self.rng.uniform(1.5,4.,m)
+    def to_data(self,P):
+        return np.stack([self.x0+P[...,0]*self.Lx,self.y0+P[...,1]*self.Ly],-1)
+    def segments(self):
+        """Tail segments in data coordinates (n (tail-1), 2, 2) and the
+        fraction along the tail of each (0 = the head)."""
+        H=self.to_data(self.H)
+        seg=np.stack([H[:,:-1],H[:,1:]],2).reshape(-1,2,2)
+        f=np.tile(np.arange(self.tail-1)/(self.tail-1),self.n)
+        return seg,f
+
 def _interp_axis(A,c_old,c_new,axis):
     c_old=np.asarray(c_old,float); c_new=np.asarray(c_new,float)
     i=np.clip(np.searchsorted(c_old,c_new)-1,0,len(c_old)-2)
@@ -3842,7 +4204,7 @@ import queue, json, copy, textwrap
 import tkinter.font as tkfont
 from matplotlib.ticker import FuncFormatter
 
-VERSION="0.2"
+VERSION="0.2.2"
 SETTINGS_FILE=os.path.join(os.path.expanduser("~"),".semisim3d.json")
 # label-based buttons (FlatButton) and themed check boxes: macOS draws the
 # classic Tk ones natively, without the app's colours; SEMISIM_FLAT_BUTTONS=1
@@ -3862,6 +4224,12 @@ def _x11(w):
 ARROWS_2D=(4,120)          # Current tab: arrows across the in-plane map (min, max)
 ARROWS_3D=(2,40)           # ... along x in the 3-D field (y: 3/4, z: 5/8 of it)
 ARROWS_3D_MAX=4000         # total 3-D arrows (mplot3d redraws every arrow on each rotation step)
+FLOWLINES=(4,60)           # Current tab: equal-current flowlines (min, max)
+PARTICLES=(50,3000)        # ... animated particles
+# nothing is drawn where |J| < this fraction of its maximum (arrows, flowlines, particles)
+THR_CHOICES={"off":0.,"10 %":1e-1,"1 %":1e-2,"0.1 %":1e-3,"1e-4":1e-4,"1e-5":1e-5,"1e-6":1e-6,"1e-8":1e-8}
+CUR_FIELDS=("current J","electron flow","hole flow")
+ANIM_MS=40                 # animation frame interval (ms)
 
 def _lin_axis(F,c,g,axis):
     """Linear interpolation of the array F along `axis` (node coordinates c,
@@ -4032,7 +4400,7 @@ Typical workflow for a new design: load the closest template, change regions and
 ("Status and terms", """
 # Status and terms
 SemiSim 3D 0.2 is an early public version - a test version: it is still being tested, so read its results with care.
-- The physics is checked against textbook theory (`validate.py`, 213 checks), not yet against measurements of real devices.
+- The physics is checked against textbook theory (`validate.py`, 238 checks), not yet against measurements of real devices.
 - Results can be wrong, and some effects are not modelled at all (see Limitations). Check anything important against measurements, the literature or an established simulator.
 - The `RW:` templates are modelled on the device class and ratings of real parts, not on their real dies; currents are per simulated cell.
 - macOS support and the WSL2 full-screen workaround are new and have been tried on few computers so far.
@@ -4192,6 +4560,9 @@ The bias is ramped adaptively from the previous state. MOS gates are ramped firs
 - `Plot current of`: the terminal whose current appears in the linear panel. `auto` uses the swept terminal, or the terminal with the largest current if the swept one is an insulated gate.
 - `BV knee`: a current density (A/cm²) for breakdown. With impact ionisation on (Solver page) the breakdown voltage is where the current reaches it - 0: where the current runs away. With impact ionisation off it only places a heuristic knee marker.
 - With impact ionisation on, a sweep ends once two points in a row fail to converge (at and just past avalanche breakdown every point would fail, and each failed point costs the solver its whole step-halving search).
+- `Capacitances (quasi-static C-V)`: at every point also the capacitances (2-4 extra solves per point; see 'MOSFET: R_DS(on), capacitances'). Not with a floating terminal.
+## Power device (die values)
+`Active area` (mm²) turns the simulated cell into a die in the parameter table: R_DS(on) and the capacitances are scaled by the active area over the cell footprint (the x-z face of the cell). `Series outside` (mΩ·cm²) adds what the mesh leaves out, per area - a substrate is ρ·t, 4H-SiC 20 mΩ·cm × 350 µm = 0.70 mΩ·cm², Si 2 mΩ·cm × 100 µm = 0.02 mΩ·cm², plus contact resistivity. `Package` (mΩ) adds bond wires and leads. 0 = per cell only. The values are saved with the device.
 ## Stop (Esc)
 Stops within one Gummel iteration. A sweep keeps the points already solved, and the device keeps its last converged state.
 ## Extracted parameters
@@ -4201,7 +4572,9 @@ The I-V tab and the Results tab report what fits the sweep:
 - V_M, gain and noise margins (transfer curves);
 - the Early voltage V_A = I/g_o − V of output curves (collector or drain swept and observed): a straight line through the flat part, drawn dotted;
 - for a Gummel plot (base swept, collector observed): the current gain β = I_C/I_B and the quasi-static f_T against I_C (the BJT panel), f_T,max and where β halves;
-- the avalanche breakdown voltage when impact ionisation is on (else a heuristic current knee).
+- the avalanche breakdown voltage when impact ionisation is on (else a heuristic current knee);
+- R_DS(on) of a MOSFET: from the slope of an output curve at V_DS → 0 (drain swept from 0 with the gate on), or V_DS/I_D of a transfer curve taken at a small V_DS (up to 2 V); per cell, specific (mΩ·cm² of the cell footprint) and for the die when an active area is set;
+- C_iss, C_oss, C_rss at the start and end of a C-V sweep, the output charge Q_oss, energy E_oss and the effective output capacitances C_o(tr) and C_o(er) from 0 V; C(V) of a diode or MOS capacitor.
 Pinned sweeps get the same parameters, listed below those of the last sweep; `Table…` puts them side by side with their differences.
 ## Comparing designs
 - `Pin sweep` (I-V tab) keeps the last sweep as a reference: later sweeps of the same swept terminal are drawn over it, dashed in the pin's colour, on the linear, semi-log and BJT panels.
@@ -4217,6 +4590,10 @@ Pinned sweeps get the same parameters, listed below those of the last sweep; `Ta
 - `Bands`: Ec and Ev (solid), the quasi-Fermi levels Efn and Efp (dashed) and a combined Ef, weighted towards the majority carrier. The energy zero is the vacuum level at φ = 0, so absolute values depend on the gauge but differences are physical. The n and p overlay uses a log scale on the right axis.
 - `3D Slicer`: pick a quantity and slide the plane. The three small maps are the XY, YZ and XZ planes through the slice point, drawn on the real (non-uniform) mesh.
 - `Current`: the in-plane map shows |J| with direction arrows. Arrow length is log-scaled so weak and strong regions are both visible. The number boxes next to `2-D arrows` and `3-D arrows` set how many arrows are drawn: 2-D, the arrows across the map (4-120; the rows follow the map's shape); 3-D, the arrows along x (2-40; depth y gets 3/4 and z 5/8 of them, never more than the mesh lines along an axis, at most 4000 arrows). The current is interpolated between the mesh nodes, so the count is not limited by the mesh; denser arrows are drawn shorter and thinner.
+- `Current` → `Show`: `current J` (the total, conventional current, from + to −), `electron flow` (where the electrons go: −J_n - in an n-channel MOSFET from the source through the channel to the drain) or `hole flow` (J_p). Line cut, map, arrows, flowlines and particles all follow it.
+- `Current` → `Hide below`: nothing is drawn where the current density is below this fraction of its maximum (in the map's plane for the map, in the device for the 3-D arrows) - the leakage paths disappear and the main current path stands out. `log |J|` colours the map on a log scale (from the threshold up).
+- `Current` → `Flowlines`: lines that each carry the same share of the in-plane current (contours of the stream function built from the finite-volume face currents: exact in a 2-D device). They crowd where the current is dense - a MOSFET channel, a JFET neck - and fan out where it spreads: in a VDMOS cell the electrons come out of the two channels, squeeze through the JFET region between the p-bodies and spread at about 45° into the drift region (a reversed funnel). The box sets their number. When current leaves the plane (a 3-D device, or a single carrier where it recombines) evenly spaced streamlines are drawn instead; the note in the corner says which.
+- `Current` → `▶ Animate`: particles flow along the current of the in-plane map. They start where the current is, with a probability proportional to |J|; their speed grows with log |J| (|J| spans many decades - fast in the channel, slow where the current fans out). `Hide below` keeps them out of the leakage, `Particles` sets their number and `Speed` the pace. `GIF…` saves the animated map (with its labels and colour bar) as an animated GIF.
 - `Panels ▾` (every plot tab): hide panels to give the others the room - the Structure tab's 3-D view, cross-section and legend; the Slicer's 3-D view and its three planes; the band diagram and ribbon; the five Current panels; E-field and mobility; the linear, semi-log and BJT panels of the I-V tab.
 - `Layers…` (Structure and Current tabs): click 'Shown' to hide or show a region, contact or the defects in the 3-D view. Select one or more parts (Ctrl/Shift for several) and move 'Opacity of the selected parts' to give them their own opacity - a see-through substrate under an opaque channel, say; 'Auto' hands them back to the sliders for all regions and all contacts ('See-through contacts' sets 0.15). 'Insulators in 3-D' draws the oxides too; 'Apply to the cross-section too' uses the same choices in the section.
 - `Current` → `Map`: what lies under the arrows of the in-plane map - `|J|`, the device `structure` (region colours) or `|J| + structure`. `Structure in 3-D` draws the regions and contacts around the 3-D arrows. `Opacity` sets how see-through that structure is; parts hidden in `Layers…` stay hidden and a part with its own opacity there keeps it.
@@ -4226,6 +4603,27 @@ Pinned sweeps get the same parameters, listed below those of the last sweep; `Ta
 - Oxide and metal nodes carry no carriers. They are blank in carrier plots.
 - Triangular (prism) mesh: line cuts and maps use the rectangular lines as a display grid (every prism node lies on it or is interpolated inside its triangle, from the same material). In the 3D Slicer the map of the cross-section normal to the prism axis is drawn on the triangulation itself, and the Structure tab's mesh overlay shows the triangles.
 - Use the matplotlib toolbar under each plot to zoom and pan. File → Export plot saves the visible tab (PNG/PDF/SVG).
+"""),
+("MOSFET: R_DS(on), capacitances", """
+# MOSFET: R_DS(on), capacitances
+## R_DS(on)
+- Sweep the drain from 0 V with the gate held on (Contacts page): the I-V tab gives R_DS(on) from the slope of the output curve at V_DS → 0 - per simulated cell (Ω), specific (mΩ·cm², times the cell footprint: the x-z face of the cell) and, with an active area on the Sweep page, for the die (with the series resistance and package outside the cell added). A gate sweep at a small V_DS gives V_DS/I_D at its highest gate voltage instead.
+- Datasheets quote R_DS(on) at a drain current and a junction temperature: sweep at the Solver page's temperature (25 °C = 298 K, 150 °C = 423 K), pin each sweep and read the ratio in `Table…`.
+- Analysis → `On-resistance by region…`: where the solution loses its power, P_i = ∫ (J_n·∇E_Fn + J_p·∇E_Fp) dV over each region, and its share R_i = P_i/I² - channel (in the p-body), JFET and drift region, substrate. Run the device at its on-state bias first. The total is compared with Σ V·I; the difference is the node-to-node discretisation of the gradients.
+- Real dies add a substrate (part of it is often outside the mesh), contacts, metal and the package: `Series outside` and `Package` on the Sweep page.
+## Capacitances
+- Turn on `Capacitances (quasi-static C-V)` on the Sweep page. At every point each terminal is moved by a few mV and re-solved; the change of every terminal's charge gives C_ij = dQ_i/dV_j.
+- A terminal's charge is Gauss's law around its part of the device: its contact nodes plus the semiconductor of the same majority carrier connected to it (an n-drift region belongs to the drain, a p-body tied to the source to the source); a gate's charge is the flux through its oxide. An inversion layer with no source of its own (a MOS capacitor) belongs to the bulk that feeds it.
+- With a gate and a swept drain, the terminals are gate (all gate contacts), drain and source (everything else): C_iss = dQ_G/dV_G (input, drain shorted to source), C_oss = dQ_D/dV_D (output, gate shorted to source) and C_rss = −dQ_G/dV_D (= C_gd), the datasheet curves. Sweep the drain from 0 V with the gate at 0 V (off). Otherwise the swept terminal against all the others: C(V) of a diode or a MOS capacitor (the low-frequency curve - minority carriers follow).
+- From 0 V the I-V tab also gives the output charge Q_oss = ∫ C_oss dV, the stored energy E_oss = ∫ V C_oss dV, and the effective capacitances C_o(tr) = Q_oss/V (same charging time) and C_o(er) = 2 E_oss/V² (same energy).
+- Exact at low frequency in the off state, where no DC current joins two terminals: the result is reciprocal (C_gd = C_dg) and charge is conserved; the I-V tab reports both errors (round-off, ~1e-6). When a channel is on, its charge is split between source and drain where the two terminals' regions meet - an approximation; the I-V tab says at how many points.
+- Analysis → `Capacitances at this bias…`: the full matrix between every pair of terminals (nets) at the present solution, and the datasheet set when there is a gate.
+- Units: nF/cm² of the cell footprint, or pF for the die with an active area set (Sweep page).
+- The gate charge Q_g of a switching event needs a transient solver; the quasi-static curves above give its static parts (Q_oss, and Q_gs, Q_gd from C_iss and C_rss).
+## Gate oxide field
+The Results tab title shows the largest field in the insulators (a gate oxide) and where it is - a design limit of SiC trench MOSFETs (about 3-4 MV/cm).
+## Interface traps of SiC MOSFETs
+Defects → 'Interface traps 4H-SiC/SiO2: band tail': acceptor states rising exponentially towards Ec (Potbhare et al.). They trap a large part of the channel electrons near threshold: V_th up, a stretched subthreshold swing, and a channel that improves as the temperature empties them.
 """),
 ("Physics and numerics", """
 # Physics and numerics
@@ -4284,7 +4682,10 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - thermionic emission at heterointerfaces;
 - ballistic transport, strain and remote-phonon scattering in high-k stacks: nanoscale on-currents are drift-diffusion estimates;
 - self-heating;
-- transients and AC (f_T is the quasi-static charge-control estimate);
+- transients and AC: f_T is the quasi-static charge-control estimate, and the capacitances are quasi-static (low-frequency) values - no high-frequency MOS C-V with frozen inversion charge, no switching transient for the gate charge; with a channel on, the split of its charge between source and drain is approximate;
+- SiC MOSFET channels: the Lombardi surface mobility is silicon only, so a 4H-SiC inversion channel keeps its bulk mobility (hundreds of cm²/Vs, against the 20-40 measured, set by Coulomb scattering on the interface charge): its channel resistance comes out several times too low - the band-tail D_it preset adds the trapped charge, not the scattering;
+- anisotropic mobility: 4H-SiC conducts about 20 % better along its c-axis (vertical drift regions), not modelled;
+- doping profiles: every region is uniformly doped - the lateral doping gradient of a DMOS channel, which sets both V_th and the channel length, is approximated by boxes;
 - defects: traps are in steady state (no transient trapping, current collapse or hysteresis), without field-enhanced emission (Poole-Frenkel, trap-assisted tunnelling); a metal particle carries no current through itself (a particle spanning a junction does not short it), and dislocations are not conducting pipes;
 - general 3-D (tetrahedral) meshes: the triangular mesh is a 2-D triangulation extruded along one axis, so an outline must be normal to the prism axis (others fall back to a staircase), and geometry along the axis stays blocky;
 - gate tunnelling through a curved stack uses the planar WKB barrier along each normal path (the field is exact, the barrier shape ignores the film's curvature).
@@ -4553,6 +4954,10 @@ class App(tk.Tk):
         self.iv_tgt=tk.StringVar(); self.iv_flt=tk.StringVar(value="(none)"); self.iv_out=tk.StringVar(value="auto")
         self.bv_thr=tk.DoubleVar(value=0.); self.iv_refine=tk.BooleanVar(value=True)
         self.iv_live=tk.BooleanVar(value=True)
+        self.iv_cap=tk.BooleanVar(value=False)        # quasi-static C-V at every sweep point
+        # power device: active area (mm2, 0 = none) and the series resistances
+        # outside the simulated cell (mOhm cm2: substrate, contacts; mOhm: package)
+        self.pw_area=tk.DoubleVar(value=0.); self.pw_rsp=tk.DoubleVar(value=0.); self.pw_rpkg=tk.DoubleVar(value=0.)
         # structure view
         self.sec_plane=tk.StringVar(value="XY"); self.sec_pos=tk.DoubleVar(value=0.)
         self.sec_mesh=tk.BooleanVar(value=True); self.sec_3d=tk.BooleanVar(value=True)
@@ -4575,6 +4980,19 @@ class App(tk.Tk):
             except Exception: return d
         self.cur_n2d=tk.IntVar(value=_ci(self.cfg.get("arrows2d"),22,*ARROWS_2D))
         self.cur_n3d=tk.IntVar(value=_ci(self.cfg.get("arrows3d"),8,*ARROWS_3D))
+        # current-flow pictures: which current, the threshold below which
+        # nothing is drawn, equal-current flowlines, log colours, animation
+        self.cur_field=tk.StringVar(value="current J")    # current J / electron flow / hole flow
+        thr=self.cfg.get("cur_thr"); self.cur_thr=tk.StringVar(value=thr if thr in THR_CHOICES else "off")
+        self.cur_lines=tk.BooleanVar(value=bool(self.cfg.get("flowlines",False)))
+        self.cur_nl=tk.IntVar(value=_ci(self.cfg.get("nlines"),16,*FLOWLINES))
+        self.cur_log=tk.BooleanVar(value=bool(self.cfg.get("jlog",False)))
+        self.cur_np=tk.IntVar(value=_ci(self.cfg.get("particles"),400,*PARTICLES))
+        try: spd=max(0.2,min(4.,float(self.cfg.get("aspeed",1.))))
+        except Exception: spd=1.
+        self.cur_spd=tk.DoubleVar(value=spd)
+        self._anim=None; self._anim_on=False; self._anim_art=None; self._anim_ax=None
+        self._anim_bg=None; self._anim_t=None; self._anim_id=None; self._anim_box=None
         self.fi_axis=tk.StringVar(value="X"); self.fi_p1=tk.IntVar(value=0); self.fi_p2=tk.IntVar(value=0)
         self.fi_show_field=tk.BooleanVar(value=True); self.fi_show_mob=tk.BooleanVar(value=True)
         # which panels each plot tab shows (Panels ▾ menus); the Structure 3-D
@@ -4669,7 +5087,9 @@ class App(tk.Tk):
             d=dict(geometry=geo,text_scale=self.txt_scale.get(),
                    template=self.tname,drawer=self._drawer_on,drawer_w=w or self._drawer_w,
                    workarea=self._workarea,wsl_max_fix=bool(self.wsl_fix.get()),filled=bool(big),
-                   arrows2d=self._arrow_n()[0],arrows3d=self._arrow_n()[1])
+                   arrows2d=self._arrow_n()[0],arrows3d=self._arrow_n()[1],
+                   cur_thr=self.cur_thr.get(),flowlines=bool(self.cur_lines.get()),nlines=self._nlines(),
+                   jlog=bool(self.cur_log.get()),particles=self._nparticles(),aspeed=float(self.cur_spd.get()))
             with open(SETTINGS_FILE,"w") as f: json.dump(d,f)
         except Exception: pass
     def _quit(self):
@@ -4919,6 +5339,16 @@ class App(tk.Tk):
                    font=self.F["mono"],width=w,highlightbackground=C["border"],highlightcolor=C["accent"],
                    highlightthickness=1)
         e.grid(row=r,column=c,padx=2,pady=2,sticky="w",**kw); return e
+    @staticmethod
+    def _fnum(v,default=0.):
+        """A DoubleVar's value, or default when its entry does not hold a number."""
+        try:
+            x=float(v.get()); return x if math.isfinite(x) else default
+        except Exception: return default
+    def _power(self):
+        """Power-device settings (active area mm2, series outside mOhm cm2, package mOhm), never negative."""
+        return dict(area=max(0.,self._fnum(self.pw_area)),rsp=max(0.,self._fnum(self.pw_rsp)),
+                    rpkg=max(0.,self._fnum(self.pw_rpkg)))
     def _CB(self,p,v,opts,r,c,w=10,**kw):
         cb=ttk.Combobox(p,textvariable=v,values=list(opts),state="readonly",width=w,font=self.F["ui"])
         cb.grid(row=r,column=c,padx=2,pady=2,sticky="w",**kw); return cb
@@ -5050,6 +5480,10 @@ class App(tk.Tk):
         rm.add_checkbutton(label="Continue from previous solution",variable=self.reuse_sol)
         rm.add_command(label="Forget solution (next run starts from equilibrium)",command=self._forget)
         mb.add_cascade(label="Run",menu=rm)
+        an=tk.Menu(mb,**mkw)
+        an.add_command(label="Capacitances at this bias…",command=self._cap_here)
+        an.add_command(label="On-resistance by region…",command=self._ron_here)
+        mb.add_cascade(label="Analysis",menu=an)
         vm=tk.Menu(mb,**mkw)
         vm.add_command(label="Show / hide editor panel",accelerator=f"{MOD}+E",command=A("drawer",self._toggle_drawer))
         vm.add_command(label="Fill the screen / restore",accelerator="F11",command=A("fill",self._toggle_fill))
@@ -5822,12 +6256,32 @@ class App(tk.Tk):
                         variable=self.iv_refine).grid(row=6,column=0,columnspan=4,sticky="w",padx=4,pady=1)
         ttk.Checkbutton(fm,text="Live plot while sweeping",
                         variable=self.iv_live).grid(row=7,column=0,columnspan=4,sticky="w",padx=4,pady=1)
+        cb=ttk.Checkbutton(fm,text="Capacitances (quasi-static C-V)",variable=self.iv_cap)
+        cb.grid(row=8,column=0,columnspan=4,sticky="w",padx=4,pady=1)
+        Tip(cb,"At every point also the capacitances: each terminal is moved by a few mV and\n"
+               "re-solved, and the change of every terminal's charge (Gauss's law) gives\n"
+               "C_ij = dQ_i/dV_j (2-4 extra solves per point).  Sweep the drain of a MOSFET\n"
+               "with the gate at 0 V for C_iss, C_oss and C_rss (the datasheet curves);\n"
+               "a diode or a MOS capacitor gives C(V).  Exact in the off state (no DC current\n"
+               "between the terminals); with a channel on the split of the channel charge\n"
+               "between source and drain is an approximation (the I-V tab says so).",self.F["small"])
         bf=tk.Frame(fr,bg=C["panel"]); bf.pack(fill=tk.X,padx=4,pady=4)
         self._btn(bf,"↔ Run sweep (F6)",self._sweep,bg="#7a3fc4",font=self.F["uib"]).pack(side=tk.LEFT,padx=2)
         self._hint(fr,"The swept terminal may be a whole net (all members move together). A floating "
                       "terminal is solved for zero current at every point - e.g. an inverter output - which "
                       "turns the sweep into a transfer curve. All other contacts stay at the voltages in the "
                       "Contacts page.")
+        fr=self._sec(p,"Power device (die values)")
+        fm=tk.Frame(fr,bg=C["panel"]); fm.pack(fill=tk.X,padx=4,pady=4)
+        self._L(fm,"Active area (mm²)",0,0); self._E(fm,self.pw_area,0,1,9); self._L(fm,"0 = per cell only",0,2)
+        self._L(fm,"Series outside (mΩ·cm²)",1,0); self._E(fm,self.pw_rsp,1,1,9)
+        self._L(fm,"Package (mΩ)",2,0); self._E(fm,self.pw_rpkg,2,1,9)
+        self._hint(fr,"Turn the simulated cell into a die: the parameter table scales R_DS(on) and the "
+                      "capacitances by the active area (cell footprint = the x-z face of the cell). "
+                      "'Series outside' adds what the mesh leaves out, per area - a substrate is "
+                      "ρ·t (4H-SiC 20 mΩ·cm × 350 µm = 0.70 mΩ·cm², Si 2 mΩ·cm × 100 µm = 0.02), "
+                      "plus contact resistivity; 'Package' adds bond wires and leads (TO-220/TO-247 "
+                      "about 0.5-2 mΩ).")
 
 
     # ─── PLOT TABS ─────────────────────────────────────────────
@@ -5869,7 +6323,8 @@ class App(tk.Tk):
              "tc":[("line","Line cut: current density"),("map","In-plane map"),
                    ("prof","Current under a contact"),("rec","Line cut: recombination"),("3d","3-D current field")],
              "tf":[("E","Electric field"),("mu","Mobility")],
-             "ti":[("lin","Linear I-V"),("log","Semi-log I-V (all terminals)"),("bjt","BJT: gain and f_T vs I_C")]}
+             "ti":[("lin","Linear I-V"),("log","Semi-log I-V (all terminals)"),("bjt","BJT: gain and f_T vs I_C"),
+                   ("cv","C-V: capacitances")]}
     def _panels_menu(self,parent,tab,cmd,side=tk.RIGHT):
         """A 'Panels ▾' menu button: show / hide each panel of a plot tab
         (the panels left take the room of the hidden ones)."""
@@ -5999,6 +6454,39 @@ class App(tk.Tk):
     def _intok(v):
         try: v.get(); return True
         except Exception: return False
+    def _spin_int(self,cf,var,rng,step,tip,cb):
+        """An integer spinbox clipped to rng that calls cb() when changed."""
+        def changed(_=None):
+            try: v=max(rng[0],min(rng[1],int(var.get())))
+            except Exception: v=rng[0]
+            try:
+                if int(var.get())!=v: var.set(v)
+            except Exception: var.set(v)
+            cb()
+        sp=ttk.Spinbox(cf,from_=rng[0],to=rng[1],increment=step,width=5,textvariable=var,
+                       command=changed,font=self.F["ui"])
+        sp.pack(side=tk.LEFT,padx=(0,4))
+        for ev in ("<Return>","<KP_Enter>","<FocusOut>"): sp.bind(ev,changed,add="+")
+        Tip(sp,tip,self.F["small"])
+        return sp
+    def _nlines(self):
+        try: return max(FLOWLINES[0],min(FLOWLINES[1],int(self.cur_nl.get())))
+        except Exception: return 16
+    def _nparticles(self):
+        try: return max(PARTICLES[0],min(PARTICLES[1],int(self.cur_np.get())))
+        except Exception: return 400
+    def _cur_thr_v(self):
+        return THR_CHOICES.get(self.cur_thr.get(),0.)
+    def _cur_vec(self,s):
+        """The current shown in the Current tab: (Fx, Fy, Fz) arrays (A/cm2),
+        its symbol and its name - the total current J, the electron flow
+        -J_n (where the electrons go) or the hole flow J_p."""
+        w=self.cur_field.get()
+        if w!="current J" and "Jnx" in s:
+            if w=="electron flow":
+                return (-s["Jnx"],-s["Jny"],-s["Jnz"]),"-Jn","electron flow"
+            return (s["Jx"]-s["Jnx"],s["Jy"]-s["Jny"],s["Jz"]-s["Jnz"]),"Jp","hole flow"
+        return (s["Jx"],s["Jy"],s["Jz"]),"J","current"
     def _arrow_spin(self,cf,var,rng,step,tip):
         sp=ttk.Spinbox(cf,from_=rng[0],to=rng[1],increment=step,width=4,textvariable=var,
                        command=self._arrows_changed,font=self.F["ui"])
@@ -6053,12 +6541,50 @@ class App(tk.Tk):
                    "hidden in Layers… stay hidden; a part given its own opacity there keeps it.",self.F["small"])
             b=self._btn(cf2,"Layers…",self._layers_win,bg=C["border"]); b.pack(side=tk.LEFT,padx=6)
             self._panels_menu(cf2,"tc",self._upd_curr_plot,side=tk.LEFT)
+            cf3=self._strip(self.tc)                  # third row: what flows, threshold, flowlines, animation
+            tk.Label(cf3,text="Show",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(4,2))
+            cb=ttk.Combobox(cf3,textvariable=self.cur_field,values=list(CUR_FIELDS),state="readonly",width=13,
+                            font=self.F["ui"])
+            cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda e:self._upd_curr_plot())
+            Tip(cb,"current J: the total (conventional) current density - it runs from + to -.\n"
+                   "electron flow: where the electrons go (-J_n; opposite to their current) - in an\n"
+                   "n-channel MOSFET from the source through the channel to the drain.\n"
+                   "hole flow: where the holes go (J_p).  Arrows, map, flowlines and particles follow it.",
+                self.F["small"])
+            tk.Label(cf3,text="Hide below",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(8,2))
+            cb=ttk.Combobox(cf3,textvariable=self.cur_thr,values=list(THR_CHOICES),state="readonly",width=6,
+                            font=self.F["ui"])
+            cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda e:self._upd_curr_plot())
+            Tip(cb,"Threshold: no arrows, flowlines or particles where the current density is below\n"
+                   "this fraction of its largest value (in the plane for the map, in the device for\n"
+                   "3-D).  Removes the leakage paths, so the main current path stands out.",self.F["small"])
+            self._check(cf3,"Flowlines",self.cur_lines,self._upd_curr_plot,"#e2e8f0")
+            self._spin_int(cf3,self.cur_nl,FLOWLINES,2,
+                           "Number of flowlines.  In a 2-D device each line carries the same share of the\n"
+                           "current (stream-function contours), so the lines crowd where the current is\n"
+                           "dense - a channel, a JFET neck - and spread where it fans out.  When current\n"
+                           "leaves the plane (a 3-D device) evenly spaced streamlines are drawn instead.",
+                           lambda:self._debounce('_cur_after_id',self._upd_curr_plot,250))
+            self._check(cf3,"log |J|",self.cur_log,self._upd_curr_plot,"#e2e8f0")
+            ttk.Separator(cf3,orient="vertical").pack(side=tk.LEFT,fill=tk.Y,padx=6,pady=2)
+            self._anim_btn=self._btn(cf3,"▶ Animate",self._anim_toggle,bg="#0a8f5a"); self._anim_btn.pack(side=tk.LEFT,padx=2)
+            Tip(self._anim_btn,"Particles flow along the current in the in-plane map; their speed grows with\n"
+                               "log |J| (fast in the channel, slow in the spreading region).  'Hide below'\n"
+                               "keeps them out of the leakage paths.",self.F["small"])
+            tk.Label(cf3,text="Particles",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(6,2))
+            self._spin_int(cf3,self.cur_np,PARTICLES,50,"Number of particles in the animation.",
+                           lambda:self._anim_rebuild())
+            tk.Label(cf3,text="Speed",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(6,2))
+            ttk.Scale(cf3,from_=0.2,to=4.,orient=tk.HORIZONTAL,variable=self.cur_spd,length=90).pack(side=tk.LEFT,padx=2)
+            b=self._btn(cf3,"GIF…",self._anim_gif,bg=C["border"]); b.pack(side=tk.LEFT,padx=6)
+            Tip(b,"Save the animation of the in-plane map as an animated GIF.",self.F["small"])
         self.cur_lbl1,self.cur_lbl2,self.cur_scale1,self.cur_scale2=self._build_cut_controls(
             self.tc,self.cur_axis,self.cur_p1,self.cur_p2,self._upd_curr_axis,
             lambda _:self._debounce('_cur_after_id',self._upd_curr_plot),extras)
         self.fc,self.cvc=self._mfig(self.tc)
         self.cvc.mpl_connect("motion_notify_event",lambda e:self._map_hover(e,self.cur_hover))
         self.cvc.mpl_connect("draw_event",self._labels_on_draw)
+        self.cvc.mpl_connect("draw_event",self._anim_on_draw)
 
     def _prof_choices(self):
         cb=getattr(self,"cb_prof",None)
@@ -6577,6 +7103,108 @@ class App(tk.Tk):
     def _forget(self):
         self._c_sig=None; self._c_ok=False; self._log("Solution forgotten - next run starts from equilibrium")
 
+    # ─── ANALYSIS MENU ─────────────────────────────────────────
+    def _solved_here(self,what):
+        """The shown solution is the one held by the solver (needed by tools that re-solve)."""
+        s=self.sol
+        if s is None or not getattr(self,"_c_ok",False) or getattr(self,"_c_sol",None) is not s or not s.get("dev"):
+            messagebox.showinfo(what,"Solve the device first (▶ Run, F5, or a sweep): the tool works at the bias "
+                                     "of that solution.  (A pinned sweep's fields are not held by the solver.)")
+            return None
+        return s
+    def _cap_here(self):
+        if self.busy: return
+        s=self._solved_here("Capacitances")
+        if s is None: return
+        cons=s["dev"]["cons"]; groups=con_groups(cons); vapp=[float(v) for v in s["Vs"]]
+        if len(groups)<2: messagebox.showinfo("Capacitances","The device needs two terminals at least."); return
+        job=Job("cap",1); job.nthreads=self._nthreads()
+        self.sv.set(f"Capacitances at this bias: {2*(len(groups)-1)} extra solves…")
+        def work(job):
+            r=cap_matrix(cons,groups,vapp=vapp,restore=True,job=job)
+            api_resolve()                          # back to this bias with its own currents
+            return dict(r=r,groups=groups,cons=cons,vapp=vapp,L=s["dev"].get("L"),dt=time.time()-job.t0)
+        self._start(job,work,self._cap_here_done)
+    def _cap_here_done(self,res):
+        r=res["r"]
+        if r is None: messagebox.showerror("Capacitances","The terminal charges could not be evaluated."); return
+        groups=res["groups"]; cons=res["cons"]; vapp=res["vapp"]; K=r["K"]; keys=[k for k,_ in groups]
+        P=dict(L=res["L"],power=self._power())
+        fac,un=self._cap_scale(P)
+        bcs=[c.bc for c in cons]; gv=lambda idx: float(np.mean([vapp[c] for c in idx]))
+        w=max(10,max(len(k) for k in keys)+2)
+        lines=["Bias: "+", ".join(f"{k} = {gv(idx):g} V" for k,idx in groups),
+               f"Unit: {un}"+(" (of the cell footprint, the x-z face)" if un=="nF/cm²" else ""),"",
+               "Capacitance between two terminals C_ij = -dQ_i/dV_j; on the diagonal dQ_i/dV_i (all other",
+               "terminals held): the capacitance of terminal i to everything else.",
+               "".ljust(w)+"".join(k[:w-1].rjust(w) for k in keys)]
+        for i,k in enumerate(keys):
+            lines.append(k[:w-1].ljust(w)+"".join(f"{(K[i,j] if i==j else -K[i,j])*fac:{w}.4g}" for j in range(len(keys))))
+        gi=[i for i,(_,idx) in enumerate(groups) if all(bcs[c]==2 for c in idx)]
+        ng=[i for i in range(len(groups)) if i not in gi]
+        if gi and len(ng)>=2:
+            vmin=min(gv(groups[i][1]) for i in ng)
+            d=max(ng,key=lambda i:abs(gv(groups[i][1])-vmin))
+            Ciss=float(K[np.ix_(gi,gi)].sum()); Coss=float(K[d,d]); Crss=-float(K[gi,d].sum())
+            lines+=["",f"MOSFET datasheet set (drain = {keys[d]}, gates together, the rest as source):",
+                    f"  C_iss = {Ciss*fac:.4g}   C_oss = {Coss*fac:.4g}   C_rss = {Crss*fac:.4g}  {un}"]
+        lines+=["",f"Partition of the nodes: {r['meet']} meeting edges"+
+                (" (off state: exact low-frequency capacitances)" if r["meet"]==0 else
+                 " - a conducting channel joins two terminals; the split of its charge between them is approximate"),
+                f"Reciprocity |C_ij - C_ji| / C: {r['recip']:.1e}   charge conservation: {r['neutral']:.1e}",
+                f"{r['nsolve']} extra solves (±{r['dV']*1e3:.3g} mV)"+("" if r["ok"] else " - NOT all converged")+
+                f", {res['dt']:.1f} s"]
+        self._log(f"Capacitances at this bias: {r['nsolve']} solves, meeting edges {r['meet']}")
+        self.sv.set("Capacitances at this bias: see the window")
+        self._report("Capacitances at this bias (quasi-static)","\n".join(lines))
+    def _ron_here(self):
+        s=self._solved_here("On-resistance by region")
+        if s is None: return
+        regs=s["dev"]["regs"]; cons=s["dev"]["cons"]; own=self._owner(s)
+        b=joule_breakdown(s,own,len(regs))
+        if b is None: messagebox.showinfo("On-resistance by region","This solution has no per-carrier currents (solve again)."); return
+        groups=con_groups(cons); I=np.asarray(s["I"],float); Vs=np.asarray(s["Vs"],float)
+        bcs=[c.bc for c in cons]
+        gI={k:float(I[idx].sum()) for k,idx in groups}
+        car=[k for k,idx in groups if not all(bcs[c]==2 for c in idx)]
+        if not car: messagebox.showinfo("On-resistance by region","No carrier terminal."); return
+        kmax=max(car,key=lambda k:abs(gI[k])); Iref=abs(gI[kmax])
+        Pterm=float(np.sum(Vs*I))
+        if Iref<=0: messagebox.showinfo("On-resistance by region","No current flows in this solution."); return
+        Afp=self._cell_area(dict(L=s["dev"].get("L")))
+        rows=[(r.label,float(b["P"][k])) for k,r in enumerate(regs)]
+        rest=b["Ptot"]-sum(p for _,p in rows)
+        if abs(rest)>1e-6*abs(b["Ptot"]): rows.append(("(nodes of no region)",rest))
+        w=max(22,max(len(n) for n,_ in rows)+2)
+        lines=[f"Current: |I({kmax})| = {Iref:.4e} A per cell;  terminal power Σ V·I = {Pterm:.4e} W",
+               "Each region's share of the on-resistance R_i = P_i / I², P_i = ∫ (J_n·∇E_Fn + J_p·∇E_Fp) dV",
+               "(the power the carriers lose in it).  Meaningful when one current runs through the device",
+               "(drain to source) - not with large gate or body currents.","",
+               "Region".ljust(w)+"P (W per cell)".rjust(16)+"share".rjust(9)+"R_i (Ω per cell)".rjust(18)
+               +("R_i,sp (mΩ·cm²)".rjust(18) if Afp>0 else "")]
+        for n,Pk in sorted(rows,key=lambda t:-abs(t[1])):
+            Ri=Pk/Iref**2
+            lines.append(n[:w-1].ljust(w)+f"{Pk:16.4e}"+f"{100*Pk/b['Ptot'] if b['Ptot'] else 0:8.1f}%"+f"{Ri:18.4e}"
+                         +(f"{Ri*Afp*1e3:18.4g}" if Afp>0 else ""))
+        tot=b["Ptot"]; Rt=tot/Iref**2
+        lines+=["",f"Total in the semiconductor: {tot:.4e} W = {100*tot/Pterm if Pterm else 0:.1f} % of Σ V·I;  "
+                   f"R = {Rt:.4e} Ω per cell"+(f" = {Rt*Afp*1e3:.4g} mΩ·cm²" if Afp>0 else ""),
+                "The rest is lost in the node-to-node discretisation of the gradients (thin channels, contacts):",
+                "refine the mesh where the current crowds for a closer match."]
+        if s.get("mesh")=="tri": lines.append("Triangular mesh: computed on its tensor-line resampling (approximate).")
+        self._report("On-resistance by region","\n".join(lines))
+    def _report(self,title,text):
+        top=self._text_window(title,w=980,h=560)
+        fr,t=self._styled_text(top); fr.pack(fill=tk.BOTH,expand=True,padx=6,pady=6)
+        t.configure(wrap="none"); t.insert("1.0",text,("pre",)); t.configure(state="disabled")
+        bf=tk.Frame(top,bg=C["panel"]); bf.pack(fill=tk.X,padx=6,pady=(0,6))
+        def cp():
+            self.clipboard_clear(); self.clipboard_append(text); self.sv.set("Copied to the clipboard")
+        self._btn(bf,"Copy",cp,bg=C["border"]).pack(side=tk.LEFT,padx=3)
+        self._btn(bf,"Close",top.destroy,bg=C["border"]).pack(side=tk.RIGHT,padx=3)
+        self._last_report=(title,text)
+        return top
+
     def _set_threads(self):
         try: n=max(1,min(int(self.threads.get()),self.ncpu))
         except Exception: return
@@ -6701,7 +7329,7 @@ class App(tk.Tk):
         if r.get("fresh"): self._def_summary(notes)
         for n in notes if r.get("fresh") else []: self._log("Defect: "+n)
     def _run_done(self,r):
-        s=r["s"]; self.sol=s; self._defect_notes(r)
+        s=r["s"]; self.sol=s; self._c_sol=s; self._defect_notes(r)
         if r.get("amr_info"):
             self.amr_nodes=r.get("amr") or {}; self._amr_label(r["amr_info"])
             self._log("Adaptive mesh: "+"; ".join(f"pass {i+1} +{a} lines → {b:,} nodes{'' if c else ' (not converged)'}"
@@ -6752,11 +7380,19 @@ class App(tk.Tk):
         flt=group_of(cons,fkey) if fkey!="(none)" else []
         if set(flt)&set(tgt): messagebox.showerror("Cannot sweep","The floating terminal cannot be the swept one."); return
         okey=self._gmap.get(self.iv_out.get(),"auto")
+        cap=None
+        if self.iv_cap.get():
+            if flt: messagebox.showerror("Cannot sweep","Capacitances need every terminal driven: clear the floating terminal "
+                                         "(or turn 'Capacitances' off)."); return
+            roles=cap_roles(groups,[c.bc for c in cons],tkey)
+            if roles is None: messagebox.showerror("Cannot sweep","Capacitances need a second terminal."); return
+            cap=dict(groups=roles["groups"],ref=roles["ref"],kind=roles["kind"])
         sig=device_signature(t,solver,models,T,graded)
         vapp=[c.V for c in cons]
         job=Job("sweep",Np); job.nthreads=self._nthreads()
         self._live=[]; self._live_meta=dict(cons=cons,groups=groups,tkey=tkey,fkey=fkey if flt else None,
-                                            okey=okey,bv=bv,Vs=Vs,Ve=Ve,wl=self.tmeta.get("wl"),models=models,T=T)
+                                            okey=okey,bv=bv,Vs=Vs,Ve=Ve,wl=self.tmeta.get("wl"),models=models,T=T,
+                                            cap=cap,L=(t["Lx"],t["Ly"],t["Lz"]),power=self._power())
         self.sv.set(f"Sweeping {tkey}: {Vs:g} → {Ve:g} V, {Np} points"+(f", {fkey} floating" if flt else "")+"…")
         self._log(f"Sweep {self.tname}: {tkey} {Vs:g}→{Ve:g} V ({Np} pts)"+(f", floating {fkey}" if flt else ""))
         refine=bool(self.iv_refine.get()); reuse=bool(self.reuse_sol.get())
@@ -6764,7 +7400,7 @@ class App(tk.Tk):
         def work(job):
             fresh=self._prepare(job,t,solver,models,T,graded,sig,reuse)
             R=run_sweep(cons,tgt,Vs,Ve,Np,flt,job,on_point=lambda k,rec:self._q.put(("point",rec)),
-                        vapp=vapp,refine=refine,max_fail=2 if models&M_II else 0)
+                        vapp=vapp,refine=refine,max_fail=2 if models&M_II else 0,cap=cap)
             self._c_ok=True
             A=np.array([api_conA(c) for c in range(len(cons))])
             s=pull()
@@ -6790,7 +7426,7 @@ class App(tk.Tk):
         self.ivd=dict(R=R,A=r["A"],cons=cons,groups=con_groups(cons),tkey=m["tkey"],fkey=m["fkey"],
                       okey=m["okey"],bv=m["bv"],labels=[c.label for c in cons],bcs=[c.bc for c in cons],
                       vapp=r["vapp"],tname=self.tname,wl=m.get("wl"),models=m.get("models"),
-                      Vs=m.get("Vs"),Ve=m.get("Ve"),T=m.get("T"))
+                      Vs=m.get("Vs"),Ve=m.get("Ve"),T=m.get("T"),cap=m.get("cap"),L=m.get("L"),power=m.get("power"))
         n=len(R["V"]); nc=int(np.sum(R["conv"])) if n else 0
         state="STOPPED" if r["stopped"] else "done"
         sf=R.get("stop_fail",float("nan"))
@@ -6801,7 +7437,7 @@ class App(tk.Tk):
         self.sv.set(f"Sweep {state}: {nc}/{n} points converged in {r['dt']:.1f} s (fields show the last point)")
         self._log(f"Sweep {state}: {nc}/{n} converged, {r['dt']:.1f} s")
         if r["s"] is not None:
-            self.sol=r["s"]; self.ivd["s"]=r["s"]
+            self.sol=r["s"]; self.ivd["s"]=r["s"]; self._c_sol=r["s"]
             self._fill_results(r["s"],cons,r["vapp"],r["flt"],None,note="last sweep point")
             self._new_solution_views()
         self._plot_iv(); self.nb.select(self.ti)
@@ -6817,7 +7453,8 @@ class App(tk.Tk):
                   tkey=d["tkey"],fkey=d.get("fkey"),okey=d.get("okey"),bv=d.get("bv",0.),wl=d.get("wl"),
                   models=d.get("models"),tname=d.get("tname",""),labels=list(d.get("labels") or []),
                   bcs=list(d.get("bcs") or [c.bc for c in d["cons"]]),vapp=list(d.get("vapp") or []),
-                  Vs=d.get("Vs"),Ve=d.get("Ve"),T=d.get("T"))
+                  Vs=d.get("Vs"),Ve=d.get("Ve"),T=d.get("T"),cap=copy.deepcopy(d.get("cap")),L=d.get("L"),
+                  power=dict(d.get("power") or {}))
         if s is not None and s.get("nodes",0)>self.PIN_FIELDS_MAX: s=None
         if color is None:
             used={p["color"] for p in self.pins}
@@ -7136,8 +7773,11 @@ class App(tk.Tk):
             big=max([abs(x) for x in raw]+[1e-300]); fl=sum(s.get("Ifl") or [0.])
             kir=(f" · Kirchhoff check of the contact fluxes {abs(sum(raw))/big:.1e}" if big>10.*fl else
                  " · currents below the resolution floor")
+        Ei,Ep=s.get("Eins") or (float("nan"),None)
+        eox=(f" · max field in insulators {Ei*1e-8:.3g} MV/cm at ({Ep[0]:.0f}, {Ep[1]:.0f}, {Ep[2]:.0f}) nm"
+             if Ei==Ei and Ep is not None and Ei>1e3 else "")
         self.res_title.config(text=f"{self.tname} - {'converged' if nconv else 'NOT converged'}"
-                                   f"{' ('+note+')' if note else ''} · {_mesh_desc(s)}{kir}")
+                                   f"{' ('+note+')' if note else ''} · {_mesh_desc(s)}{kir}{eox}")
         for k,c in enumerate(cons):
             if k>=len(s["I"]): break
             I_=s["I"][k]; A_=s["A"][k]; fl=s["Ifl"][k]; Vs_=s["Vs"][k]
@@ -7944,9 +8584,12 @@ class App(tk.Tk):
     # ─── CURRENT ───────────────────────────────────────────────
     def _plot_curr(self):
         s=self.sol; fig=self.fc; fig.clear()
+        self._anim_art=None; self._anim_ax=None; self._anim_bg=None; self._anim_cax=None
         self._hmaps={k:v for k,v in getattr(self,"_hmaps",{}).items() if k.figure is not fig}
         self.cur_hover.config(text="")
-        if s is None: self.cvc.draw_idle(); return
+        if s is None:
+            if self._anim_on: self._anim_stop(redraw=False)
+            self.cvc.draw_idle(); return
         vis=self._vis("tc")
         pkey=self._gmap.get(self.cur_prof.get()) if self.cur_prof.get()!="(none)" else None
         if pkey is None and "prof" in vis: vis.remove("prof")
@@ -7955,19 +8598,23 @@ class App(tk.Tk):
         aJ,aR,aQ,aQ3,aP=(axs.get(k) for k in ("line","rec","map","3d","prof"))
         for a in axs.values(): a.set_facecolor(C["bg"])
         A,p1,p2=self.cur_axis.get(),self.cur_p1.get(),self.cur_p2.get()
-        cx,Jx,(an1,av1),(an2,av2)=self._line_cut_at(s["Jx"],A,p1,p2)
-        Jy=self._line_cut_at(s["Jy"],A,p1,p2)[1]; Jz=self._line_cut_at(s["Jz"],A,p1,p2)[1]
+        (FX,FY,FZ),sym,fname=self._cur_vec(s)
+        cx,Jx,(an1,av1),(an2,av2)=self._line_cut_at(FX,A,p1,p2)
+        Jy=self._line_cut_at(FY,A,p1,p2)[1]; Jz=self._line_cut_at(FZ,A,p1,p2)[1]
         Rt=self._line_cut_at(s["R"],A,p1,p2)[1]
         self.cur_lbl1.configure(text=f"{an1} = {av1:.1f} nm"); self.cur_lbl2.configure(text=f"{an2} = {av2:.1f} nm")
         xl=f"{'depth y' if A=='Y' else A.lower()} (nm)"
         own=self._owner(s); dev=s.get("dev") or {}; regs=dev.get("regs",[])
         ownl=self._line_cut_at(own,A,p1,p2)[1] if own is not None else None
+        cl=(lambda c:f"J{c}") if sym=="J" else (lambda c:f"{sym},{c}")
+        mag=f"|{sym.lstrip('-')}|"
         if aJ is not None:
-            aJ.plot(cx,Jx,color="#34d399",lw=1.6,label="Jx"); aJ.plot(cx,Jy,color="#fbbf24",lw=1.6,label="Jy")
-            aJ.plot(cx,Jz,color="#f87171",lw=1.6,label="Jz")
-            aJ.plot(cx,np.sqrt(Jx**2+Jy**2+Jz**2),color=C["green"],lw=2.2,ls="--",label="|J|")
+            aJ.plot(cx,Jx,color="#34d399",lw=1.6,label=cl("x")); aJ.plot(cx,Jy,color="#fbbf24",lw=1.6,label=cl("y"))
+            aJ.plot(cx,Jz,color="#f87171",lw=1.6,label=cl("z"))
+            aJ.plot(cx,np.sqrt(Jx**2+Jy**2+Jz**2),color=C["green"],lw=2.2,ls="--",label=mag)
             aJ.axhline(0,color=C["border"],lw=0.5); aJ.legend(fontsize=7,framealpha=0.85)
-            sax(aJ,xl,"J (A/cm²)",f"Current density along {A} ({an1} = {av1:.1f}, {an2} = {av2:.1f} nm)")
+            what="Current density" if sym=="J" else f"{fname.capitalize()} ({sym})"
+            sax(aJ,xl,f"{sym} (A/cm²)",f"{what} along {A} ({an1} = {av1:.1f}, {an2} = {av2:.1f} nm)")
             self._ov_line(aJ,cx,ownl,regs)
         if aR is not None:
             if np.any(np.abs(np.nan_to_num(Rt))>1e-30):
@@ -7981,26 +8628,37 @@ class App(tk.Tk):
         # in-plane map: the plane that CONTAINS the cut line
         if A in ("X","Y"):
             l=max(0,min(int(p2),Nz_-1))
-            U=s["Jx"][l,:,:]; Vq=s["Jy"][l,:,:]; hx,vy=s["x"],s["y"]; xlab,ylab="x (nm)","depth y (nm)"
+            U=FX[l,:,:]; Vq=FY[l,:,:]; hx,vy=s["x"],s["y"]; xlab,ylab="x (nm)","depth y (nm)"
             ttl=f"XY plane @ z = {s['z'][l]:.1f} nm"; invert=True
             cut=("h",s["y"][max(0,min(int(p1),Ny_-1))]) if A=="X" else ("v",s["x"][max(0,min(int(p1),Nx_-1))])
             own2=own[l,:,:] if own is not None else None; ovax=("x","y","z"); ovpos=s["z"][l]
         else:
             i=max(0,min(int(p1),Nx_-1))
-            U=s["Jz"][:,:,i].T; Vq=s["Jy"][:,:,i].T; hx,vy=s["z"],s["y"]; xlab,ylab="z (nm)","depth y (nm)"
+            U=FZ[:,:,i].T; Vq=FY[:,:,i].T; hx,vy=s["z"],s["y"]; xlab,ylab="z (nm)","depth y (nm)"
             ttl=f"YZ plane @ x = {s['x'][i]:.1f} nm"; invert=True
             cut=("h",s["y"][max(0,min(int(p2),Ny_-1))])
             own2=own[:,:,i].T if own is not None else None; ovax=("z","y","x"); ovpos=s["x"][i]
         M=np.sqrt(U**2+Vq**2)
         n2,n3=self._arrow_n()
         bg=self.cur_bg.get(); sa=max(0.,min(1.,float(self.cur_sa.get())))
+        thr=self._cur_thr_v(); Mmax=float(np.nanmax(M)) if np.isfinite(M).any() else 0.
         if aQ is None: pass
-        elif np.nanmax(M)>1e-30:
+        elif Mmax>1e-30:
             X1,Y1=np.meshgrid(hx,vy)
             if bg!="structure":
-                pc=aQ.pcolormesh(X1,Y1,np.ma.masked_invalid(M),cmap="viridis",shading="nearest")
-                fig.colorbar(pc,ax=aQ,label="|J| (A/cm²)",shrink=0.85,pad=0.02)
+                if self.cur_log.get():
+                    from matplotlib.colors import LogNorm
+                    Mp=M[np.isfinite(M)&(M>0)]
+                    vmin=max(float(Mp.min()) if Mp.size else Mmax*1e-12,Mmax*(thr if thr>0 else 1e-10))
+                    pc=aQ.pcolormesh(X1,Y1,np.ma.masked_where(~(np.isfinite(M)&(M>=vmin)),M),cmap="viridis",
+                                     shading="nearest",norm=LogNorm(vmin=vmin,vmax=Mmax))
+                else:
+                    pc=aQ.pcolormesh(X1,Y1,np.ma.masked_invalid(M),cmap="viridis",shading="nearest")
+                self._anim_cax=fig.colorbar(pc,ax=aQ,label=f"{mag} (A/cm²)",shrink=0.85,pad=0.02).ax
             if bg!="|J|": self._struct_plane(aQ,hx,vy,own2,regs,sa)
+            if self.cur_lines.get():
+                self._flowlines(aQ,U,Vq,hx,vy,M,thr,self._plane_faces(s,A in ("X","Y"),l if A in ("X","Y") else i))
+            if self._anim_on: self._anim_build(aQ,U,Vq,hx,vy,thr)
             if self.cur_show_arrows2d.get():
                 # n2 arrows across, rows spaced alike on screen; J interpolated to the
                 # arrow points (so the count is not limited by the mesh)
@@ -8013,7 +8671,7 @@ class App(tk.Tk):
                 gx=np.linspace(hx[0]+ex,hx[-1]-ex,n2); gy=np.linspace(vy[0]+ey,vy[-1]-ey,ny2)
                 Us=_lin_axis(_lin_axis(U,hx,gx,1),vy,gy,0); Vs=_lin_axis(_lin_axis(Vq,hx,gx,1),vy,gy,0)
                 ms=np.sqrt(Us**2+Vs**2)
-                okm=np.isfinite(ms)&(ms>1e-30*np.nanmax(M)+1e-300)
+                okm=np.isfinite(ms)&(ms>max(1e-30,thr)*Mmax+1e-300)
                 ln=np.log10(np.where(okm,ms,1e-300)); lo,hi=(np.nanmin(ln[okm]),np.nanmax(ln[okm])) if okm.any() else (0.,0.)
                 sc=0.3+0.7*(ln-lo)/(hi-lo+1e-30); sc=np.where(okm,sc,0.)
                 Gx,Gy=np.meshgrid(gx,gy)
@@ -8024,7 +8682,8 @@ class App(tk.Tk):
                           headwidth=4,headlength=5,alpha=0.9,pivot="mid")
         else:
             if bg!="|J|": self._struct_plane(aQ,hx,vy,own2,regs,sa)
-            aQ.text(0.5,0.5,"J ≈ 0 (no current flow)",transform=aQ.transAxes,ha="center",va="center",fontsize=10,color=C["sub"])
+            aQ.text(0.5,0.5,f"{sym} ≈ 0 (no {fname} in this plane)",transform=aQ.transAxes,ha="center",va="center",
+                    fontsize=10,color=C["sub"])
         if aQ is not None:
             if cut[0]=="h": aQ.axhline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
             else: aQ.axvline(cut[1],color=C["yellow"],lw=0.9,ls="--",alpha=0.8)
@@ -8032,7 +8691,7 @@ class App(tk.Tk):
             if invert: aQ.invert_yaxis()
             self._ov_plane(aQ,hx,vy,own2,regs,dev.get("cons"),ovax,ovpos,dev.get("L"),[cut])
             sax(aQ,xlab,ylab,ttl+"  (dashed: the line cut)")
-            self._reg_hover(aQ,hx,vy,M,"|J| (A/cm²)",ovax,ovpos)
+            self._reg_hover(aQ,hx,vy,M,f"{mag} (A/cm²)",ovax,ovpos)
         if aQ3 is not None and self.cur_st3.get() and regs:      # the structure, see-through, under the arrows
             L3d=dev.get("L") or (float(s["x"][-1]),float(s["y"][-1]),float(s["z"][-1]))
             self._draw_struct3(aQ3,regs,dev.get("cons") or [],L3d,overlay=sa,editor=False)
@@ -8055,22 +8714,24 @@ class App(tk.Tk):
             def samp(F):   # F (Nz,Ny,Nx) -> (ny,nx,nz) like meshgrid(..., indexing="xy")
                 return _lin_axis(_lin_axis(_lin_axis(F,x,g[0],2),y,g[1],1),z,g[2],0).transpose(1,2,0)
             Xa,Ya,Za=np.meshgrid(g[0],g[1],g[2],indexing="xy")
-            Ua,Va,Wa=samp(s["Jx"]),samp(s["Jy"]),samp(s["Jz"])
+            Ua,Va,Wa=samp(FX),samp(FY),samp(FZ)
             Ma=np.nan_to_num(np.sqrt(Ua**2+Va**2+Wa**2))
-            nar=int(np.count_nonzero(Ma>1e-30))
+            keep=(Ma>max(1e-30,thr*Ma.max())).flatten()
+            nar=int(np.count_nonzero(keep))
             if Ma.max()>1e-30:
                 msf=np.where(Ma>1e-30,Ma,1.); Lr=0.64*d
                 from matplotlib.colors import LogNorm
-                mf=Ma.flatten(); mpos=mf[mf>1e-30]
-                norm=LogNorm(vmin=max(mpos.min(),Ma.max()*1e-4),vmax=Ma.max())
-                cols=plt.cm.viridis(norm(np.clip(mf,norm.vmin,None)))
+                mf=Ma.flatten(); mpos=mf[keep]
+                norm=LogNorm(vmin=max(mpos.min(),Ma.max()*max(thr,1e-4)),vmax=Ma.max())
+                cols=plt.cm.viridis(norm(np.clip(mf[keep],norm.vmin,None)))
                 lw=1.2*min(1.,(8./max(na))**0.5)
-                aQ3.quiver(Xa.flatten(),Za.flatten(),-Ya.flatten(),
-                           np.nan_to_num(Ua/msf*Lr).flatten(),np.nan_to_num(Wa/msf*Lr).flatten(),
-                           np.nan_to_num(-Va/msf*Lr).flatten(),colors=cols,arrow_length_ratio=0.4,linewidth=lw)
+                fl=lambda a:np.nan_to_num(a).flatten()[keep]
+                aQ3.quiver(fl(Xa),fl(Za),-fl(Ya),fl(Ua/msf*Lr),fl(Wa/msf*Lr),-fl(Va/msf*Lr),
+                           colors=cols,arrow_length_ratio=0.4,linewidth=lw)
             aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
             self._aspect3(aQ3,x.max(),y.max(),z.max())
-            sax3(aQ3,"x","z","depth y",f"3-D current field ({nar} arrows)"); _depth_axis(aQ3)
+            what="current" if sym=="J" else fname
+            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({nar} arrows)"); _depth_axis(aQ3)
         else:
             x,y,z=s["x"],s["y"],s["z"]
             if not self.cur_st3.get():
@@ -8082,6 +8743,139 @@ class App(tk.Tk):
         except Exception: pass
         self._flush_labels(fig)
         self.cvc.draw_idle()
+
+    def _plane_faces(self,s,xy,idx):
+        """Face current densities of the shown field in the map plane (XY at z
+        index idx, or YZ at x index idx): (Fh, Fv) for stream_function_faces,
+        None without them (a prism mesh)."""
+        if "Fx" not in s: return None
+        w=self.cur_field.get()
+        def comp(c):
+            T=s["F"+c].astype(float)
+            if w=="current J" or "Fn"+c not in s: return T
+            En=s["Fn"+c].astype(float)
+            return -En if w=="electron flow" else T-En
+        if xy: return comp("x")[idx,:,:-1],comp("y")[idx,:-1,:]
+        return comp("z")[:-1,:,idx].T,comp("y")[:,:-1,idx].T
+    def _flowlines(self,ax,U,V,hx,vy,M,thr,faces=None):
+        """Flowlines of the in-plane map: stream-function contours, so that
+        every line carries the same share of the current (they crowd in a
+        channel or a JFET neck and fan out where the current spreads); when
+        the in-plane current is not divergence-free (current leaving the
+        plane of a 3-D device) evenly spaced streamlines instead."""
+        n=self._nlines(); Mmax=float(np.nanmax(M))
+        if faces is not None:          # the finite-volume fluxes: exact (on the corners of the cells)
+            psi,gx,gy,err=stream_function_faces(faces[0],faces[1],hx,vy); Mc=to_corners(np.nan_to_num(M))
+        else:
+            psi,err=stream_function(U,V,hx,vy); gx,gy,Mc=hx,vy,np.nan_to_num(M)
+        keep=Mc>max(thr,1e-6)*Mmax
+        if err<=0.05:
+            lv=flowline_levels(psi,n,keep)
+            if len(lv):
+                ax.contour(gx,gy,np.ma.masked_where(~keep,psi),levels=lv,colors="white",linewidths=0.8,alpha=0.85,
+                           linestyles="solid")
+            note=f"flowlines: 1/{n} of the in-plane current each"
+        else:
+            G=200; gx=np.linspace(hx[0],hx[-1],G); gy=np.linspace(vy[0],vy[-1],G)
+            Us=_lin_axis(_lin_axis(np.nan_to_num(U),hx,gx,1),vy,gy,0); Vs=_lin_axis(_lin_axis(np.nan_to_num(V),hx,gx,1),vy,gy,0)
+            k2=np.hypot(Us,Vs)>max(thr,1e-6)*Mmax
+            try:
+                ax.streamplot(gx,gy,np.ma.masked_where(~k2,Us),np.ma.masked_where(~k2,Vs),density=max(0.3,n/16.),
+                              color="white",linewidth=0.7,arrowsize=0.8)
+            except Exception: pass
+            note="streamlines (current leaves this plane: not equal-current lines)"
+        ax.text(0.01,0.01,note,transform=ax.transAxes,fontsize=7,color="white",alpha=0.8,va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2",facecolor="black",alpha=0.35,edgecolor="none"))
+
+    # ── animation of the in-plane map (particles along the current) ──
+    def _anim_toggle(self):
+        if self._anim_on: self._anim_stop(); return
+        if self.sol is None:
+            self.sv.set("Solve a device first (▶ Run): the animation follows its current"); return
+        if "map" not in self._vis("tc"): self.pv["tc"]["map"].set(True)
+        self._anim_on=True; self._anim_btn.config(text="■ Stop"); self._anim_t=time.time()
+        self._plot_curr(); self._anim_sched()
+    def _anim_stop(self,redraw=True):
+        self._anim_on=False
+        if self._anim_id is not None:
+            try: self.after_cancel(self._anim_id)
+            except Exception: pass
+            self._anim_id=None
+        try: self._anim_btn.config(text="▶ Animate")
+        except Exception: pass
+        if self._anim_art is not None:
+            try: self._anim_art.remove()
+            except Exception: pass
+        self._anim_art=None; self._anim=None; self._anim_bg=None
+        if redraw: self.cvc.draw_idle()
+    def _anim_sched(self,ms=ANIM_MS):
+        self._anim_id=self.after(ms,self._anim_tick)
+    def _anim_tick(self):
+        self._anim_id=None
+        if not self._anim_on: return
+        try: shown=self.nb.select()==str(self.tc)
+        except Exception: shown=False
+        if not shown or self._anim is None or self._anim_art is None or self._anim_bg is None:
+            self._anim_t=time.time(); self._anim_sched(250); return
+        now=time.time(); dt=min(0.1,max(0.,now-(self._anim_t or now))); self._anim_t=now
+        try:
+            self._anim.step(dt,float(self.cur_spd.get())); self._anim_draw()
+        except Exception: pass
+        self._anim_sched()
+    def _anim_draw(self):
+        seg,f=self._anim.segments()
+        col=np.ones((len(f),4)); col[:,3]=0.95*(1.-f)**1.5
+        self._anim_art.set_segments(seg); self._anim_art.set_color(col)
+        self._anim_art.set_linewidths(0.6+1.6*(1.-f))
+        cv=self.cvc; cv.restore_region(self._anim_bg)
+        self._anim_ax.draw_artist(self._anim_art); cv.blit(self._anim_ax.bbox)
+    def _anim_on_draw(self,ev):
+        """A full redraw (the animated tails are left out of it): keep the map as the background."""
+        if self._anim_ax is None or self._anim_art is None: self._anim_bg=None; return
+        try: self._anim_bg=self.cvc.copy_from_bbox(self._anim_ax.bbox)
+        except Exception: self._anim_bg=None
+    def _anim_build(self,ax,U,V,hx,vy,thr):
+        from matplotlib.collections import LineCollection
+        self._anim=FlowParticles(U,V,hx,vy,thr=thr if thr>0 else 1e-6,n=self._nparticles())
+        self._anim_art=LineCollection([],animated=True,capstyle="round"); ax.add_collection(self._anim_art)
+        self._anim_ax=ax; self._anim_bg=None
+    def _anim_rebuild(self):
+        if self._anim_on: self._debounce('_cur_after_id',self._upd_curr_plot,250)
+    def _anim_gif(self,path=None,frames=90,fps=15):
+        """Save the animated in-plane map (with its labels and colour bar) as a GIF."""
+        if self.sol is None: messagebox.showinfo("Animation","Solve a device first (▶ Run)."); return
+        try: from PIL import Image
+        except ImportError: messagebox.showerror("Animation","Saving a GIF needs Pillow (pip install pillow)."); return
+        if path is None:
+            path=filedialog.asksaveasfilename(defaultextension=".gif",filetypes=[("Animated GIF","*.gif")],
+                                              initialfile=f"{(self.tname or 'device').replace(' ','_')}_current.gif")
+            if not path: return
+        was=self._anim_on
+        if "map" not in self._vis("tc"): self.pv["tc"]["map"].set(True)
+        self._anim_on=True
+        try:
+            self._plot_curr(); self.cvc.draw()
+            if self._anim is None or self._anim_art is None or self._anim_bg is None or self._anim.empty:
+                messagebox.showinfo("Animation","No current to animate in this plane."); return
+            from matplotlib.transforms import Bbox
+            r=self.cvc.get_renderer(); bbs=[self._anim_ax.get_tightbbox(r)]
+            if self._anim_cax is not None: bbs.append(self._anim_cax.get_tightbbox(r))
+            bb=Bbox.union(bbs); buf=np.asarray(self.cvc.buffer_rgba()); H,W=buf.shape[:2]
+            sc=W/float(self.fc.bbox.width)
+            c0,c1=max(0,int(bb.x0*sc)-4),min(W,int(np.ceil(bb.x1*sc))+4)
+            r0,r1=max(0,H-int(np.ceil(bb.y1*sc))-4),min(H,H-int(bb.y0*sc)+4)
+            for _ in range(30): self._anim.step(1./fps,float(self.cur_spd.get()))    # tails formed
+            out=[]
+            for k in range(int(frames)):
+                self._anim.step(1./fps,float(self.cur_spd.get())); self._anim_draw()
+                img=np.asarray(self.cvc.buffer_rgba())[r0:r1,c0:c1,:3].copy()
+                out.append(Image.fromarray(img).convert("P",palette=Image.ADAPTIVE,colors=128))
+                if k%15==0: self.sv.set(f"Writing GIF… frame {k}/{frames}"); self.update_idletasks()
+            out[0].save(path,save_all=True,append_images=out[1:],duration=int(round(1000/fps)),loop=0,disposal=2)
+            self.sv.set(f"Saved the animation ({len(out)} frames) to {path}"); self._log(f"Animation GIF → {path}")
+        finally:
+            if not was: self._anim_stop(redraw=False); self._plot_curr()
+            else: self._anim_t=time.time()
 
     def _struct_plane(self,ax,hx,vy,own2,regs,alpha):
         """The structure in a solution plane: each node in its region's colour,
@@ -8360,7 +9154,8 @@ class App(tk.Tk):
         # the swept terminal's own current is observed (an open-base transistor)
         return dict(V=V,cv=cv,gI=gI,gF=gF,gA=gA,gate=gate,tkey=tkey,fkey=fkey,okey=okey,cand=cand,
                     groups=groups,R=R,models=d.get("models"),bv=d.get("bv",0.),wl=d.get("wl"),
-                    tname=d.get("tname",""),vtc=bool(fkey) and okey!=tkey,T=d.get("T"),vapp=d.get("vapp"))
+                    tname=d.get("tname",""),vtc=bool(fkey) and okey!=tkey,T=d.get("T"),vapp=d.get("vapp"),
+                    cap=d.get("cap"),L=d.get("L"),power=d.get("power") or {},bcs=bcs,cons=d.get("cons"))
 
     @staticmethod
     def _bjt_roles(P):
@@ -8434,6 +9229,8 @@ class App(tk.Tk):
         bj=self._bjt_curves(P) if P is not None else None
         bjp=[(p,self._bjt_curves(Q)) for p,Q in PP]
         if "bjt" in vis and bj is None and not any(g is not None for _,g in bjp): vis=[k for k in vis if k!="bjt"]
+        hascv=lambda Q: Q is not None and "K" in Q["R"] and Q.get("cap") is not None
+        if "cv" in vis and not hascv(P) and not any(hascv(Q) for _,Q in PP): vis=[k for k in vis if k!="cv"]
         if not vis: vis=["lin"]
         axs=row_axes(fig,[(k,1.,None) for k in vis],wspace=0.45)
         for a in axs.values(): a.set_facecolor(C["bg"])
@@ -8469,6 +9266,7 @@ class App(tk.Tk):
             a2.yaxis.set_major_formatter(EngFormatter(places=None,sep=" "))
             a2.set_ylabel("J (A/cm²)",fontsize=8,color=C["sub"]); a2.tick_params(labelsize=7,colors=C["sub"])
         if aB is not None: self._plot_bjt_panel(aB,P,bj,bjp)
+        if axs.get("cv") is not None: self._plot_cv_panel(axs["cv"],P,PP)
         for p,Q in PP:
             tn=Q["tname"] or ""
             par.append(f"── pinned: {p['name']} - sweep of {Q['tkey']}"+(f" ({tn})" if tn and p["name"] not in tn else "")+" ──")
@@ -8664,6 +9462,113 @@ class App(tk.Tk):
                                "high injection sets in")
                 elif j==len(fT)-1:
                     par.append("   f_T still rising at the sweep end - extend the sweep to see its peak")
+        self._iv_params_mos(P,par,aL,put)
+
+    # ── MOSFET on-resistance and capacitances of a sweep record ──
+    @staticmethod
+    def _cell_area(P):
+        """Footprint of the simulated cell (its x-z face, cm2), 0 if unknown."""
+        L=P.get("L")
+        try: return float(L[0])*float(L[2])*1e-14 if L else 0.
+        except Exception: return 0.
+    def _cap_scale(self,P):
+        """F per cell -> the shown unit: pF of the die (active area set), nF/cm2 of
+        the cell footprint, or pF per cell."""
+        Afp=self._cell_area(P); ar=float((P.get("power") or {}).get("area",0.) or 0.)
+        if Afp>0 and ar>0: return ar*1e-2/Afp*1e12,f"pF, die {ar:g} mm²"
+        if Afp>0: return 1e9/Afp,"nF/cm²"
+        return 1e12,"pF per cell"
+    def _iv_params_mos(self,P,par,aL,put):
+        V,cv,gI,gF,gate=P["V"],P["cv"],P["gI"],P["gF"],P["gate"]
+        tkey,okey=P["tkey"],P["okey"]; vapp=P.get("vapp"); gd=dict(P["groups"])
+        Afp=self._cell_area(P); pw=P.get("power") or {}
+        ar=float(pw.get("area",0.) or 0.); rsp=float(pw.get("rsp",0.) or 0.); rpkg=float(pw.get("rpkg",0.) or 0.)
+        vk=(lambda k: float(np.mean([vapp[c] for c in gd[k]]))) if vapp else None
+        gates=[k for k in gd if gate.get(k)]
+        def ron_out(R,how):
+            """R_DS(on) per cell (ohm) -> text lines and table entries (specific, die)."""
+            par.append(f"R_DS(on) = {R:.4g} Ω per cell ({how})"); put("R_DS(on) (per cell)",float(R),"Ω","r")
+            if Afp>0:
+                Rsp=R*Afp*1e3                                  # mOhm cm2
+                par.append(f"   specific R_on,sp = {Rsp:.4g} mΩ·cm² (cell footprint {Afp*1e8:.4g} µm²)"
+                           +(f"; + {rsp:g} outside = {Rsp+rsp:.4g} mΩ·cm²" if rsp>0 else ""))
+                put("R_on,sp (cell)",float(Rsp),"mΩ·cm²","r")
+                if ar>0:
+                    Rd=(Rsp+rsp)/(ar*1e-2)+rpkg                # mOhm
+                    par.append(f"   die R_DS(on) = {Rd:.4g} mΩ (active area {ar:g} mm²"+(f", package {rpkg:g} mΩ" if rpkg>0 else "")+")")
+                    put("R_DS(on) (die)",float(Rd),"mΩ","r")
+        # output curve (drain swept from ~0 with the gate on): slope at V_DS -> 0
+        if tkey==okey and gates and not gate.get(tkey) and vk is not None and len(V)>=2:
+            src=[k for k in gd if k!=tkey and not gate.get(k)]
+            if src:
+                V0=float(np.mean([vk(k) for k in src])); Vgs=float(np.mean([vk(k) for k in gates]))-V0
+                span=float(np.nanmax(np.abs(V-V0)))
+                if abs(Vgs)>=0.1 and span>0 and float(np.nanmin(np.abs(V-V0)))<=0.2*span:
+                    r=rdson_lin(V,gI[okey],cv&(np.abs(gI[okey])>=gF[okey]),V0=V0)
+                    if r is not None and r[0]>0 and np.isfinite(r[0]):
+                        ron_out(r[0],f"slope of the output curve at V_DS → 0, {r[1]} points, V_GS = {Vgs:g} V"
+                                     +(f", T = {P['T']:g} K" if P.get("T") else ""))
+        # transfer curve at a small drain voltage: V_DS / I_D at the highest gate voltage
+        if gate.get(tkey) and not gate.get(okey) and vk is not None:
+            src=[k for k in gd if k not in (tkey,okey) and not gate.get(k)]
+            ok=cv&(np.abs(gI[okey])>=gF[okey])&(np.abs(gI[okey])>0)
+            if src and ok.any():
+                Vds=vk(okey)-float(np.mean([vk(k) for k in src]))
+                j=int(np.argmax(np.where(ok,np.abs(V),-1.)))
+                if 0<abs(Vds)<=2.:
+                    ron_out(abs(Vds/gI[okey][j]),f"V_DS / I_D at V_DS = {Vds:g} V, V_G = {V[j]:g} V"
+                                                 +(f", T = {P['T']:g} K" if P.get("T") else ""))
+        # capacitances (quasi-static C-V)
+        R=P["R"]; cap=P.get("cap")
+        if "K" not in R or cap is None: return
+        cs=cv_curves(cap,R["K"]); ok=cv&np.all(np.isfinite(np.asarray(R["K"]).reshape(len(V),-1)),axis=1) if len(V) else cv
+        if not ok.any(): return
+        fac,un=self._cap_scale(P)
+        meet=np.asarray(R.get("capm",[]),float); rec=np.asarray(R.get("capr",[]),float); neu=np.asarray(R.get("capn",[]),float)
+        srcv=None
+        if cap.get("kind")=="mos" and vk is not None:
+            src=[c for c in cap["groups"][2][1]]; srcv=float(np.mean([vapp[c] for c in src]))
+        V0=srcv if srcv is not None else float(V[ok][0])
+        o=np.argsort(np.abs(V[ok]-V0)); Vs=V[ok][o]; j0,j1=0,len(Vs)-1
+        def at(name,j): return float(cs[name][ok][o][j])
+        names=["C_iss","C_oss","C_rss"] if cap.get("kind")=="mos" else ["C"]
+        for nm in names:
+            a,b=at(nm,j0),at(nm,j1)
+            par.append(f"{nm} = {a*fac:.4g} {un} at V = {Vs[j0]:g} V, {b*fac:.4g} {un} at {Vs[j1]:g} V")
+            put(f"{nm} at the sweep end",float(b*fac),un,"r"); put(f"{nm} at the sweep start",float(a*fac),un,"r")
+        if cap.get("kind")=="mos":
+            m=oss_metrics(Vs,cs["C_oss"][ok][o],V0=V0)
+            if m is not None and abs(Vs[0]-V0)<=0.02*max(abs(Vs[-1]-V0),1e-9):
+                Vr=m["u"][-1]
+                par.append(f"Output charge from 0 to {Vr:g} V: Q_oss = {m['Q'][-1]*fac:.4g} {un}·V, "
+                           f"E_oss = {m['E'][-1]*fac:.4g} {un}·V², C_o(tr) = {m['Ctr'][-1]*fac:.4g} {un}, "
+                           f"C_o(er) = {m['Cer'][-1]*fac:.4g} {un}")
+                put("C_o(tr) (same charging time)",float(m["Ctr"][-1]*fac),un,"r")
+                put("C_o(er) (same stored energy)",float(m["Cer"][-1]*fac),un,"r")
+        bad=int(np.sum(meet[ok]>0)) if len(meet)==len(V) else 0
+        q=[]
+        if len(rec)==len(V) and np.isfinite(rec[ok]).any(): q.append(f"reciprocity C_gd/C_dg within {np.nanmax(rec[ok]):.1e}")
+        if len(neu)==len(V) and np.isfinite(neu[ok]).any(): q.append(f"charge conservation {np.nanmax(neu[ok]):.1e}")
+        par.append("   quasi-static capacitances ("+", ".join(q)+")"+
+                   (f"; at {bad} points a terminal's domain touches another (a channel is on): the split of "
+                    "its charge is approximate" if bad else "; off state everywhere: exact at low frequency"))
+    def _plot_cv_panel(self,ax,P,PP):
+        """Capacitance-voltage curves of the last sweep and of pinned sweeps (log axis)."""
+        cols={"C_iss":"#38bdf8","C_oss":"#4ade80","C_rss":"#f472b6","C":"#38bdf8"}
+        un=None; tk_=None
+        def draw(Q,style,col=None,pref=""):
+            nonlocal un,tk_
+            R=Q["R"]; cap=Q.get("cap")
+            if "K" not in R or cap is None or not len(Q["V"]): return
+            fac,u=self._cap_scale(Q); un=un or u; tk_=tk_ or Q["tkey"]
+            for k,y in cv_curves(cap,R["K"]).items():
+                if k not in cols: continue
+                y=np.abs(np.asarray(y,float))*fac; m=Q["cv"]&np.isfinite(y)&(y>0)
+                if m.any(): ax.semilogy(Q["V"][m],y[m],color=col or cols[k],label=pref+k,**style)
+        if P is not None: draw(P,dict(lw=2,marker="o",ms=3))
+        for p,Q in PP: draw(Q,dict(lw=1.4,ls="--",marker="o",ms=2.5),p["color"],f"{p['name']}: ")
+        sax(ax,f"V({tk_ or ''}) (V)",f"C ({un or 'pF'})","Capacitances (quasi-static)")
+        if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=7)
 
     def _plot_bjt_panel(self,ax,P,bj,bjp):
         """β (left axis) and f_T (right axis) against I_C, log scale."""
@@ -9012,6 +9917,9 @@ class App(tk.Tk):
             cols.append(R["I"][:,c]); hdr.append(f"I_{l}_A")
         for c,l in enumerate(labs):
             cols.append(R["F"][:,c]); hdr.append(f"floor_{l}_A")
+        if "K" in R and d.get("cap"):                       # quasi-static capacitances, F per cell
+            for k,y in cv_curves(d["cap"],R["K"]).items():
+                cols.append(np.asarray(y,float)); hdr.append(f"{k}_F_per_cell")
         np.savetxt(p,np.column_stack(cols),delimiter=",",fmt="%.8e",comments="",
                    header=",".join(h.replace(",",";") for h in hdr))
         self.sv.set(f"Sweep → {p}"); self._log(f"Sweep exported to {p}")
@@ -9045,7 +9953,8 @@ class App(tk.Tk):
                    mesh=dict(type=self.mesh_type.get(),prism_axis=self.prism_ax.get(),amr=self.amr_nodes or {}),
                    sweep=dict(tgt=self._gmap.get(self.iv_tgt.get()),flt=self._gmap.get(self.iv_flt.get()),
                               out=self._gmap.get(self.iv_out.get()),Vs=self.ivS.get(),Ve=self.ivE.get(),
-                              N=self.ivN.get(),bv=self.bv_thr.get()),
+                              N=self.ivN.get(),bv=self.bv_thr.get(),cap=bool(self.iv_cap.get())),
+                   power=dict(area=self._fnum(self.pw_area),rsp=self._fnum(self.pw_rsp),rpkg=self._fnum(self.pw_rpkg)),
                    solver=dict(T=self.T.get(),max_p=self.max_p.get(),max_c=self.max_c.get(),max_g=self.max_g.get(),
                                tol_p=self.tol_p.get(),tol_c=self.tol_c.get(),bgn=self.m_bgn.get(),
                                tau=self.m_tau.get(),vsat=self.m_vsat.get(),qc=self.m_qc.get(),
@@ -9089,6 +9998,10 @@ class App(tk.Tk):
         self.regs,self.cons,self.sheets,self.defects=regs,cons,sheets,defects
         sw=d.get("sweep",{})
         self.ivS.set(sw.get("Vs",0.)); self.ivE.set(sw.get("Ve",1.)); self.ivN.set(sw.get("N",11)); self.bv_thr.set(sw.get("bv",0.))
+        self.iv_cap.set(bool(sw.get("cap",False)))
+        pw=d.get("power") or {}
+        self.pw_area.set(float(pw.get("area",0.) or 0.)); self.pw_rsp.set(float(pw.get("rsp",0.) or 0.))
+        self.pw_rpkg.set(float(pw.get("rpkg",0.) or 0.))
         so=d.get("solver",{})
         for v,k in ((self.T,"T"),(self.max_p,"max_p"),(self.max_c,"max_c"),(self.max_g,"max_g"),
                     (self.tol_p,"tol_p"),(self.tol_c,"tol_c"),(self.m_bgn,"bgn"),(self.m_tau,"tau"),(self.m_vsat,"vsat"),

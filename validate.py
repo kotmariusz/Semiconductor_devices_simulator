@@ -1257,18 +1257,132 @@ def s18_parameters_analysis():
     check(18, "subthreshold swing 75 mV/dec with a noisy resolution floor", sw["SS"] if sw else float("nan"), 75., 0.01)
 
 
+def _mos_cap(Na_cm3=1e17, tox=10e-9, phim=4.05):
+    """1-D MOS capacitor (p-Si, face gate) as in section 6: (x, ys, gate id, Cox, ni)."""
+    x = geo_grid(1.5e-6, 0.1e-9, 1.06, 20e-9); Nx = len(x); ys = np.linspace(0, 20e-9, 3)
+    M.api_init(); M.api_gridc(Nx, 3, 3, (D3 * Nx)(*x), (D3 * 3)(*ys), (D3 * 3)(*ys)); M.api_solver(*SOLV)
+    L.api3_set_models(0)
+    si = M.api_addmat(0, 300.0); M.api_region(0, 0, 0, Nx - 1, 2, 2, si, 0.0, Na_cm3 * 1e6)
+    M.api_clrcon()
+    g = L.api3_add_contact_ex(0, 0, 2, 0, 2, 0, 0, 2, 0.0, phim, tox, 0.0)
+    L.api3_add_contact_ex(1, 0, 2, 0, 2, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    L.api3_solve()
+    return x, ys, g, 3.9 * EPS0 / tox, L.api3_mat_ni(0)
+
+
+def s19_mosfet_analysis():
+    print("19. Capacitance (quasi-static C-V), on-resistance, Joule breakdown, current flowlines")
+    EPS = 11.7 * EPS0
+    # abrupt symmetric junction: C = sqrt(q eps N_eff / 2 (Vbi + VR - 2kT/q)) per area
+    Na = Nd = 1e16; Lnm = 12000.; xs = np.linspace(0, Lnm * 1e-9, 961)
+    cons = [M.Con(0, 0, 1, 0, 1, 0, label="anode"), M.Con(1, 0, 1, 0, 1, 0, label="cathode")]
+    for VR in (0.0, 1.0, 10.0):
+        stack1d([(0, Lnm / 2, "Si", 0, Na), (Lnm / 2, Lnm, "Si", Nd, 0)], xs, [(0, 0, -VR, 0.0), (1, 0, 0.0, 0.0)])
+        L.api3_solve(); ni = L.api3_mat_ni(0)
+        r = M.cap_matrix(cons, M.con_groups(cons), vapp=[-VR, 0.], dV=5e-3)
+        Vbi = VT * np.log(Na * Nd * 1e12 / ni ** 2); Neff = 0.5 * Na * 1e6
+        Cth = np.sqrt(Q * EPS * Neff / (2 * (Vbi + VR - 2 * VT)))
+        check(19, f"junction capacitance at VR = {VR:g} V vs depletion formula", r["K"][0, 0] / M.api_conA(0), Cth, 1e-3)
+        if VR == 10.0:
+            check(19, "junction: charge conservation (column sums of dQ/dV)", r["neutral"], 0., 1e-9, "range")
+            check(19, "junction: reciprocity C_ac = C_ca", abs(r["K"][0, 1] / r["K"][1, 0] - 1), 0., 1e-6, "range")
+    # MOS capacitor: low-frequency C-V against the exact Poisson-Boltzmann surface charge
+    Nam = 1e17 * 1e6; tox = 10e-9
+    x, ys, g, Cox, ni = _mos_cap()
+    Eg = 1.170 - 4.73e-4 * 300 ** 2 / 936.; Ws = 4.05 + Eg - VT * np.log(3.10e25 / Nam)
+    VFB = 4.05 - Ws; phiF = VT * np.log(Nam / ni); VTth = VFB + 2 * phiF + np.sqrt(4 * EPS * Q * Nam * phiF) / Cox
+    def Qs(psi):
+        u = psi / VT; F = np.sqrt(max((np.exp(-u) + u - 1) + (ni / Nam) ** 2 * (np.exp(u) - u - 1), 0.))
+        return -np.sign(psi) * np.sqrt(2 * EPS * VT * Q * Nam) * F
+    def Cs(psi, h=1e-5):
+        return EPS / np.sqrt(EPS * VT / (Q * Nam)) if abs(psi) < 1e-4 else -(Qs(psi + h) - Qs(psi - h)) / (2 * h)
+    mos = [M.Con(0, 0, 1, 0, 1, 2, label="gate"), M.Con(1, 0, 1, 0, 1, 0, label="bulk")]
+    for VG, what in ((VFB - 1.0, "accumulation"), (VFB, "flat band"), (VFB + 0.5, "depletion"), (VTth + 1.0, "inversion")):
+        L.api3_set_contact_V(g, VG); L.api3_resolve()
+        phi = line(PHI, x, ys, ys); psis = phi[0] - phi[-1]
+        r = M.cap_matrix(mos, M.con_groups(mos), vapp=[VG, 0.], dV=5e-3)
+        check(19, f"MOS C/Cox in {what} vs exact low-frequency curve", r["K"][0, 0] / M.api_conA(0) / Cox,
+              1 / (1 + Cox / Cs(psis)), 1e-3)
+        if what == "depletion":
+            Eox = M.api_insE((D3 * 3)())
+            check(19, "largest oxide field = |Q_s| / eps_ox in depletion (Gauss)", Eox, abs(Qs(psis)) / (3.9 * EPS0), 1e-3)
+        if what == "inversion":
+            check(19, "MOS inversion layer belongs to the bulk (charge conservation)", r["neutral"], 0., 1e-9, "range")
+    # output-charge quantities of an analytic C(V) = C0 / sqrt(1 + V/Vb)
+    C0, Vb = 1e-12, 0.7; Vv = np.linspace(0, 400, 4001); Cv = C0 / np.sqrt(1 + Vv / Vb); U = 1 + 400 / Vb
+    m = M.oss_metrics(Vv, Cv, V0=0.)
+    Qth = 2 * C0 * Vb * (np.sqrt(U) - 1); Eth = C0 * Vb ** 2 * ((2 / 3) * (U ** 1.5 - 1) - 2 * (np.sqrt(U) - 1))
+    check(19, "C_o(tr) = Q_oss / V of an analytic C(V)", m["Ctr"][-1], Qth / 400, 1e-4)
+    check(19, "C_o(er) = 2 E_oss / V^2 of an analytic C(V)", m["Cer"][-1], 2 * Eth / 400 ** 2, 1e-4)
+    # resistor bar: on-resistance from the slope of I(V), and the Joule share of two regions
+    L1 = 10000.; xs = np.linspace(0, L1 * 1e-9, 401)
+    bar = [M.Con(0, 0, 1, 0, 1, 0, label="a"), M.Con(1, 0, 1, 0, 1, 0, label="b")]
+    stack1d([(0, L1, "Si", 1e16, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)]); L.api3_solve()
+    Rw = M.run_sweep(bar, [0], 0.0, 0.05, 3, vapp=[0., 0.])
+    R1 = M.rdson_lin(Rw["V"], -Rw["I"][:, 1], Rw["conv"])[0]
+    mu = _mob_core("Si", 1e16, "n") * 1e-4
+    stack1d([(0, L1, "Si", 1e16, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)]); L.api3_solve()
+    A = M.api_conA(0)
+    check(19, "R_DS(on)-style slope of a resistor bar = L / (q mu N A)", abs(R1), L1 * 1e-9 / (Q * mu * 1e22 * A), 1e-3)
+    stack1d([(0, L1 / 2, "Si", 1e16, 0), (L1 / 2, L1, "Si", 1e17, 0)], xs, [(0, 0, 0.05, 0.0), (1, 0, 0.0, 0.0)])
+    L.api3_solve(); s = M.pull(); I0 = abs(s["I"][0])
+    regs = [M.Reg("Si", 0, 0, 0, L1 / 2, 1e9, 1e9, "n", 1e16), M.Reg("Si", L1 / 2, 0, 0, L1, 1e9, 1e9, "n", 1e17)]
+    own = M.owner_grid(regs, s["x"] * 1e-9, s["y"] * 1e-9, s["z"] * 1e-9)
+    b = M.joule_breakdown(s, own, 2)
+    mu2 = _mob_core("Si", 1e17, "n") * 1e-4
+    stack1d([(0, L1 / 2, "Si", 1e16, 0), (L1 / 2, L1, "Si", 1e17, 0)], xs, [(0, 0, 0.05, 0.0), (1, 0, 0.0, 0.0)])
+    L.api3_solve()
+    for k, (N, mk) in enumerate(((1e16, mu), (1e17, mu2))):
+        check(19, f"Joule share P/I^2 of the {N:.0e} half vs L / (q mu N A)", b["P"][k] / I0 ** 2,
+              L1 / 2 * 1e-9 / (Q * mk * N * 1e6 * A), 0.02)
+    check(19, "Joule power in the bar / terminal power V.I", b["Ptot"] / (0.05 * I0), 1.0, 2e-3)
+    # VDMOS (IRLZ44N-like): off-state capacitances, flowlines from the face currents
+    t = M.TEMPLATES["RW: Si MOSFET 55V (IRLZ44N)"](); cons = t["cons"]
+    G = [k for k, c in enumerate(cons) if c.bc == 2]; Dn = [k for k, c in enumerate(cons) if c.label == "Drain"]
+    S = [k for k in range(len(cons)) if k not in G + Dn]
+    M.setup_device(t, models=t.get("models", M.M_DEFAULT)); ok = M.api_solve(); s = M.pull()
+    psi, ch, cvv, err = M.stream_function_faces(s["Fx"][1, :, :-1], s["Fy"][1, :-1, :], s["x"], s["y"])
+    check(19, "VDMOS flowlines: stream function range x width = drain current", np.ptp(psi) * t["Lz"] * 1e-7,
+          abs(s["I"][Dn[0]]), 1e-4)
+    check(19, "VDMOS flowlines: path independence of the stream function", err, 0., 1e-5, "range")
+    vapp = [c.V for c in cons]
+    for c in G: vapp[c] = 0.; M.api_setV(c, 0.)
+    Cg = []
+    for VD in (1.0, 10.0):
+        for c in Dn: vapp[c] = VD; M.api_setV(c, VD)
+        M.api_resolve()
+        r = M.cap_matrix(cons, [("G", G), ("D", Dn), ("S", S)], vapp=vapp, ref=2); Cg.append(r)
+    r = Cg[1]
+    check(19, "VDMOS off state: every domain belongs to one terminal (exact C)", float(r["meet"]), 0., 0., "range")
+    check(19, "VDMOS off state: reciprocity C_gd = C_dg", r["recip"], 0., 1e-3, "range")
+    check(19, "VDMOS off state: charge conservation", r["neutral"], 0., 1e-8, "range")
+    check(19, "VDMOS C_oss falls from 1 V to 10 V (drain depletion widens)", Cg[1]["K"][1, 1] / Cg[0]["K"][1, 1], 0., 0.5, "range")
+    # particles follow the field: solid-body rotation keeps their radius
+    gg = np.linspace(-1, 1, 101); X, Y = np.meshgrid(gg, gg)
+    fp = M.FlowParticles(-Y, X, gg, gg, thr=1e-3, n=200, G=200, seed=3); fp.life[:] = 1e9
+    P0 = fp.to_data(fp.P); r0 = np.hypot(*P0.T)
+    for _ in range(100): fp.step(0.02, 1.0)
+    r1 = np.hypot(*fp.to_data(fp.P).T); kk = (r0 < 0.9) & (r1 < 0.95)
+    check(19, "animation particles stay on their current line (rotation, radius change)",
+          float(np.max(np.abs(r1 - r0)[kk] / r0[kk])), 0., 2e-3, "range")
+    # band-tail D_it (4H-SiC/SiO2): the levels hold D_edge * E_t of acceptor states
+    lv = M.SD.dit_levels(5.7e13, 1e-15, 3.23, tail=0.067)
+    check(19, "D_it band tail: total acceptor states = D_edge E_t (1 - e^-8)", sum(n for _, n in lv),
+          5.7e13 * 0.067 * (1 - np.exp(-8.)), 2e-2)
+
+
 SECTIONS = {1: s1_equilibrium, 2: s2_reverse, 3: s3_forward, 4: s4_sic_blocking, 5: s5_hetero,
             6: s6_mos, 7: s7_nmos, 8: s8_bjt, 9: s9_templates, 10: s10_cmos_finfet,
             11: s11_tunnelling, 12: s12_mlda_lombardi, 13: s13_prism_mesh, 14: s14_metal_contacts,
             15: s15_defects, 16: s16_amr_predictor, 17: s17_avalanche_bjt,
-            18: s18_parameters_analysis}
+            18: s18_parameters_analysis, 19: s19_mosfet_analysis}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", default="", help="comma-separated section numbers")
     ap.add_argument("--templates", action="store_true", help="also run section 9 (all GUI templates)")
     a = ap.parse_args()
-    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18] + ([9] if a.templates else [])
+    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] + ([9] if a.templates else [])
     T0 = time.time()
     for s in sel:
         t = time.time(); SECTIONS[s](); print(f"   ({time.time()-t:.1f} s)\n")

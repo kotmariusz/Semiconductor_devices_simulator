@@ -4701,6 +4701,200 @@ void api3_carrier_sums(double *out){
     }
     out[0]=sn; out[1]=sp;
 }
+/* ------------------------------------------- terminal charges (C-V)
+   Quasi-static capacitances C_ij = dQ_i/dV_j need the charge of every
+   terminal.  The nodes are first split into terminals: every contact node
+   belongs to its terminal (cterm[contact], -1 = none); from the nodes of
+   ohmic contacts (not gates, not metal / Schottky contacts, whose
+   semiconductor side is a barrier) each terminal spreads through the
+   semiconductor nodes of the same majority carrier (n >= p: electrons) and
+   through metal - all terminals at once, so a domain that touches two
+   terminals (a channel that is on) is split where their fronts meet.  The
+   number of such meeting edges is returned: 0 = every domain belongs to one
+   terminal (the off state, where the capacitances are exact and reciprocal).
+   Semiconductor that no ohmic contact reaches this way (an inversion layer
+   with no source: its carriers come from the bulk) joins the terminal next
+   to it; insulators and isolated regions belong to no terminal.
+   The charge of a terminal is then Gauss's law for its node set: the flux of
+   D out of it (C), i.e. electrode charge plus the space charge it holds -
+   no sum of large, nearly cancelling node charges.  A face (Robin) gate's
+   charge is the oxide flux C_ox (V_G' - psi) of its nodes. */
+static int *g_qown=NULL; static size_t g_qN=0; static int g_qct[NC_MAX];
+static inline int qtype(const Dev *d, size_t k){ return d->n[k]>=d->p[k] ? 1 : -1; }
+static int qdeg(const Dev *d){
+    if(!d->unstr) return 6;
+    int g=1; size_t N=NN(d);
+    for(size_t k=0;k<N;k++){ int m=d->grp[k+1]-d->grp[k]; if(m>g) g=m; }
+    return g;
+}
+/* neighbours of k with their Poisson coupling eps A / h (F) and spacing h */
+static int qnbrs(const Dev *d, size_t k, size_t *nb, double *cf, double *hh){
+    int m=0;
+    if(d->unstr){
+        for(int e=d->grp[k];e<d->grp[k+1];e++){
+            size_t kb=d->gcol[e]; double ek=d->eps[k], eb=d->eps[kb];
+            nb[m]=kb; cf[m]=(2.*ek*eb/(ek+eb))*d->ga[e]/d->gh[e]; hh[m]=d->gh[e]; m++;
+        }
+        return m;
+    }
+    int i,j,l; unidx(d,k,&i,&j,&l);
+    for(int dir=0;dir<6;dir++){
+        size_t kb; double h,ar;
+        if(!nbr(d,i,j,l,dir,&kb,&h,&ar)) continue;
+        double ek=d->eps[k], eb=d->eps[kb];
+        nb[m]=kb; cf[m]=(2.*ek*eb/(ek+eb))*ar/h; hh[m]=h; m++;
+    }
+    return m;
+}
+int api3_charge_partition(const int *cterm){
+    Dev *d=&gdev;
+    if(!d->allocated || !d->have_solution || !cterm) return -1;
+    size_t N=NN(d);
+    if(g_qN!=N){
+        free(g_qown); g_qown=(int*)malloc(N*sizeof(int)); g_qN = g_qown ? N : 0;
+        if(!g_qown) return -1;
+    }
+    int deg=qdeg(d);
+    size_t *qu=(size_t*)malloc(N*sizeof(size_t)), *nb=(size_t*)malloc(deg*sizeof(size_t));
+    double *cf=(double*)malloc(deg*sizeof(double)), *hh=(double*)malloc(deg*sizeof(double));
+    if(!qu||!nb||!cf||!hh){ free(qu); free(nb); free(cf); free(hh); return -1; }
+    for(int c=0;c<NC_MAX;c++) g_qct[c] = c<d->n_cons ? cterm[c] : -1;
+    size_t qh=0, qt=0; int meet=0;
+    for(size_t k=0;k<N;k++){
+        g_qown[k]=-1;
+        int c=d->con_mask[k]-1;
+        if(c<0 || c>=d->n_cons) continue;
+        int t=cterm[c]; g_qown[k]=t;
+        const Con *cn=&d->cons[c];
+        if(t>=0 && cn->bc==0 && !cn->te && (d->kind[k]==K_SEMI || d->kind[k]==K_METAL)) qu[qt++]=k;
+    }
+    while(qh<qt){
+        size_t k=qu[qh++]; int t=g_qown[k];
+        int m=qnbrs(d,k,nb,cf,hh);
+        for(int e=0;e<m;e++){
+            size_t b=nb[e];
+            if(d->con_mask[b]) continue;
+            int ok = d->kind[k]==K_METAL ? d->kind[b]==K_METAL
+                   : (d->kind[k]==K_SEMI && d->kind[b]==K_SEMI && qtype(d,b)==qtype(d,k));
+            if(!ok) continue;
+            if(g_qown[b]<0){ g_qown[b]=t; qu[qt++]=b; }
+            else if(g_qown[b]!=t) meet++;
+        }
+    }
+    /* second pass: semiconductor left over - a region of minority carriers
+       with no contact of its own, e.g. the inversion layer of a MOS
+       capacitor, whose electrons the bulk supplies in steady state - joins
+       the terminal next to it (fronts from every owned semiconductor node) */
+    qh=qt=0;
+    for(size_t k=0;k<N;k++) if(g_qown[k]>=0 && d->kind[k]==K_SEMI) qu[qt++]=k;
+    while(qh<qt){
+        size_t k=qu[qh++]; int t=g_qown[k];
+        int m=qnbrs(d,k,nb,cf,hh);
+        for(int e=0;e<m;e++){
+            size_t b=nb[e];
+            if(d->con_mask[b] || d->kind[b]!=K_SEMI || g_qown[b]>=0) continue;
+            g_qown[b]=t; qu[qt++]=b;
+        }
+    }
+    free(qu); free(nb); free(cf); free(hh);
+    return meet;
+}
+/* Qt[0..nt-1]: charge of each terminal (C per simulated cell) for the
+   partition of the last api3_charge_partition call; Qt[nt]: the flux into the
+   nodes of no terminal (their charge, sign reversed).  1 = done. */
+int api3_terminal_charges(int nt, double *Qt){
+    Dev *d=&gdev; size_t N=NN(d);
+    if(!d->allocated || !d->have_solution || !g_qown || g_qN!=N || nt<=0 || !Qt) return 0;
+    for(int t=0;t<=nt;t++) Qt[t]=0.;
+    int deg=qdeg(d);
+    size_t *nb=(size_t*)malloc(deg*sizeof(size_t));
+    double *cf=(double*)malloc(deg*sizeof(double)), *hh=(double*)malloc(deg*sizeof(double));
+    if(!nb||!cf||!hh){ free(nb); free(cf); free(hh); return 0; }
+    for(size_t k=0;k<N;k++){                 /* serial: the same bits on every run */
+        int t=g_qown[k]; if(t<0 || t>=nt) continue;
+        int m=qnbrs(d,k,nb,cf,hh);
+        for(int e=0;e<m;e++){
+            size_t b=nb[e]; int tb=g_qown[b];
+            if(tb==t) continue;
+            double f=cf[e]*(d->phi[k]-d->phi[b]);
+            Qt[t]+=f; if(tb<0 || tb>=nt) Qt[nt]+=f;
+        }
+    }
+    for(int r=0;r<d->n_rob;r++){              /* face gates: D through the oxide */
+        size_t k=d->rob_k[r]; int c=d->rob_c[r]; const Con *cn=&d->cons[c];
+        double Cox=EPS_OX/(cn->tox>0.?cn->tox:10e-9);
+        double pm = cn->phi_m>0. ? cn->phi_m : d->Cref;
+        double f=d->rob_A[r]*Cox*(d->phi[k]-(cn->V+d->Cref-pm));   /* out of the semiconductor */
+        int t=g_qown[k], tg=(c>=0 && c<NC_MAX)? g_qct[c] : -1;
+        if(t>=0 && t<nt) Qt[t]+=f;
+        if(tg>=0 && tg<nt) Qt[tg]-=f;
+    }
+    free(nb); free(cf); free(hh);
+    return 1;
+}
+/* Current density (A/m^2) through the face from node k to its + neighbour
+   along axis ax (0 x, 1 y, 2 z) - the finite-volume fluxes themselves,
+   which balance exactly at every node (a stream function built from them
+   gives equal-current flowlines); carrier 0: total, 1: electrons.  Faces
+   that do not exist (the last node of a line, a non-semiconductor end)
+   carry 0.  Tensor mesh only: returns 0 on a prism mesh. */
+int api3_face_J(int ax, int carrier, double *out){
+    Dev *d=&gdev;
+    if(!d->allocated || !d->have_solution || !out || ax<0 || ax>2) return 0;
+    if(d->unstr) return 0;
+    const int Nx=d->Nx,Ny=d->Ny,Nz=d->Nz;
+    #pragma omp parallel for collapse(2) schedule(static) if(NN(d)>PAR_MIN)
+    for(int l=0;l<Nz;l++) for(int j=0;j<Ny;j++) for(int i=0;i<Nx;i++){
+        size_t k=IDX(i,j,l,Nx,Ny), kb; double h,ar,Jn,Jp,Sn,Sp;
+        out[k]=0.;
+        if(d->kind[k]!=K_SEMI || !nbr(d,i,j,l,2*ax+1,&kb,&h,&ar) || d->kind[kb]!=K_SEMI) continue;
+        face_flux(d,k,kb,h,ar,&Jn,&Jp,&Sn,&Sp);
+        out[k]=(carrier? Jn : Jn+Jp)/ar;
+    }
+    return 1;
+}
+/* terminal of every node in the last partition (-1 = none); 1 = done */
+int api3_charge_owner(int *out){
+    Dev *d=&gdev; size_t N=NN(d);
+    if(!g_qown || g_qN!=N || !out) return 0;
+    memcpy(out,g_qown,N*sizeof(int)); return 1;
+}
+/* Largest electric field in the insulators (V/m), e.g. a gate oxide: over
+   the edges joining two non-semiconductor nodes of which one at least is an
+   insulator, and over the oxide of every face (Robin) gate; pos (m): where. */
+double api3_ins_field_max(double *pos){
+    Dev *d=&gdev; double best=0.;
+    if(pos){ pos[0]=pos[1]=pos[2]=NAN; }
+    if(!d->allocated || !d->have_solution) return NAN;
+    size_t N=NN(d); int deg=qdeg(d); size_t kbest=(size_t)-1;
+    size_t *nb=(size_t*)malloc(deg*sizeof(size_t));
+    double *cf=(double*)malloc(deg*sizeof(double)), *hh=(double*)malloc(deg*sizeof(double));
+    if(!nb||!cf||!hh){ free(nb); free(cf); free(hh); return NAN; }
+    for(size_t k=0;k<N;k++){
+        if(d->kind[k]==K_SEMI) continue;
+        int m=qnbrs(d,k,nb,cf,hh);
+        for(int e=0;e<m;e++){
+            size_t b=nb[e];
+            if(b<k || d->kind[b]==K_SEMI) continue;
+            if(d->kind[k]!=K_INS && d->kind[b]!=K_INS) continue;
+            double F=fabs(d->phi[b]-d->phi[k])/hh[e];
+            if(F>best){ best=F; kbest = d->kind[k]==K_INS ? k : b; }
+        }
+    }
+    for(int r=0;r<d->n_rob;r++){
+        size_t k=d->rob_k[r]; const Con *cn=&d->cons[d->rob_c[r]];
+        double tox = cn->tox>0. ? cn->tox : 10e-9;
+        double pm = cn->phi_m>0. ? cn->phi_m : d->Cref;
+        double F=fabs(d->phi[k]-(cn->V+d->Cref-pm))/tox;
+        if(F>best){ best=F; kbest=k; }
+    }
+    if(pos && kbest!=(size_t)-1){
+        if(d->unstr){ pos[0]=d->gpos[3*kbest]; pos[1]=d->gpos[3*kbest+1]; pos[2]=d->gpos[3*kbest+2]; }
+        else { int i,j,l; unidx(d,kbest,&i,&j,&l); pos[0]=d->xs[i]; pos[1]=d->ys[j]; pos[2]=d->zs[l]; }
+    }
+    free(nb); free(cf); free(hh);
+    return best;
+}
 double api3_get_phi(int k){ return node_val(&gdev,0,(size_t)k); }
 double api3_get_n(int k)  { return node_val(&gdev,1,(size_t)k); }
 double api3_get_p(int k)  { return node_val(&gdev,2,(size_t)k); }

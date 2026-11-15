@@ -81,6 +81,44 @@ try:
         app.cur_n2d.set(22); app._arrows_changed(); pump(0.4)
     step("Current tab arrow density", arrows)
 
+    def flow():                                  # what flows, threshold, flowlines, log map, animation, GIF
+        app.nb.select(app.tc); pump(0.4)
+        for fld in M.CUR_FIELDS:
+            app.cur_field.set(fld); app.cur_thr.set("1 %"); app.cur_lines.set(True); app.cur_log.set(True)
+            app._upd_curr_plot(); pump(0.5)
+            maps = [a for a in app.fc.axes if "plane" in a.get_title()]
+            assert maps and any("flowlines" in t.get_text() or "streamlines" in t.get_text() for t in maps[0].texts), fld
+        app.cur_field.set("current J"); app._anim_toggle(); pump(1.5)
+        assert app._anim is not None and app._anim_art is not None and app._anim_bg is not None, "animation running"
+        P0 = app._anim.P.copy(); pump(0.6)
+        assert np.abs(app._anim.P - P0).max() > 0, "particles move"
+        app._anim_toggle(); pump(0.3); assert not app._anim_on and app._anim is None
+        gif = os.path.join(os.environ["HOME"], "flow.gif")
+        app._anim_gif(path=gif, frames=8); pump(0.3)
+        from PIL import Image
+        with Image.open(gif) as im: assert im.n_frames == 8, im.n_frames
+        app.cur_thr.set("off"); app.cur_lines.set(False); app.cur_log.set(False); app._upd_curr_plot(); pump(0.3)
+    step("Current tab: electron / hole flow, threshold, flowlines, animation, GIF", flow)
+
+    def mosfet():                                # C-V sweep, capacitances and on-resistance tools, R_DS(on)
+        app._load("RW: Si MOSFET 55V (IRLZ44N)"); pump(0.5)
+        disp = {v: k for k, v in app._gmap.items()}
+        for c in app.cons:
+            if c.bc == 2: c.V = 0.
+        app.iv_tgt.set(disp["Drain"]); app.ivS.set(0.); app.ivE.set(20.); app.ivN.set(3); app.iv_cap.set(True)
+        app._sweep(); wait()
+        R = app.ivd["R"]; assert "K" in R and np.isfinite(R["K"]).all(), "capacitance matrices"
+        assert any(a.get_title().startswith("Capacitances") for a in app.fiv.axes), "C-V panel"
+        par = app.res_par.get("1.0", "end"); assert "C_iss" in par and "C_rss" in par and "C_o(tr)" in par, par
+        app._cap_here(); wait(); assert "C_iss" in app._last_report[1], app._last_report
+        app.iv_cap.set(False)
+        for c in app.cons:
+            if c.bc == 2: c.V = 5.
+        app.ivS.set(0.); app.ivE.set(0.4); app.ivN.set(3); app._sweep(); wait()
+        assert "R_DS(on)" in app.res_par.get("1.0", "end"), app.res_par.get("1.0", "end")
+        app._ron_here(); pump(0.3); assert "R_i" in app._last_report[1] and "n epi" in app._last_report[1], app._last_report
+    step("MOSFET: C-V sweep (C_iss, C_oss, C_rss), Analysis menu, R_DS(on)", mosfet)
+
     def nmos_sweep():
         app._load("NMOS"); pump(0.5)
         app.ivN.set(6); app._sweep(); wait()
