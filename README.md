@@ -1,4 +1,4 @@
-# SemiSim 3D — semiconductor device simulator (v0.2.3)
+# SemiSim 3D — semiconductor device simulator (v0.2.4)
 
 A 3-D drift-diffusion simulator for semiconductor devices with a desktop
 interface: build a device from blocks of material and doping, solve it, and
@@ -13,7 +13,7 @@ Early effect and avalanche breakdown), MOSFETs, FinFETs, a CMOS inverter,
 JFETs, GaN HEMTs, Si and SiC power devices, solar cells, LEDs and
 photodiodes.
 
-> **v0.2.3 is an early public version and still a test version.** Its results
+> **v0.2.4 is an early public version and still a test version.** Its results
 > can be wrong - see [Status](#status).
 
 ![FinFET with a tapered, rounded fin on the triangular-prism mesh](docs/screenshots/finfet_structure.png)
@@ -29,7 +29,7 @@ photodiodes.
 | ![Comb (interdigitated) emitter of the MJ21193-like power PNP, top view](docs/screenshots/comb_bjt_structure.png) | ![Lateral PNP of an LDO regulator going into dropout: collector, base and substrate currents](docs/screenshots/ldo_dropout.png) |
 | ![A/B compare: Gummel plots, gain and f_T of an NPN with a 1e16 and a 1e17 collector (Kirk effect)](docs/screenshots/kirk_ab_iv.png) | ![Emitter current crowding: current density map and the current under a 20 um emitter](docs/screenshots/crowding_current.png) |
 | ![Current arrows through a FinFET with the device structure drawn see-through around them](docs/screenshots/current_structure.png) | ![Parameter table: V_th, SS and I_on/I_off of an NMOS at 300, 350 and 400 K with their differences](docs/screenshots/param_table.png) |
-| ![Electron flow in a 55 V VDMOS cell: equal-current flowlines and animated particles - through the JFET neck and fanning out into the drift region](docs/screenshots/vdmos_flow.png) | ![Quasi-static capacitances C_iss, C_oss and C_rss of the 55 V VDMOS cell against the drain voltage](docs/screenshots/vdmos_cv.png) |
+| ![Quasi-static capacitances C_iss, C_oss and C_rss of the 55 V VDMOS cell against the drain voltage](docs/screenshots/vdmos_cv.png) | |
 
 ## Install
 

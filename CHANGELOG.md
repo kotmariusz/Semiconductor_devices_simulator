@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.4 (2026-11-15) - defects in the 3-D current view, steady GIFs
+
+- Current tab: the 3-D view shows the defects of the solved device (voids
+  and particles as markers, dislocations as lines, planes; their number in
+  the title; `Layers…` → `Defects` hides them) - before, only the Structure
+  tab drew them, so a defect could not be found in the current view.
+- GIF export: one colour palette for all the frames, no dithering. Each frame
+  had its own palette, so the static colour scale and map shimmered and
+  drifted from frame to frame; now only the particles move (and the files
+  are smaller). The README GIFs are remade with it.
+- README: the still picture of the VDMOS flow is gone (the GIFs show it).
+- GUI smoke test: the GIF frames share one palette; the defect template
+  shows its three defects in the 3-D current view.
+
 ## 0.2.3 (2026-11-15) - the current animated in 3-D
 
 - Current tab: `▶ Animate` with `3-D` ticked also animates the 3-D view -

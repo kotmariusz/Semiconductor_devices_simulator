@@ -165,7 +165,9 @@ View → `WSL: turn maximise into fill screen` switches this off.
   in-plane map: `|J|` (the current density, as before), `structure` (the
   region colours) or `|J| + structure` (both, the structure see-through on
   top). `Structure in 3-D` draws the regions and contacts around the 3-D
-  arrows. The `Opacity` slider next to them sets how see-through that
+  arrows; the defects of the solved device are drawn there too (markers,
+  lines and planes, counted in the title; `Layers…` → `Defects` hides them).
+  The `Opacity` slider next to them sets how see-through that
   structure is; parts hidden in `Layers…` stay hidden there, and a part given
   its own opacity in `Layers…` keeps it.
 * `Panels ▾` (every plot tab) hides and shows the tab's panels; the panels

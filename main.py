@@ -4292,7 +4292,7 @@ import queue, json, copy, textwrap
 import tkinter.font as tkfont
 from matplotlib.ticker import FuncFormatter
 
-VERSION="0.2.3"
+VERSION="0.2.4"
 SETTINGS_FILE=os.path.join(os.path.expanduser("~"),".semisim3d.json")
 # label-based buttons (FlatButton) and themed check boxes: macOS draws the
 # classic Tk ones natively, without the app's colours; SEMISIM_FLAT_BUTTONS=1
@@ -4318,6 +4318,7 @@ PARTICLES=(50,3000)        # ... animated particles
 THR_CHOICES={"off":0.,"10 %":1e-1,"1 %":1e-2,"0.1 %":1e-3,"1e-4":1e-4,"1e-5":1e-5,"1e-6":1e-6,"1e-8":1e-8}
 CUR_FIELDS=("current J","electron flow","hole flow")
 ANIM_MS=40                 # animation frame interval (ms)
+GIF_COLORS=128             # one palette of this many colours for all the frames of a GIF
 
 def _lin_axis(F,c,g,axis):
     """Linear interpolation of the array F along `axis` (node coordinates c,
@@ -4684,7 +4685,7 @@ Pinned sweeps get the same parameters, listed below those of the last sweep; `Ta
 - `Current` → `▶ Animate`: particles flow along the current of the in-plane map and, with `3-D` ticked, through the 3-D view - along the current of the whole device; drag to turn the view while it runs (untick `3-D arrows` to see the particles alone). They start where the current is, with a probability proportional to |J|; their speed grows with log |J| (|J| spans many decades - fast in the channel, slow where the current fans out). `Hide below` keeps them out of the leakage, `Particles` sets their number and `Speed` the pace. `GIF…` saves the animation - the map (with its labels and colour bar) and the 3-D view as it is turned - as an animated GIF.
 - `Panels ▾` (every plot tab): hide panels to give the others the room - the Structure tab's 3-D view, cross-section and legend; the Slicer's 3-D view and its three planes; the band diagram and ribbon; the five Current panels; E-field and mobility; the linear, semi-log and BJT panels of the I-V tab.
 - `Layers…` (Structure and Current tabs): click 'Shown' to hide or show a region, contact or the defects in the 3-D view. Select one or more parts (Ctrl/Shift for several) and move 'Opacity of the selected parts' to give them their own opacity - a see-through substrate under an opaque channel, say; 'Auto' hands them back to the sliders for all regions and all contacts ('See-through contacts' sets 0.15). 'Insulators in 3-D' draws the oxides too; 'Apply to the cross-section too' uses the same choices in the section.
-- `Current` → `Map`: what lies under the arrows of the in-plane map - `|J|`, the device `structure` (region colours) or `|J| + structure`. `Structure in 3-D` draws the regions and contacts around the 3-D arrows. `Opacity` sets how see-through that structure is; parts hidden in `Layers…` stay hidden and a part with its own opacity there keeps it.
+- `Current` → `Map`: what lies under the arrows of the in-plane map - `|J|`, the device `structure` (region colours) or `|J| + structure`. `Structure in 3-D` draws the regions and contacts around the 3-D arrows; the defects of the solved device are drawn there too (counted in the title; `Layers…` → `Defects` hides them). `Opacity` sets how see-through that structure is; parts hidden in `Layers…` stay hidden and a part with its own opacity there keeps it.
 - `Current` → `Contact`: pick a contact or net and the panel 'Current under a contact' shows the current density through it node by node - a profile across it (2-D sections) or a map over it (3-D devices) - with J max/mean and centre/edge. Emitter current crowding shows as a profile that rises towards the emitter edges.
 - `I-V` BJT panel: β (left axis) and f_T (right axis, dotted; dash-dot for pins) against I_C for Gummel sweeps; the stars mark f_T,max.
 - 3D Slicer `log10 G avalanche`: where impact ionisation makes electron-hole pairs (cm⁻³s⁻¹).
@@ -8149,7 +8150,8 @@ class App(tk.Tk):
     def _lay_redraw(self):
         """Redraw the views the Layers choices act on."""
         self._ddev()
-        if self.sol is not None and (self.cur_st3.get() or self.cur_bg.get()!="|J|"): self._upd_curr_plot()
+        if self.sol is not None and (self.cur_st3.get() or self.cur_bg.get()!="|J|"
+                                     or (self.sol.get("dev") or {}).get("defects")): self._upd_curr_plot()
     def _lay_fill_later(self):
         self._debounce("_lay_fill_id",self._lay_fill,250)
     def _lay_fill(self):
@@ -8793,6 +8795,13 @@ class App(tk.Tk):
         if aQ3 is not None and self.cur_st3.get() and regs:      # the structure, see-through, under the arrows
             L3d=dev.get("L") or (float(s["x"][-1]),float(s["y"][-1]),float(s["z"][-1]))
             self._draw_struct3(aQ3,regs,dev.get("cons") or [],L3d,overlay=sa,editor=False)
+        dtag=""                                                    # the defects of the solved device (Layers → Defects)
+        defs3=dev.get("defects") if (aQ3 is not None and self.lay_def.get()) else None
+        if defs3:
+            L3d=dev.get("L") or (float(s["x"][-1]),float(s["y"][-1]),float(s["z"][-1]))
+            self._draw_defects_3d(aQ3,defs3,L3d)
+            nd=sum(1 for d in defs3[:self._DEF_DRAW_MAX] if d.shape!="everywhere")
+            if nd: dtag=f" · {nd} defect{'s' if nd>1 else ''}"
         if aQ3 is None: pass
         elif self.cur_show_arrows3d.get():
             x,y,z=s["x"],s["y"],s["z"]
@@ -8829,7 +8838,7 @@ class App(tk.Tk):
             aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
             self._aspect3(aQ3,x.max(),y.max(),z.max())
             what="current" if sym=="J" else fname
-            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({nar} arrows)"); _depth_axis(aQ3)
+            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({nar} arrows){dtag}"); _depth_axis(aQ3)
         else:
             x,y,z=s["x"],s["y"],s["z"]
             moving=self._anim_on and self.cur_anim3.get()            # particles instead of arrows
@@ -8838,7 +8847,7 @@ class App(tk.Tk):
             aQ3.set_xlim(0,x.max()); aQ3.set_ylim(0,z.max()); aQ3.set_zlim(-y.max(),0)
             self._aspect3(aQ3,x.max(),y.max(),z.max())
             what="current" if sym=="J" else fname
-            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({'particles' if moving else 'arrows off'})"); _depth_axis(aQ3)
+            sax3(aQ3,"x","z","depth y",f"3-D {what} field ({'particles' if moving else 'arrows off'}){dtag}"); _depth_axis(aQ3)
         if aQ3 is not None and self._anim_on and self.cur_anim3.get():
             self._anim3_build(aQ3,FX,FY,FZ,s["x"],s["y"],s["z"],thr)
         try: fig.tight_layout(pad=1.)
@@ -9014,11 +9023,16 @@ class App(tk.Tk):
             c0,c1=max(0,int(bb.x0*sc)-4),min(W,int(np.ceil(bb.x1*sc))+4)
             r0,r1=max(0,H-int(np.ceil(bb.y1*sc))-4),min(H,H-int(bb.y0*sc)+4)
             for _ in range(30): self._anim_step(1./fps)                 # tails formed
-            out=[]
+            # one palette (from the first frame) for every frame, no dithering: the map
+            # and the colour bar keep exactly their colours - a palette of its own per
+            # frame made the static colour scale shimmer and drift
+            D=getattr(Image,"Dither",None); nod=D.NONE if D is not None else 0
+            out=[]; pal=None
             for k in range(int(frames)):
                 self._anim_step(1./fps); self._anim_draw()
-                img=np.asarray(self.cvc.buffer_rgba())[r0:r1,c0:c1,:3].copy()
-                out.append(Image.fromarray(img).convert("P",palette=Image.ADAPTIVE,colors=128))
+                img=Image.fromarray(np.asarray(self.cvc.buffer_rgba())[r0:r1,c0:c1,:3].copy())
+                if pal is None: pal=img.quantize(colors=GIF_COLORS)
+                out.append(img.quantize(palette=pal,dither=nod))
                 if k%15==0: self.sv.set(f"Writing GIF… frame {k}/{frames}"); self.update_idletasks()
             out[0].save(path,save_all=True,append_images=out[1:],duration=int(round(1000/fps)),loop=0,disposal=2)
             self.sv.set(f"Saved the animation ({len(out)} frames) to {path}"); self._log(f"Animation GIF → {path}")
