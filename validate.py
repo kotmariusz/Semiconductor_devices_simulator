@@ -16,7 +16,7 @@ Needs main.py, semimesh.py, semidefects.py and semibuild.py in the same folder
 (main.py supplies the ctypes bindings and the mesh helpers and builds the
 core if it is missing; no window is opened).
 """
-import os, sys, time, ctypes, argparse, copy
+import os, sys, time, math, ctypes, argparse, copy
 import numpy as np
 if not hasattr(np, "trapezoid"):          # NumPy < 2.0 (e.g. Ubuntu 22.04/24.04 packages)
     np.trapezoid = np.trapz
@@ -25,6 +25,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import main as M  # noqa: E402
+import semidefects as SD  # noqa: E402
 
 L = M._lib
 D3 = ctypes.c_double
@@ -34,7 +35,7 @@ for fn, res, args in [
     ("api3_set_models", None, [_I]), ("api3_set_contact_V", None, [_I, _D]),
     ("api3_get_contact_I", _D, [_I]), ("api3_get_contact_A", _D, [_I]),
     ("api3_get_contact_Iraw", _D, [_I]), ("api3_get_contact_Ifloor", _D, [_I]),
-    ("api3_mat_ni", _D, [_I]), ("api3_get_stat", ctypes.c_long, [_I]),
+    ("api3_mat_ni", _D, [_I]), ("api3_get_stat", ctypes.c_longlong, [_I]),
     ("api3_add_contact_ex", _I, [_I] * 7 + [_I, _D, _D, _D, _D]),
     ("api3_set_gate_stack", _I, [_I, _I, ctypes.POINTER(_I), ctypes.POINTER(_D)]),
     ("api3_get_ntp", _I, [_I]), ("api3_get_Cref", _D, []),
@@ -42,6 +43,7 @@ for fn, res, args in [
     ("api3_mlda_factor", _D, [_I, _D, _D, _I]),
     ("api3_lombardi", _D, [_I, _D, _D, _D, _D, _I]),
     ("api3_set_predictor", None, [_I]),
+    ("api3_coulomb_inv", _D, [_I, _D, _D, _D, _D]),
 ]:
     f = getattr(L, fn); f.restype = res; f.argtypes = args
 
@@ -1386,18 +1388,367 @@ def s19_mosfet_analysis():
           5.7e13 * 0.067 * (1 - np.exp(-8.)), 2e-2)
 
 
+# ------------------------------------------------------------------ v0.2.5
+def _sic_bar(axis, typ, N=1e16, caxis="y", mesh="rect", Lnm=2000., thin=True):
+    """4H-SiC bar Lnm long along `axis` (x or y), 400 x 400 nm, doped N (cm^-3)
+    of type typ, ideal ohmic contacts on its two end faces, set up through
+    main.setup_device with the device's c-axis.  Returns (R in ohm at 10 mV,
+    displayed electron and hole mobility mid-bar in cm^2/Vs)."""
+    L3 = {"x": 400., "y": 400., "z": 400.}; L3[axis] = Lnm
+    n3 = {"x": 9, "y": 9, "z": 9}; n3[axis] = 41
+    f0 = {"x": 0, "y": 2}[axis]
+    t = dict(Lx=L3["x"], Ly=L3["y"], Lz=L3["z"], Nx=n3["x"], Ny=n3["y"], Nz=n3["z"],
+             regs=[M.Reg("4H-SiC", 0, 0, 0, L3["x"], L3["y"], L3["z"], typ, N, typ)],
+             cons=[M.Con(f0, 0., 1., 0., 1., 0, 0., 4.05, "A"), M.Con(f0 + 1, 0., 1., 0., 1., 0, 0., 4.05, "B")],
+             dense_x=[], dense_y=[], dense_z=[], sheets=[], mesh=mesh, caxis=caxis, tri_thin=thin)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=0)
+    M.run_point(t["cons"], [], None, [0.01, 0.])
+    sh = (len(zs), len(ys), len(xs))
+    mid = tuple(k // 2 for k in sh)
+    return (0.01 / abs(L.api3_get_contact_I(0)), float(field(MUN, sh)[mid]) * 1e4, float(field(MUP, sh)[mid]) * 1e4)
+
+
+def s20_sic_anisotropy():
+    print("20. 4H-SiC c-axis mobility anisotropy: bars along and across the c-axis, drift-layer resistance")
+    ref = {"n": 0.83, "p": 1.15}                 # mu_perp/mu_par, Burin et al. (arXiv:2410.06798)
+    for typ, N in (("n", 1e16), ("p", 1e17)):
+        Rx, mnx, mpx = _sic_bar("x", typ, N)
+        Ry, mny, mpy = _sic_bar("y", typ, N)
+        check(20, f"{typ}-SiC {N:.0e}: R along c / R across c = mu_perp/mu_par", Ry / Rx, ref[typ], 1e-6)
+        mu, muy = (mnx, mny) if typ == "n" else (mpx, mpy)
+        check(20, f"{typ}-SiC: the mobility map shows the in-plane value in both bars", muy, mu, 1e-9,
+              info=f"[{mu:.1f} cm2/Vs]")
+    Rx, _, _ = _sic_bar("x", "n", caxis="x"); Ry, _, _ = _sic_bar("y", "n", caxis="x")
+    check(20, "c-axis = x: the x bar conducts better (R_x/R_y = 0.83)", Rx / Ry, 0.83, 1e-6)
+    Rx, _, _ = _sic_bar("x", "n", caxis="off"); Ry, _, _ = _sic_bar("y", "n", caxis="off")
+    check(20, "c-axis off: isotropic, as before v0.2.5", Ry / Rx, 1.0, 1e-9)
+    Ry, _, _ = _sic_bar("y", "n")
+    Rt, _, _ = _sic_bar("y", "n", mesh="tri", thin=False)
+    check(20, "prism mesh with every node = tensor mesh (bar along c)", Rt, Ry, 1e-6)
+    Rt, _, _ = _sic_bar("y", "n", mesh="tri", thin=True)
+    check(20, "thinned prism mesh (edge-projected tensor), bar along c", Rt, Ry, 1e-2)
+    # drift layer of a vertical device: 10 um, 8e15 cm^-3, conducting along c
+    W, Nd = 10e-6, 8e15
+    R, mu_perp, _ = _sic_bar("y", "n", N=Nd, Lnm=W * 1e9)
+    A = (400e-9) ** 2
+    rsp = R * A * 1e4 * 1e3                     # mOhm cm^2
+    rsp_perp = W / (Q * mu_perp * 1e-4 * Nd * 1e6) * 1e4 * 1e3
+    check(20, "drift layer 10 um, 8e15: R_on,sp = W/(q mu_par N)", rsp, rsp_perp * 0.83, 1e-4,
+          info=f"[{rsp_perp:.3f} -> {rsp:.3f} mOhm cm2, mu_perp {mu_perp:.0f} cm2/Vs]")
+
+
+def _sic_mos(NA=1e17, dit=1.5e13, nox=0., Lch=2000., oxide=False, qf=0.):
+    """4H-SiC n-MOSFET cross-section (x along the channel, y depth): p-body
+    NA, n+ source/drain 1e19, n+ poly gate (4.1 eV) over 50 nm SiO2 - a face
+    gate with oxide charge nox (q/cm^2), or with oxide=True a meshed oxide
+    under a metal gate (no source/drain: a MOS capacitor) with the defect
+    'Oxide fixed charge' qf - band-tail interface traps of D_edge dit
+    (cm^-2 eV^-1; 0: none).  Contacts: source, drain, gate, body."""
+    if oxide:
+        Lx, Ly, Lz, tox = 200., 1050., 100., 50.
+        regs = [M.Reg("4H-SiC", 0, tox, 0, Lx, Ly, Lz, "p", NA, "p-body"),
+                M.Reg("SiO2", 0, 0, 0, Lx, tox, Lz, "i", 0., "gate oxide")]
+        cons = [M.con_full(2, 2, 0., "Gate", 4.1), M.con_full(3, 0, 0., "Body")]
+        t = dict(Lx=Lx, Ly=Ly, Lz=Lz, Nx=5, Ny=60, Nz=3, regs=regs, cons=cons,
+                 dense_x=[], dense_y=[0., tox], dense_z=[], sheets=[])
+    else:
+        Lx, Ly, Lz = Lch + 1000., 1500., 100.
+        regs = [M.Reg("4H-SiC", 0, 0, 0, Lx, Ly, Lz, "p", NA, "p-body"),
+                M.Reg("4H-SiC", 0, 0, 0, 500., 200., Lz, "n", 1e19, "n+ source"),
+                M.Reg("4H-SiC", Lx - 500., 0, 0, Lx, 200., Lz, "n", 1e19, "n+ drain")]
+        cons = [M.con_part(2, 0., 450. / Lx, 0., 1., 0, 0., "Source"),
+                M.con_part(2, (Lx - 450.) / Lx, 1., 0., 1., 0, 0.05, "Drain"),
+                M.con_part(2, 450. / Lx, (Lx - 450.) / Lx, 0., 1., 2, 0., "Gate", 4.1, tox=50., nox=nox),
+                M.con_full(3, 0, 0., "Body")]
+        t = dict(Lx=Lx, Ly=Ly, Lz=Lz, Nx=60, Ny=60, Nz=3, regs=regs, cons=cons,
+                 dense_x=[500., Lx - 500.], dense_y=[0., 200.], dense_z=[], sheets=[])
+    t["defects"] = ([SD.Defect("Interface traps 4H-SiC/SiO2: band tail", dit=dit)] if dit > 0 else []) \
+        + ([SD.Defect("Oxide fixed charge (Qf)", charge=qf)] if qf else [])
+    return t
+
+
+def _col(which, t, xs, ys, zs):
+    """Field `which` down the middle of the device (x and z centre)."""
+    return field(which, (len(zs), len(ys), len(xs)))[len(zs) // 2, :, len(xs) // 2]
+
+
+def _mu_fe(t, VG, T=300., models=None):
+    """Transfer curve at V_DS = 50 mV: (I_D, mu_FE cm^2/Vs, E_eff V/cm).
+    mu_FE = g_m L / (W C_ox V_DS); E_eff = E(10 nm) + q N_inv / (2 eps) at
+    the channel centre (Gauss: the field below the inversion layer plus half
+    of its charge)."""
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=M.M_DEFAULT | M.M_LB if models is None else models, T=T)
+    ys = np.asarray(ys); j = int(np.searchsorted(ys, 10e-9))
+    I, E = [], []
+    for vg in VG:
+        M.run_point(t["cons"], [], None, [0., 0.05, vg, 0.])
+        I.append(L.api3_get_contact_I(1))
+        phi = _col(PHI, t, xs, ys, zs); n = _col(NN_, t, xs, ys, zs)
+        Ninv = float(np.sum(0.5 * (n[1:j + 1] + n[:j]) * np.diff(ys[:j + 1])))
+        E.append(abs(phi[j + 1] - phi[j - 1]) / (ys[j + 1] - ys[j - 1]) + Q * Ninv / (2 * 9.7 * EPS0))
+    I = np.array(I)
+    W, Lch, Cox = t["Lz"] * 1e-9, (t["Lx"] - 1000.) * 1e-9, 3.9 * EPS0 / 50e-9
+    return I, np.gradient(I, VG) * Lch / (W * Cox * 0.05) * 1e4, np.array(E) * 1e-2
+
+
+def s21_sic_channel():
+    print("21. 4H-SiC channel mobility: Coulomb term, interface charge, field-effect mobility, temperature")
+    # the Coulomb term against Uhnevionak's Eq. 26 (independent implementation, cm units)
+    a, tr = np.log([1e15, 1e16, 5e16, 5e17]), np.log([2.8e16, 8e16, 2.5e17, 1.55e18])
+    def inv_mu_c(F, n, NC, NA, T):
+        r = NC / 1e11; f = 1. - np.exp(-(F / 2e5) ** 2)
+        ntr = np.exp(np.interp(np.log(NA), a, tr))
+        return r ** 0.5 * f / (40. * (T / 300.) * (1. + (n / (ntr * r)) ** 1.5))
+    err = 0.
+    for T in (300., 450.):
+        M.api_init(); mi = M.api_addmat(M.MATS["4H-SiC"], T)
+        for F, n, NC, NA in ((1e5, 1e17, 1e12, 1e17), (5e5, 3e18, 4e12, 3e15), (1e6, 1e19, 2e11, 8e17),
+                             (3e5, 1e16, 1e13, 2e16)):
+            c = L.api3_coulomb_inv(mi, F * 1e2, n * 1e6, NC * 1e4, NA * 1e6)
+            err = max(err, abs(c / inv_mu_c(F, n, NC, NA, T) - 1.))
+    check(21, "Coulomb mobility = Uhnevionak Eq. 26 (8 points, 300/450 K, n_trans of Table 5)", err, 0., 1e-12, "range")
+    # the interface charge N_C the term sees: oxide charge, fixed charge on oxide nodes, trapped charge
+    t = _sic_mos(dit=0., nox=2e12)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=M.M_DEFAULT | M.M_LB)
+    M.run_point(t["cons"], [], None, [0., 0., 10., 0.])
+    nc = _col(34, t, xs, ys, zs) * 1e-4
+    check(21, "N_C under a face gate = its oxide charge (2e12 cm^-2), at the surface and 5 nm deep",
+          max(abs(nc[0] / 2e12 - 1), abs(nc[int(np.searchsorted(ys, 5e-9))] / 2e12 - 1)), 0., 1e-12, "range")
+    t = _sic_mos(dit=0., oxide=True, qf=1e12)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=M.M_DEFAULT | M.M_LB)
+    M.run_point(t["cons"], [], None, [5., 0.])
+    ys = np.asarray(ys); js = int(np.searchsorted(ys, 50e-9 - 1e-12))
+    check(21, "N_C under a meshed oxide = the 'Oxide fixed charge' on its nodes (1e12 cm^-2)",
+          _col(34, t, xs, ys, zs)[js] * 1e-4, 1e12, 1e-9)
+    t = _sic_mos(dit=1.5e13)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=M.M_DEFAULT | M.M_LB)
+    M.run_point(t["cons"], [], None, [0., 0.05, 10., 0.])
+    tr0 = abs(_col(31, t, xs, ys, zs)[0]) * 0.5 * ys[1]          # trapped charge of the surface node per area
+    check(21, "N_C of the band-tail traps = their trapped charge per interface area (V_G 10 V)",
+          _col(34, t, xs, ys, zs)[0], tr0, 1e-9, info=f"[{tr0*1e-4:.3g} cm^-2]")
+    # field-effect mobility of a long-channel NMOS (L 2 um, 50 nm oxide, N_A 1e17, NO-annealed band tail)
+    VG = np.arange(0., 30.01, 1.)
+    I, mu, E = _mu_fe(_sic_mos(), VG)
+    k = int(np.argmax(mu)); k1 = int(np.argmin(np.abs(E - 1e6)))
+    check(21, "peak field-effect mobility (measured 30-40 cm^2/Vs, NO-annealed Si face)", mu[k], 25., 40., "range",
+          f"[at V_G {VG[k]:.0f} V, E_eff {E[k]*1e-6:.2f} MV/cm]")
+    check(21, "field-effect mobility at E_eff = 1 MV/cm (measured 10-20)", mu[k1], 10., 20., "range",
+          f"[V_G {VG[k1]:.0f} V, E_eff {E[k1]*1e-6:.2f} MV/cm]")
+    _, mu0, _ = _mu_fe(_sic_mos(), VG, models=M.M_DEFAULT)
+    check(21, "the same device at bulk mobility (no surface model): peak mu_FE several times higher",
+          mu0.max() / mu[k], 3., 1e3, "range", f"[{mu0.max():.0f} cm^2/Vs]")
+    # temperature: N_A 5e17 - the current rises with temperature above threshold (Uhnevionak)
+    VG = np.arange(0., 12.01, 1.)
+    I3, _, _ = _mu_fe(_sic_mos(NA=5e17), VG, T=300.)
+    I4, _, _ = _mu_fe(_sic_mos(NA=5e17), VG, T=400.)
+    check(21, "N_A 5e17, V_G 12 V: I_D(400 K) / I_D(300 K) > 1.2", I4[-1] / I3[-1], 1.2, 1e3, "range")
+    # the 900 V template as a die (its active area, substrate outside the cell): R_DS(on) 25 -> 150 C
+    t = M.TEMPLATES["RW: SiC MOSFET 900V (C3M)"]()
+    pw = t["power"]; Acell = t["Lx"] * t["Lz"] * 1e-14; Adie = pw["area"] * 1e-2         # cm^2
+    R = {}
+    for T in (298., 423.):
+        M.setup_device(t, solver=SOLV, models=t["models"], T=T)
+        M.run_point(t["cons"], [], None, [0., 0., 15., 15., 0.])
+        M.run_point(t["cons"], [], None, [0., 0., 15., 15., 0.25])
+        Rc = 0.25 / L.api3_get_contact_I(4)
+        R[T] = (Rc * Acell * 1e3 + pw["rsp"]) / Adie + pw["rpkg"]                       # mOhm
+    check(21, "SiC 900 V template: die R_DS(on) at 25 C, V_GS 15 V (datasheet 65 mOhm)", R[298.], 65., 0.1)
+    check(21, "... R_DS(on)(150 C) / R_DS(on)(25 C) (datasheet 90/65 = 1.38)", R[423.] / R[298.], 1.2, 1.6, "range",
+          f"[{R[423.]:.0f} mOhm at 150 C]")
+
+
+def _ionised(N, T, levels, g, Nband):
+    """Closed-form neutrality of one dopant species with its majority
+    carriers (Boltzmann): c = N sum_s w_s / (1 + g c / (Nband e^(-dE_s/kT))),
+    levels [(w, dE0 eV, alpha eV cm)]; bisection to 1e-15."""
+    vt = KB * T / Q
+    c1 = [Nband / g * np.exp(-max(E0 - a * N ** (1. / 3.), 0.) / vt) for _, E0, a in levels]
+    f = lambda c: c - N * sum(w / (1. + c / x) for (w, _, _), x in zip(levels, c1))
+    lo, hi = 0., N
+    for _ in range(200):
+        m = 0.5 * (lo + hi)
+        if f(m) > 0: hi = m
+        else: lo = m
+    return 0.5 * (lo + hi)
+
+
+SIC_N = [(0.5, 0.0709, 3.38e-8), (0.5, 0.1237, 4.65e-8)]      # N: hexagonal, cubic sites
+SIC_AL = [(1.0, 0.225, 3.2e-8)]
+
+
+def s22_incomplete_ionisation():
+    print("22. Incomplete ionisation (4H-SiC: N on two sites, Al): neutral densities, contacts, blocking junction")
+    MI = M.M_INC
+    for T in (300., 450.):
+        tr = T / 300.
+        xs = np.linspace(0, 1e-6, 21)
+        stack1d([(0, 1000, "4H-SiC", 0, 1e18)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], T=T, models=MI)
+        L.api3_solve()
+        p = line(PP, xs, xs[:3], xs[:3])[10] * 1e-6
+        pth = _ionised(1e18, T, SIC_AL, 4., 2.64e19 * tr ** 1.5)
+        check(22, f"p-SiC 1e18 Al, {T:.0f} K: hole density vs neutrality (closed form)", p, pth, 1e-6,
+              info=f"[{100*pth/1e18:.1f} % ionised]")
+        stack1d([(0, 1000, "4H-SiC", 1e16, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], T=T, models=MI)
+        L.api3_solve()
+        n = line(NN_, xs, xs[:3], xs[:3])[10] * 1e-6
+        nth = _ionised(1e16, T, SIC_N, 2., 1.73e19 * tr ** 1.5)
+        check(22, f"n-SiC 1e16 N (hexagonal + cubic site), {T:.0f} K: electron density vs neutrality", n, nth, 1e-6,
+              info=f"[{100*nth/1e16:.1f} % ionised]")
+    # a p-SiC resistor between ohmic contacts: the contacts and the bulk carry the ionised density
+    xs = np.linspace(0, 2e-6, 41); A = (50e-9) ** 2
+    stack1d([(0, 2000, "4H-SiC", 0, 1e18)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], models=MI)
+    L.api3_solve(); L.api3_set_contact_V(0, 0.01); L.api3_resolve()
+    mu = line(MUP, xs, xs[:3], xs[:3])[20]
+    R = 0.01 / L.api3_get_contact_I(0)
+    pth = _ionised(1e18, 300., SIC_AL, 4., 2.64e19)
+    check(22, "p-SiC 1e18 bar, ohmic contacts: R = L / (q mu p_ionised A)", R, 2e-6 / (Q * mu * pth * 1e6 * A), 1e-6,
+          info=f"[{R:.4g} ohm; {R*Q*mu*1e18*1e6*A/2e-6:.1f}x the fully ionised value]")
+    # blocking junction (section 4) with the dopants' levels: depletion ionises them, the field stays
+    EPS = 9.7 * EPS0; Na, Nd = 1e19, 5e15; Wp, Wd = 500., 25000.; Lnm = Wp + Wd + 500.
+    xs = M.graded_grid(Lnm, 420, [Wp, Wp + Wd])
+    stack1d([(0, Wp, "4H-SiC", 0, Na), (Wp, Wp + Wd, "4H-SiC", Nd, 0), (Wp + Wd, Lnm, "4H-SiC", 1e19, 0)], xs,
+            [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)], solver=(2000, 1000, 500, 1e-8, 1e-6, 1.0, 1.0), models=MI)
+    L.api3_solve(); ni = L.api3_mat_ni(0); Vbi = VT * np.log(Na * Nd * 1e12 / ni ** 2)
+    L.api3_set_contact_V(0, -1000.); ok = L.api3_resolve()
+    phi = line(PHI, xs, xs[:3], xs[:3]); m = (xs > Wp * 1e-9) & (xs < (Wp + Wd) * 1e-9)
+    Wth = np.sqrt(2 * EPS * (Vbi + 1000. - 2 * VT) / (Q * Nd * 1e6))
+    check(22, "4H-SiC p+/n-/n+ at 1 kV with incomplete ionisation: peak field vs depletion approximation",
+          np.max(np.abs(np.gradient(phi, xs)[m])), Q * Nd * 1e6 * Wth / EPS, 5e-3, "rel", "" if ok else "(not converged)")
+    # silicon has no level data: the switch changes nothing (bit for bit)
+    out = []
+    for mdl in (M.M_BGN | M.M_TAU, M.M_BGN | M.M_TAU | MI):
+        xs = M.graded_grid(5300., 200, [300.])
+        stack1d([(0, 300, "Si", 0, 1e19), (300, 5300, "Si", 1e16, 0)], xs, [(0, 0, 0.0, 0.0), (1, 0, 0.0, 0.0)],
+                models=mdl)
+        L.api3_solve(); L.api3_set_contact_V(0, 0.5); L.api3_resolve()
+        out.append(L.api3_get_contact_I(1))
+    check(22, "Si p+/n diode at 0.5 V: the incomplete-ionisation switch changes nothing", out[1], out[0], 0., "abs")
+
+
+def _erfinv(y):
+    lo, hi = -10., 10.
+    for _ in range(200):
+        m = 0.5 * (lo + hi)
+        if math.erf(m) < y: lo = m
+        else: hi = m
+    return 0.5 * (lo + hi)
+
+
+def _imp_dev(imps, Lx=200., Ly=2000., Lz=100., NB=1e16, btype="n", Nx=5, Ny=60, Nz=3, mesh="rect", cons=None,
+             nodes=None):
+    """A Si block with a uniform background (type btype, NB cm^-3) and the
+    doping profiles imps; ohmic contacts top and bottom unless given."""
+    t = dict(Lx=Lx, Ly=Ly, Lz=Lz, Nx=Nx, Ny=Ny, Nz=Nz,
+             regs=[M.Reg("Si", 0, 0, 0, Lx, Ly, Lz, btype, NB, "background")],
+             cons=cons or [M.con_full(2, 0, 0., "Top"), M.con_full(3, 0, 0., "Bottom")],
+             dense_x=[], dense_y=[], dense_z=[], sheets=[], implants=imps, mesh=mesh)
+    if nodes: t["nodes"] = nodes
+    return t
+
+
+def _dual(c):
+    c = np.asarray(c, float); d = np.zeros(len(c))
+    d[1:] += 0.5 * np.diff(c); d[:-1] += 0.5 * np.diff(c)
+    return d
+
+
+def s23_doping_profiles():
+    print("23. Doping profiles (implants, diffusions): node values, junctions, dose, mask edge, sheet resistance")
+    # 1-D Gaussian into a uniform background
+    pk, Lv, NB = 1e19, 200., 1e16
+    t = _imp_dev([M.Implant("p", pk, "y0", 0., 1e9, 0., 1e9, "gauss", Lv, 0., 0.8)], NB=NB)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=0); L.api3_solve()
+    ys = np.asarray(ys); net = _col(14, t, xs, ys, zs) * 1e-6
+    th = NB - pk * np.exp(-(ys * 1e9 / Lv) ** 2)
+    check(23, "Gaussian profile: node values = N_B - peak exp(-(y/Lv)^2) (tensor mesh)",
+          float(np.max(np.abs(net - th) / (NB + pk * np.exp(-(ys * 1e9 / Lv) ** 2)))), 0., 1e-12, "range")
+    k = int(np.nonzero(np.diff(np.sign(net)))[0][0])
+    yj = ys[k] - net[k] * (ys[k + 1] - ys[k]) / (net[k + 1] - net[k])
+    yth = Lv * np.sqrt(np.log(pk / NB)) * 1e-9
+    check(23, "junction depth = Lv sqrt(ln(peak/N_B)) within one mesh step", abs(yj - yth),
+          0., ys[k + 1] - ys[k], "range", f"[{yj*1e9:.2f} vs {yth*1e9:.2f} nm, step {(ys[k+1]-ys[k])*1e9:.2f} nm]")
+    dose = float(np.sum((NB - net) * _dual(ys))) * 1e2              # cm^-2 (net in cm^-3, ys in m)
+    check(23, "dose = sqrt(pi)/2 peak Lv (node sums with the box-method volumes)", dose, 0.5 * np.sqrt(np.pi) * pk * Lv * 1e-7,
+          1e-2)
+    # the same on the triangular-prism mesh (node values at the prism nodes)
+    t = _imp_dev([M.Implant("p", pk, "y0", 0., 1e9, 0., 1e9, "gauss", Lv, 0., 0.8)], NB=NB, mesh="tri")
+    M.setup_device(t, solver=SOLV, models=0); L.api3_solve()
+    pos = M._PRISM.graph()[7].reshape(-1, 3) * 1e9; N = len(pos)
+    buf = (D3 * N)(); M.api_bulk(14, buf); netp = np.frombuffer(buf, np.float64, count=N) * 1e-6
+    thp = NB - pk * np.exp(-(pos[:, 1] / Lv) ** 2)
+    check(23, "... prism mesh: node values = the profile at the node positions",
+          float(np.max(np.abs(netp - thp) / (NB + pk * np.exp(-(pos[:, 1] / Lv) ** 2)))), 0., 1e-12, "range")
+    # a mask edge: half the peak under the edge, the lateral junction where the profile says
+    pk, Lv, r, NB, xe = 1e18, 300., 0.8, 1e16, 1000.
+    t = _imp_dev([M.Implant("p", pk, "y0", 0., xe, 0., 1e9, "gauss", Lv, 0., r)], Lx=2000., Ly=1500., NB=NB,
+                 Nx=60, Ny=40, nodes={"x": [xe]})
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=0); L.api3_solve()
+    xs = np.asarray(xs); s0 = field(14, (len(zs), len(ys), len(xs)))[len(zs) // 2, 0, :] * 1e-6
+    ie = int(np.argmin(np.abs(xs - xe * 1e-9)))
+    check(23, "under the mask edge the surface concentration is peak/2", NB - s0[ie], pk / 2, 1e-9)
+    k = int(np.nonzero(np.diff(np.sign(s0)))[0][0])
+    xj = xs[k] - s0[k] * (xs[k + 1] - xs[k]) / (s0[k + 1] - s0[k])
+    xth = (xe + r * Lv * _erfinv(1. - 2. * NB / pk)) * 1e-9
+    check(23, "lateral junction at the surface = edge + r Lv erfinv(1 - 2 N_B/peak), within one mesh step",
+          abs(xj - xth), 0., xs[k + 1] - xs[k], "range", f"[{xj*1e9:.1f} vs {xth*1e9:.1f} nm]")
+    # sheet resistance of an n layer in p-Si between contacts on its ends (the layer only)
+    pk, Lv, NB, Lx = 1e19, 100., 1e15, 10000.
+    cons = [M.con_part(0, 0., 0.25, 0., 1., 0, 0.01, "A"), M.con_part(1, 0., 0.25, 0., 1., 0, 0., "B"),
+            M.con_full(3, 0, 0., "Substrate")]
+    t = _imp_dev([M.Implant("n", pk, "y0", 0., 1e9, 0., 1e9, "gauss", Lv, 0., 0.8)], Lx=Lx, Ly=2000., NB=NB,
+                 btype="p", Nx=40, Ny=80, cons=cons)
+    xs, ys, zs = M.setup_device(t, solver=SOLV, models=0)
+    M.run_point(t["cons"], [], None, [0.01, 0., 0.])
+    R = 0.01 / L.api3_get_contact_I(0)
+    ys = np.asarray(ys); mu = _col(MUN, t, xs, ys, zs) * 1e4
+    Nn = pk * np.exp(-(ys * 1e9 / Lv) ** 2) - NB
+    m = Nn > 0
+    G = float(np.sum(np.where(m, Q * mu * Nn, 0.) * _dual(ys) * 1e2))    # sheet conductance (S)
+    check(23, "sheet resistance of an implanted layer = 1 / integral q mu(N) N dy (ends contacted)",
+          R * (t["Lz"] / Lx), 1. / G, 3e-2, info=f"[{1./G:.1f} ohm/sq]")
+    # profiles of zero peak take the node-array path: it must equal the region path exactly
+    out = []
+    for imps in ([], [M.Implant("p", 0., "y0", 0., 1e9, 0., 1e9, "gauss", 100., 0., 0.8)]):
+        t = M.TEMPLATES["RW: Si MOSFET 55V (IRLZ44N)"](); t["implants"] = imps
+        xs, ys, zs = M.setup_device(t, solver=SOLV, models=0); L.api3_solve()
+        out.append((len(xs), len(ys), len(zs), field(14, (len(zs), len(ys), len(xs))).copy(),
+                    field(13, (len(zs), len(ys), len(xs))).copy()))
+    same = out[0][:3] == out[1][:3] and np.array_equal(out[0][3], out[1][3]) and np.array_equal(out[0][4], out[1][4])
+    check(23, "a device without profiles: node arrays as before (box path = node path, bit for bit)",
+          float(same), 1., 1., "range")
+    # the diffused IRLZ44N-like cell: R_on,sp at V_GS 10 V sets the die area (22 mOhm), then V_GS(th) at
+    # 250 uA per die with V_DS = V_GS (datasheet 1.0-2.0 V)
+    Ron = {}
+    for name in ("RW: Si MOSFET 55V (IRLZ44N)", "RW: Si MOSFET 55V (IRLZ44N), diffused"):
+        t = M.TEMPLATES[name](); A = t["Lx"] * t["Lz"] * 1e-14
+        M.setup_device(t, solver=SOLV, models=t.get("models", M.M_DEFAULT))
+        M.run_point(t["cons"], [], None, [0., 0., 10., 10., 0.])
+        M.run_point(t["cons"], [], None, [0., 0., 10., 10., 0.1])
+        Ron[name] = 0.1 / L.api3_get_contact_I(4) * A * 1e3                 # mOhm cm^2
+    Ith = 250e-6 * A / (Ron[name] / 22.)                                    # per cell
+    M.setup_device(t, solver=SOLV, models=t.get("models", M.M_DEFAULT))
+    VG = np.arange(0.75, 2.01, 0.125); Id = []
+    for vg in VG:
+        M.run_point(t["cons"], [], None, [0., 0., vg, vg, vg]); Id.append(L.api3_get_contact_I(4))
+    vth = float(np.interp(np.log(Ith), np.log(np.maximum(Id, 1e-300)), VG))
+    rb, rd = Ron["RW: Si MOSFET 55V (IRLZ44N)"], Ron[name]
+    check(23, "diffused IRLZ44N cell: V_GS(th) at 250 uA per die, V_DS = V_GS (datasheet 1.0-2.0 V)", vth, 1.0, 2.0,
+          "range", f"[R_on,sp at 10 V: {rd:.3f} mOhm cm2 diffused, {rb:.3f} box]")
+
+
 SECTIONS = {1: s1_equilibrium, 2: s2_reverse, 3: s3_forward, 4: s4_sic_blocking, 5: s5_hetero,
             6: s6_mos, 7: s7_nmos, 8: s8_bjt, 9: s9_templates, 10: s10_cmos_finfet,
             11: s11_tunnelling, 12: s12_mlda_lombardi, 13: s13_prism_mesh, 14: s14_metal_contacts,
             15: s15_defects, 16: s16_amr_predictor, 17: s17_avalanche_bjt,
-            18: s18_parameters_analysis, 19: s19_mosfet_analysis}
+            18: s18_parameters_analysis, 19: s19_mosfet_analysis, 20: s20_sic_anisotropy,
+            21: s21_sic_channel, 22: s22_incomplete_ionisation, 23: s23_doping_profiles}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", default="", help="comma-separated section numbers")
     ap.add_argument("--templates", action="store_true", help="also run section 9 (all GUI templates)")
     a = ap.parse_args()
-    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] + ([9] if a.templates else [])
+    sel = [int(s) for s in a.only.split(",") if s.strip()] or [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] + ([9] if a.templates else [])
     T0 = time.time()
     for s in sel:
         t = time.time(); SECTIONS[s](); print(f"   ({time.time()-t:.1f} s)\n")

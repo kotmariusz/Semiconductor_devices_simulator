@@ -1,4 +1,4 @@
-# SemiSim 3D — semiconductor device simulator (v0.2.4)
+# SemiSim 3D — semiconductor device simulator (v0.2.5)
 
 A 3-D drift-diffusion simulator for semiconductor devices with a desktop
 interface: build a device from blocks of material and doping, solve it, and
@@ -6,14 +6,16 @@ look at its bands, fields, current flow (flowlines, particles animated in
 the map and in 3-D)
 and I-V curves, extract MOSFET on-resistance and capacitances - and compare
 designs side by side, curves and a table of their parameters. A C core (OpenMP) does the numerics; the interface is
-Python/Tk. 55 ready-made devices are included: diodes, BJTs (among them
+Python/Tk. 56 ready-made devices are included: diodes, BJTs (among them
 comb-emitter power transistors, the lateral PNP of an LDO regulator, and
 small sections that show the Kirk effect, emitter current crowding, the
 Early effect and avalanche breakdown), MOSFETs, FinFETs, a CMOS inverter,
 JFETs, GaN HEMTs, Si and SiC power devices, solar cells, LEDs and
-photodiodes.
+photodiodes. New in 0.2.5: it runs natively on Windows; 4H-SiC MOSFETs get
+their interface-limited channel mobility, incomplete ionisation and the
+c-axis anisotropy; regions can carry implanted or diffused doping profiles.
 
-> **v0.2.4 is an early public version and still a test version.** Its results
+> **v0.2.5 is an early public version and still a test version.** Its results
 > can be wrong - see [Status](#status).
 
 ![FinFET with a tapered, rounded fin on the triangular-prism mesh](docs/screenshots/finfet_structure.png)
@@ -32,6 +34,22 @@ photodiodes.
 | ![Quasi-static capacitances C_iss, C_oss and C_rss of the 55 V VDMOS cell against the drain voltage](docs/screenshots/vdmos_cv.png) | |
 
 ## Install
+
+**Windows (native, new in 0.2.5 - tried on few computers so far)**
+
+1. Install Python 3.9+ (64-bit) from [python.org](https://www.python.org/downloads/windows/)
+   with "Add python.exe to PATH" ticked.
+2. Download `SemiSim3D-<version>-windows-x64.zip` from the
+   [Releases](https://github.com/kotmariusz/Semiconductor_devices_simulator/releases)
+   page (it contains a ready-made solver core, so no C compiler is needed) and
+   unzip it.
+3. Double-click `install.bat` (no administrator rights needed).
+4. Start SemiSim 3D from the Start menu or the Desktop shortcut.
+
+From a source checkout (`git clone`, or Code → Download ZIP) `install.bat`
+builds the core itself and needs a C compiler first:
+`winget install BrechtSanders.WinLibs.POSIX.UCRT` (then a new terminal).
+Details and troubleshooting: [docs/MANUAL.md](docs/MANUAL.md#windows-native).
 
 **Windows (WSL2) and Linux** - in an Ubuntu / WSL terminal:
 
@@ -69,13 +87,13 @@ maximise button). On a Mac, ⌘R runs and ⌘. stops.
 
 ## Status
 
-- The physics is checked against textbook theory (`validate.py`, 240
+- The physics is checked against textbook theory (`validate.py`, 276
   checks), not yet against measurements of real devices.
 - Results can be wrong; band-to-band tunnelling, light, self-heating and
   transients are not modelled, avalanche breakdown is a local-field model,
-  f_T and the capacitances are quasi-static estimates, and SiC MOSFET
-  channels lack their interface (Coulomb) mobility
-  ([Limitations](docs/MANUAL.md#limitations)). Check anything important
+  f_T and the capacitances are quasi-static estimates, and the SiC MOSFET
+  channel model is checked against typical NO-annealed devices, not fitted
+  to a process ([Limitations](docs/MANUAL.md#limitations)). Check anything important
   independently.
 - `RW:` devices follow the class and ratings of real parts, not their dies.
 - macOS support is new and lightly tested.

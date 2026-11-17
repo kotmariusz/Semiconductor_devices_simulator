@@ -18,13 +18,71 @@ solution), or triangular prisms (`semimesh.py`) that follow round and sloped
 interfaces. The core (`semiconductor_3d.c`, OpenMP) returns bands, quasi-Fermi
 levels, fields, currents, mobilities, recombination and trapped charge; the
 interface (`main.py`, Python/Tk) builds the device, runs bias points and sweeps
-and draws the results. The 55 templates range from textbook diodes to FinFETs,
+and draws the results. The 56 templates range from textbook diodes to FinFETs,
 a CMOS inverter, SiC/GaN power devices, comb-emitter power BJTs and parts
 modelled on real components (device class only - not their real dies).
 
 ## Install
 
-Windows (WSL2 with Ubuntu) and Linux, in a terminal:
+### Windows (native)
+
+New in 0.2.5 and tried on few computers so far (WSL2, below, is the tried way).
+
+1. Python 3.9 or newer, 64-bit, from
+   [python.org](https://www.python.org/downloads/windows/) - in its installer
+   tick "Add python.exe to PATH" and keep "tcl/tk and IDLE" ticked. Python
+   from the Microsoft Store works too.
+2. The program: from the GitHub Releases page the zip
+   `SemiSim3D-<version>-windows-x64.zip`, which contains a ready-made solver
+   core (`semiconductor_core.dll`), so no C compiler is needed. Unzip it
+   anywhere you can write (spaces and Polish letters in the path are fine).
+3. Double-click `install.bat`. It runs `install_win.py`: a private Python
+   environment `.venv` with NumPy and Matplotlib, the core (kept from the
+   zip, or built), a self-test of a few seconds, the launchers `SemiSim3D.bat`
+   and `SemiSim3D (console).bat` in the folder, and shortcuts in the Start
+   menu and on the Desktop. No administrator rights. Options (from a
+   terminal): `py install_win.py --no-shortcuts`, `--portable`. Started with
+   another Python (Spyder's or Anaconda's, from its console), `install_win.py`
+   works too, but `.venv` then depends on that Python and an update of it can
+   break SemiSim 3D. Run later with a different Python, it makes `.venv` anew
+   from that one.
+4. Start: Start menu → SemiSim 3D.
+
+From a source checkout (git clone, or Code → Download ZIP on GitHub) there is
+no ready-made core: `install.bat` builds it, which needs a MinGW-w64 C
+compiler first - `winget install BrechtSanders.WinLibs.POSIX.UCRT` (then open
+a new terminal), or MSYS2's `mingw-w64-ucrt-x86_64-gcc` (found in
+`C:\msys64\ucrt64\bin` without a PATH change). `py semibuild.py --check` shows
+which compilers were found and why one was not used (an MSYS/Cygwin gcc, a
+32-bit one or MSVC's clang cannot build the core). A core for Windows can also
+be built from Linux or WSL: `python3 semibuild.py --cross
+x86_64-w64-mingw32-gcc-posix -o dist/semiconductor_core.dll` (Ubuntu: `sudo apt
+install gcc-mingw-w64-x86-64-posix`); copy it and its `.core_build.json` next
+to `main.py`.
+
+Troubleshooting:
+
+* "Windows protected your PC" when starting `install.bat` from a downloaded
+  zip: More info → Run anyway (the files are not signed).
+* The first start after an update can take a few seconds longer while the
+  antivirus checks the new core.
+* If the window does not open, start `SemiSim3D (console).bat` to see the
+  message; without a console SemiSim writes its messages to
+  `%LOCALAPPDATA%\SemiSim3D\semisim.log`.
+* "the core ... is in use": close the other SemiSim 3D windows (a running
+  core cannot be replaced) and start again.
+* "SEMISIM_SO points to a solver core of another version": the variable
+  `SEMISIM_SO` (a core to load instead of the built one, for testing) is still
+  set; remove it.
+* Remove it: delete the folder and the two `SemiSim 3D` shortcuts; settings
+  are in `%USERPROFILE%\.semisim3d.json`.
+* Threads: `py tests\bench_threads.py` times a sweep with 1, 2, 4, …
+  threads (a few minutes); please send its table if "all" is clearly slower
+  than the best.
+
+### Windows (WSL2) and Linux
+
+In a terminal:
 
 ```bash
 git clone https://github.com/kotmariusz/Semiconductor_devices_simulator.git
@@ -52,7 +110,7 @@ By hand: `python3 -m pip install -r requirements.txt`, `python3 semibuild.py`
 (`--portable` for any CPU of this kind, `--check` to see the compiler and
 OpenMP in use), `python3 main.py`.
 
-Notes: native Windows is not supported (use WSL2). macOS's own
+Notes: on Windows use the native install (above) or WSL2. macOS's own
 `/usr/bin/python3` (Tk 8.5) does not work; Tk 9 needs Matplotlib 3.10+. Without
 OpenMP the core runs on one core. The solver uses all cores (on Apple silicon
 the performance cores); Solver page → CPU threads. A core built for one CPU
@@ -101,6 +159,10 @@ View → `WSL: turn maximise into fill screen` switches this off.
 * `Device`: the template description, domain, base mesh, the mesh type
   (`Rectangular` or `Triangular (prisms)`, with the prism axis), adaptive
   mesh refinement and the final mesh statistics.
+* `Regions`: the regions table and, below it, the doping profiles
+  (implants and diffusions: Gaussian or erfc through a mask window on a
+  face, with lateral spread under the mask edges) that are added to the
+  regions' doping; the mesh refines at the junctions they make.
 * `Regions` and `Contacts`: scrollable tables. Select a row to edit it. A
   contact can be made of a metal (`Metal`; see below).
 * `Defects`: the defect table, the defect form (library preset, shape, size,
@@ -108,7 +170,9 @@ View → `WSL: turn maximise into fill screen` switches this off.
 * `Solver`: temperature, physical models (band-gap narrowing, τ(N), velocity
   saturation, quantum confinement, Lombardi surface mobility, gate
   tunnelling, metal-contact thermionic emission and barrier tunnelling,
-  impact ionisation), the background SRH lifetime, iteration limits,
+  impact ionisation, incomplete ionisation of 4H-SiC dopants), the
+  background SRH lifetime, the 4H-SiC c-axis
+  (mobility anisotropy; y = the wafer normal), iteration limits,
   tolerances and CPU threads. Each template sets the model switches it was
   designed with.
 * `Sweep`: the swept terminal, range and points, a floating terminal and the
@@ -543,12 +607,15 @@ insulators and where it is - a design limit of SiC trench MOSFETs (about
 acceptor states rising exponentially towards E_c,
 D_it(E) = D_edge exp(−(E_c − E)/E_t), with D_edge = 5.7e13 cm⁻²eV⁻¹ (the
 D_it field) and E_t = 67 meV (Potbhare et al.). They hold a large part of the
-channel charge near threshold.
+channel charge near threshold, and with the surface-mobility switch on their
+charge also scatters the channel electrons (Coulomb scattering). These are
+values of older oxides; the SiC MOSFET templates use D_edge = 1.5e13
+(NO-annealed).
 
 ## Validation
 
-`python3 validate.py` runs 185 checks against closed-form theory (about 12 min
-on two cores); `--templates` adds section 9: all 240 checks in about 23 min.
+`python3 validate.py` runs 220 checks against closed-form theory (about 9 min
+on two cores); `--templates` adds section 9: all 276 checks in about 16 min.
 Each check prints PASS/FAIL with its tolerance, and the script doubles as an
 example of driving the core without the interface. The references are in
 [SOURCES](SOURCES.md).
@@ -563,7 +630,7 @@ example of driving the core without the interface. The references are in
 | 6 | MOS capacitor: flat band, ψₛ(V_T) = 2φ_F, inversion charge | 0.06 mV; dQ/dV = 0.96 C_ox |
 | 7 | Long-channel NMOS, linear region: I_D vs μQ_inv V_DS/L | +1.25 % |
 | 8 | 2-D BJT (band-gap narrowing, τ(N)): base current vs Gummel number | within 0.45 % |
-| 9 | (`--templates`) all 55 templates converge at their default bias | all converge |
+| 9 | (`--templates`) all 56 templates converge at their default bias | all converge |
 | 10 | CMOS inverter, FinFET | V_T ±0.48 vs ±0.46 V; V_M 1.14 V; SS 67 mV/dec, DIBL 28 mV/V |
 | 11 | Gate tunnelling: Tsu-Esaki kernel, thin SiO2, high-k, Fowler-Nordheim | kernel 0.01 %; 81 A/cm² at 1 V (1.2 nm); FN slope 2.25e10 V/m |
 | 12 | MLDA quantum confinement, Lombardi mobility | ΔV_th +57 mV, centroid 0.82 nm; universal curve within 18 % |
@@ -574,6 +641,10 @@ example of driving the core without the interface. The references are in
 | 17 | Avalanche breakdown of Si p⁺/n junctions vs the ionisation integral and Baliga; 400 K; stored charge; short-base diode transit time; Early voltage and f_T extraction | BV within 0.2 % of the ionisation integral (1e16, 1e17 cm⁻³, 400 K), 3 % under Baliga; BV ×1.21 at 400 K; charge sums exact; transit time −3 %; V_A, f_T, β within 0.03 % |
 | 18 | Material parameters and analysis: Si mobility vs Masetti (1e15–1e20, 300 and 400 K), 4H-SiC holes vs Schaffer, nᵢ and V_bi at 250/400 K, the 32-contact limit, NaN from bad getter indices, ideality factor (n = 1 and 1.7, series resistance, 250–400 K), V_th (linear and saturation), SS above a noisy floor | mobility exact; n within 0.15 %; V_th exact; SS 0.0003 % |
 | 19 | MOSFET analysis: junction capacitance vs the depletion formula (0–10 V), MOS capacitor C/C_ox vs the exact low-frequency curve (accumulation to inversion), oxide field vs Gauss, C_o(tr)/C_o(er) of an analytic C(V), R_DS(on) slope and Joule shares of a resistor bar, VDMOS flowlines (stream function × width = drain current), VDMOS off-state capacitances (reciprocity, charge conservation), particles in a rotation and 3-D particles in a helix, SiC D_it band tail | C within 0.03 %; MOS C within 0.03 %; reciprocity 1e-6; flowlines exact (5e-8); Joule shares within 1.1 % |
+| 20 | 4H-SiC c-axis anisotropy: n- and p-SiC bars along and across the c-axis, the c-axis on x and off, prism mesh, 10 µm drift layer | R ratios 0.83 / 1.15 exact (1e-6); R_on,sp 0.93 → 0.77 mΩ·cm² |
+| 21 | 4H-SiC channel mobility: Coulomb term vs Uhnevionak's Eq. 26, interface charge N_C (oxide charge, fixed charge on oxide nodes, trapped charge), field-effect mobility of a long-channel NMOS, temperature, the 900 V template as a die | formula 1e-15; N_C exact; peak µ_FE 34.5 (measured 30-40), 12 at 1 MV/cm (10-20); I(400 K)/I(300 K) 1.8 at N_A 5e17; die 65 mΩ, ×1.47 at 150 °C (datasheet ×1.38) |
+| 22 | Incomplete ionisation: neutral p-SiC (Al) and n-SiC (N, two sites) at 300/450 K vs closed-form neutrality, a p-SiC resistor, the section-4 junction at 1 kV, Si unchanged | 1e-15; R exact; field within 0.12 %; Si bit-identical |
+| 23 | Doping profiles: Gaussian node values (both meshes), junction depth, dose, mask edge (peak/2, lateral junction), sheet resistance, the profile-free path, the diffused IRLZ44N-like cell | node values 2e-16; junctions within 0.1 nm; dose −0.37 %; R_sh +0.5 %; V_GS(th) 1.32 V (datasheet 1.0-2.0) |
 
 ## Device templates
 
@@ -611,7 +682,8 @@ through that terminal. y is depth: the top surface is y = 0 in every template.
 | RW: BC547 | Small-signal NPN | V_BE 0.7, V_CE 3 V | Base |
 | **RW: PNP / NPN power BJT 250 V (MJ21193 / MJ21194)** | Audio power transistors with a comb emitter: a 3-D section (0.28 × 0.20 mm) of interleaved emitter and base-contact fingers on bus bars, 7 µm base, 30 µm collector drift (5e14); the section plane opens as a top view of the two combs | V_BE ∓0.75, V_CE ∓5 V (PNP negative) | Base ∓0.45…−0.85 / +0.80 V: hFE 44 (PNP) / 56 (NPN), falling at high current as the collector goes into quasi-saturation (PNP 17 at ~17 A, NPN 46 at ~33 A for a 5 × 5 mm die, ×450 the section). Heavy: ~30 s per point |
 | **RW: Lateral PNP LDO 1 A (LM2940)** | One round-emitter cell (simulated as a quarter, triangular mesh) of the lateral PNP pass transistor of a bipolar LDO: 12.7 µm p emitter, 5 µm lateral base in 3e15 n-epi, p collector ring, n⁺ buried layer, base contact through an n⁺ sinker | V_EB 0.85, V_EC 2 V, substrate −5 V: 2.8 mA per emitter at β 25 | Collector: V_EC 2 → 0.05 V (dropout). Below ~0.2 V the transistor saturates: I_C −60 % at 0.05 V, base current ×4, substrate current ×10 |
-| RW: IRLZ44N, superjunction 600 V, SiC 900 V (C3M) | Power MOSFETs in the on-state | V_DS 1–2 V | Drain output curve |
+| RW: IRLZ44N, superjunction 600 V, SiC 900 V (C3M) | Power MOSFETs in the on-state; the SiC part with its channel model (NO-annealed band-tail traps) and a die scaling (65 mΩ at 25 °C) | V_DS 1–2 V | Drain output curve |
+| RW: IRLZ44N, diffused | The 55 V cell with diffused, self-aligned p-body and n+ source (doping profiles): channel ~0.55 µm, V_GS(th) ~1.3 V; A/B twin of the box version | V_GS 5 V, V_DS 2 V | Drain output curve |
 | RW: IGBT 1200 V (IKW40N120) | Field-stop trench IGBT with a transparent collector | V_GE 15, V_CE 1.5 V | Collector 0…1.8 V |
 | RW: GaN RF HEMT 28 V, GaN HEMT 650 V (GS66508) | RF HEMT; e-mode p-GaN gate | V_D 28 / 1 V | Drain / gate |
 | RW: Thyristor 800 V (BT151) | 4-layer pnpn; latching near V_G ≈ 0.65 V | V_AK 2 V | Gate 0…1 V |
@@ -686,7 +758,16 @@ described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdo
   Lombardi, gate tunnelling, stop/progress, terminal currents:**
   quasi-Fermi potentials clamped to the span of the terminal voltages, a
   balance step for floating quasi-neutral regions, Masetti (Si) and
-  Caughey-Thomas (other materials) mobility with velocity saturation, SRH τ(N) + Auger + radiative, Klaassen BGN, MLDA
+  Caughey-Thomas (other materials) mobility with velocity saturation,
+  incomplete ionisation (4H-SiC: N_D⁺, N_A⁻ from Boltzmann occupancy of the
+  dopant levels in Poisson's equation, the neutral contact values and the
+  start, their ψ-derivatives in the Newton matrix), the
+  4H-SiC channel model (Lombardi terms with Uhnevionak's parameters plus
+  Coulomb scattering on the interface charge N_C of the nearest interface
+  node - fixed charge plus the charged trap states there, per interface area
+  - with n from the reference quasi-Fermi potentials) (4H-SiC:
+  the low-field mobility of edges along the c-axis scaled by μ∥/μ⊥, on the
+  prism mesh the tensor projected on each edge), SRH τ(N) + Auger + radiative, Klaassen BGN, MLDA
   per-valley DOS cut at interfaces, Lombardi surface mobility, Tsu-Esaki/WKB
   gate tunnelling, cooperative stop, Kirchhoff-exact terminal currents with
   a round-off resolution floor.
@@ -710,10 +791,12 @@ described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdo
 * **Currents near avalanche** are converged to their resolution floor; when
   the multiplied current is below ~1e-16 A per cell it can still move by a
   few per cent between solves (the floor in the results says by how much).
-* **Boltzmann statistics, full ionisation.** No Fermi-Dirac statistics
-  (degenerate n++/p++ layers, GaAs above ~4e17 cm⁻³ and HEMT channels are
-  approximate) and every dopant is ionised (p-type 4H-SiC with Al and p-GaN
-  with Mg are far too conductive).
+* **Boltzmann statistics; incomplete ionisation in 4H-SiC only.** No
+  Fermi-Dirac statistics (degenerate n++/p++ layers, GaAs above ~4e17 cm⁻³
+  and HEMT channels are approximate). Incomplete ionisation (Solver page, on
+  by default) covers 4H-SiC (N on its two sites, Al) in steady state; there
+  is no Mott transition, so n+/p+ SiC stays partly ionised. p-GaN (Mg) and
+  the other materials are fully ionised (p-GaN is far too conductive).
 * **No negative differential mobility.** GaAs and InP electrons saturate
   smoothly at v_sat (no transferred-electron peak, no Gunn effect): short
   GaAs/InP channels carry 2–3× too little current near the peak field.
@@ -742,21 +825,33 @@ described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdo
   conducting pipes. Capture cross sections are literature values with large
   scatter.
 * **Drift-diffusion transport.** No ballistic transport, strain or
-  remote-phonon scattering; Lombardi has Si parameters only.
+  remote-phonon scattering; Lombardi has Si parameters, and 4H-SiC
+  electron parameters with Coulomb scattering (see below).
 * **Not modelled:** self-heating, field plates, transients/AC. Capacitances
   are quasi-static (low frequency): no high-frequency MOS C-V and no
   switching gate charge; with a channel on, the split of its charge between
   source and drain is approximate.
-* **SiC MOSFET channels.** The Lombardi surface mobility is silicon only: a
-  4H-SiC inversion channel keeps its bulk mobility (hundreds of cm²/Vs,
-  against the 20-40 cm²/Vs measured, which Coulomb scattering on the
-  interface charge sets), so its channel resistance comes out several times
-  too low. The band-tail D_it preset adds the trapped charge, not the
-  scattering. 4H-SiC also conducts about 20 % better along its c-axis
-  (vertical drift regions) - not modelled.
-* **Uniform doping.** Every region is uniformly doped: the lateral doping
-  gradient of a DMOS channel, which sets both V_th and the channel length, is
-  approximated by boxes.
+* **SiC MOSFET channels.** The surface model (the Lombardi switch: surface
+  phonons, roughness and Coulomb scattering on the interface charge) is
+  checked against measured field-effect mobilities of NO-annealed Si-face
+  devices (peak 30-40, 10-20 cm²/Vs at 1 MV/cm), not fitted to a process:
+  roughness and Coulomb parameters vary between oxides (the thesis's 25.5 nm
+  set gives about 3× the mobility). The Coulomb term needs the interface
+  charge in the device (band-tail traps on the Defects page, oxide charge)
+  and sees the nearest interface only. Hole channels and other crystal
+  faces ((11-20) trench sidewalls conduct about 2× better) have no
+  parameters of their own.
+* **Anisotropic mobility: 4H-SiC's low-field mobility only.** Electrons are
+  1/0.83 = 1.20× faster along the c-axis, holes 1/1.15 = 0.87× (Burin et al.
+  2024; the material data are the in-plane values, and the maps show them).
+  Velocity saturation and impact ionisation stay isotropic, GaN and the
+  other materials are isotropic, and the c-axis lies along x, y or z (no
+  4° off-cut).
+* **Doping profiles are analytic.** Gaussian or erfc profiles through a
+  rectangular mask window on one face of the domain, added to the uniformly
+  doped regions: no process simulation (no segregation at oxides, no
+  oxidation-enhanced or concentration-dependent diffusion, no channelling
+  tails).
 * **Adaptive mesh refinement** works on the rectangular mesh only; a new line
   runs through the whole device. It resolves what the indicator sees
   (space charge, band bending, quasi-Fermi curvature); quantities that hinge
@@ -769,11 +864,14 @@ described in [BJT effects, breakdown and comparing designs](#bjt-effects-breakdo
 * **Limits.** At most 32 contacts and 16 different materials (gate-stack and
   defect materials count); more gives an error.
 * **Speed.** Gummel iteration is slow under strong high-level injection: the
-  1200 V IGBT takes about 2 min at its default bias on two cores, most
+  1200 V IGBT takes 2–3 min at its default bias on two cores, most
   templates seconds. The Gummel loop stops converging in a few high-current
   regimes (the 1200 V IGBT near V_CE ≈ 2 V; trench MOSFETs at full gate drive
   beyond V_DS ≈ 3–7 V; the superjunction beyond V_DS ≈ 5 V); the default
-  sweeps stay inside the converging range.
+  sweeps stay inside the converging range. The SiC MOSFET templates (channel
+  model with trapped interface charge) converge slowly towards saturation:
+  their output sweeps take several minutes, and a point near the end of the
+  trench MOSFET's sweep can miss the tolerance.
 * **Memory.** About 760 bytes per node (a prism mesh about 30 % more). The GUI
   refuses meshes larger than 80 % of the free RAM.
 * **Triangular mesh.** A 2-D triangulation extruded along one axis, not a

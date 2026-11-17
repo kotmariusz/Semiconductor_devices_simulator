@@ -12,9 +12,16 @@ exception or error dialog.  Needs a display (Linux CI: xvfb-run).
 """
 import os, sys, time, tempfile, traceback
 
+for _s in (sys.stdout, sys.stderr):        # a Windows console may not be UTF-8
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 if "--flat" in sys.argv:
     os.environ["SEMISIM_FLAT_BUTTONS"] = "1"
-os.environ["HOME"] = tempfile.mkdtemp(prefix="semisim_home_")   # fresh settings file
+TMP = tempfile.mkdtemp(prefix="semisim_smoke_")                  # every file the test writes
+os.environ["HOME"] = TMP                                         # fresh settings file (Linux, macOS)
+os.environ["SEMISIM_SETTINGS"] = os.path.join(TMP, "settings.json")   # ... and on Windows
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import main as M  # noqa: E402
@@ -67,6 +74,8 @@ try:
     def tabs():
         for i in range(len(app._TABS)):
             app.nb.select(i); pump(0.6)
+        for q in ("net doping", "ionised doping", "trapped charge"):     # 3-D slicer maps
+            app.sl_qty.set(q); app._upd_slice(); pump(0.2)
     step("every plot tab draws", tabs)
 
     def arrows():
@@ -93,7 +102,7 @@ try:
         P0 = app._anim.P.copy(); pump(0.6)
         assert np.abs(app._anim.P - P0).max() > 0, "particles move"
         app._anim_toggle(); pump(0.3); assert not app._anim_on and app._anim is None
-        gif = os.path.join(os.environ["HOME"], "flow.gif")
+        gif = os.path.join(TMP, "flow.gif")
         app._anim_gif(path=gif, frames=8); pump(0.3)
         from PIL import Image
         with Image.open(gif) as im:
@@ -209,7 +218,7 @@ try:
         app.ptab_all.set(True); app.ptab_ref.set(names[1]); app.ptab_mode.set("Differences only"); app._ptab_fill()
         pump(0.3); assert len(app._ptab_table()[0]) == 2 + 3 + 2, app._ptab_table()[0]
         app._ptab_copy(); assert app.clipboard_get().count("\t") > 20
-        csv_path = os.path.join(os.environ["HOME"], "ptab.csv")
+        csv_path = os.path.join(TMP, "ptab.csv")
         M.filedialog.asksaveasfilename = lambda *a, **k: csv_path
         app._ptab_csv(); assert open(csv_path, encoding="utf-8").read().startswith("Parameter,Unit,")
         app._ptab_top.destroy()
@@ -219,7 +228,7 @@ try:
         import json
         app._load("NMOS"); pump(0.2)
         d = app._device_json(); d["regs"][0]["x1"] = d["regs"][0]["x0"] - 1.
-        p = os.path.join(os.environ["HOME"], "bad_device.json")
+        p = os.path.join(TMP, "bad_device.json")
         with open(p, "w") as f: json.dump(d, f)
         M.filedialog.askopenfilename = lambda *a, **k: p
         before = (app.tname, len(app.regs), len(app.cons)); n0 = len(ERRORS)
@@ -228,6 +237,41 @@ try:
         assert (app.tname, len(app.regs), len(app.cons)) == before
         del ERRORS[n0:]
     step("a malformed device file is refused", bad_file)
+
+    def caxis_file():                    # the 4H-SiC c-axis travels with a device file
+        import json
+        app._load("NMOS"); pump(0.2)
+        app.caxis.set("x"); d = app._device_json()
+        assert d["solver"]["caxis"] == "x" and app._device_dict()["caxis"] == "x", d["solver"]
+        p = os.path.join(TMP, "caxis_device.json")
+        with open(p, "w", encoding="utf-8") as f: json.dump(d, f)
+        app.caxis.set("y"); M.filedialog.askopenfilename = lambda *a, **k: p
+        app._open_device(); pump(0.2)
+        assert app.caxis.get() == "x", app.caxis.get()
+        app._load("NMOS"); pump(0.2)
+        assert app.caxis.get() == "y", app.caxis.get()      # a template: the wafer normal
+    step("the c-axis option travels with a device file", caxis_file)
+
+    def profiles():                      # doping profiles: editor, structure view, device file (version 2)
+        import json
+        app._load("RW: Si MOSFET 55V (IRLZ44N), diffused"); pump(0.5)
+        assert len(app.implants) == 4 and len(app.itree.get_children()) == 4
+        app.nb.select(0); pump(0.8)                                  # Structure: junction contours, windows
+        app.ib_dt.set("n"); app.ib_kind.set("erfc"); app.ib_face.set("y0"); app._fullimp()
+        app.ib_peak.set("1e18"); app.ib_Lv.set("50"); app._addimp(); pump(0.3)
+        assert len(app.implants) == 5 and app.implants[-1].kind == "erfc"
+        app._select(app.itree, 4); pump(0.2); app._delimp(); pump(0.3)
+        assert len(app.implants) == 4
+        d = app._device_json()
+        assert d["version"] == 2 and len(d["implants"]) == 4, (d["version"], len(d.get("implants", [])))
+        p = os.path.join(TMP, "profiles_device.json")
+        with open(p, "w", encoding="utf-8") as f: json.dump(d, f)
+        app._load("NMOS"); pump(0.3)
+        assert not app.implants and app._device_json()["version"] == 1 and "implants" not in app._device_json()
+        M.filedialog.askopenfilename = lambda *a, **k: p
+        app._open_device(); pump(0.5)
+        assert len(app.implants) == 4 and app.implants[0].label == "p-body L (diffused)"
+    step("doping profiles: editor, structure view, device file", profiles)
 
     def window():
         app._toggle_drawer(); pump(0.4); app._toggle_drawer(); pump(0.4)

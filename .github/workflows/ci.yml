@@ -1,14 +1,23 @@
 # Builds the core and runs the validation battery and a GUI smoke test on
-# Ubuntu and macOS, through the same install.sh the README tells people to run.
+# Ubuntu, macOS and Windows, through the same installers the README tells
+# people to run (install.sh, install.bat -> install_win.py).
 #
-# macOS runner minutes are free for public repositories but count 10x for
-# private ones: to save them, delete "push" from the macos job's triggers
-# (run it by hand from the Actions tab instead).
+# Cost: free for public repositories.  In a private one the included monthly
+# credit (GitHub Free: $12) is charged per minute: Linux $0.006, Windows
+# $0.010, macOS $0.062 (GitHub Docs, Nov 2026) - a Windows run of ~25 min is
+# about $0.25, a macOS run of ~30 min about $1.90.  To save minutes, remove
+# "push" from a job's triggers and run it by hand from the Actions tab.
+#
+# Windows from a branch without touching main:
+#     git switch -c win-port && git push origin win-port
+# A release (Windows zip with a ready-made core) from a tag:
+#     git tag v0.2.5 && git push origin v0.2.5
 name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'win-*']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -23,8 +32,12 @@ jobs:
         run: bash install.sh
       - name: Core build info
         run: python3 semibuild.py --check
+      - name: Platform test (with a Windows cross-build of the core)
+        run: |
+          sudo apt-get install -y gcc-mingw-w64-x86-64-posix
+          python3 tests/test_platform.py
       - name: Validation (selected sections)
-        run: python3 validate.py --only 2,4,6,7,8,11,12,14,15,17,18,19
+        run: python3 validate.py --only 2,4,6,7,8,11,12,14,15,17,18,19,20,21,22,23
       - name: GUI smoke test
         run: |
           sudo apt-get install -y xvfb
@@ -41,7 +54,74 @@ jobs:
         run: bash install.sh
       - name: Core build info
         run: .venv/bin/python semibuild.py --check
+      - name: Platform test
+        run: .venv/bin/python tests/test_platform.py
       - name: Validation (selected sections)
-        run: .venv/bin/python validate.py --only 2,4,6,7,8,11,12,14,15,17,18,19
+        run: .venv/bin/python validate.py --only 2,4,6,7,8,11,12,14,15,17,18,19,20,22,23
       - name: GUI smoke test
         run: .venv/bin/python tests/gui_smoke.py
+
+  windows:
+    name: Windows (install_win.py, MinGW-w64 UCRT gcc)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # no PYTHONUTF8 / PYTHONIOENCODING on purpose: the programs must cope with
+    # the runner's own console code page
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Put the UCRT64 gcc on PATH
+        run: |
+          $bin = Join-Path '${{ steps.msys2.outputs.msys2-location }}' 'ucrt64\bin'
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+      - name: Compiler
+        run: gcc -v
+      - name: Install (venv, packages, core build, self-test, launchers)
+        run: python install_win.py --no-shortcuts
+      - name: Core build info
+        run: .venv\Scripts\python.exe semibuild.py --check
+      - name: Platform test
+        run: .venv\Scripts\python.exe tests\test_platform.py
+      - name: Validation (selected sections)
+        run: .venv\Scripts\python.exe validate.py --only 2,4,6,7,8,11,12,14,15,17,18,19,20,22,23
+      - name: GUI smoke test
+        run: |
+          .venv\Scripts\python.exe tests\gui_smoke.py
+          .venv\Scripts\python.exe tests\gui_smoke.py --flat
+      - name: Windows zip (portable core included)
+        run: |
+          .venv\Scripts\python.exe semibuild.py --portable -o dist\core\semiconductor_core.dll
+          .venv\Scripts\python.exe tools\win_release_zip.py dist\core dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SemiSim3D-windows-x64
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub release (Windows zip)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SemiSim3D-windows-x64
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip --repo "${GITHUB_REPOSITORY}" --generate-notes --title "SemiSim 3D ${GITHUB_REF_NAME}"

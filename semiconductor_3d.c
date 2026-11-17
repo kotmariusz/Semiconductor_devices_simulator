@@ -45,7 +45,44 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+/* the two Win32 calls the core needs, declared here: <windows.h> would
+   redefine names this file uses (near, far) */
+typedef struct { unsigned long dwLength, dwMemoryLoad;
+                 unsigned long long ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile,
+                                    ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual; } SemiMemStat;
+__declspec(dllimport) int __stdcall GlobalMemoryStatusEx(SemiMemStat *st);
+__declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char *name, char *buf, unsigned long n);
+#endif
+
+/* Physical RAM in bytes, 0 when unknown (sizes the Anderson history). */
+static double phys_ram_bytes(void){
+#if defined(_WIN32)
+    SemiMemStat st; memset(&st,0,sizeof st); st.dwLength=(unsigned long)sizeof st;
+    return GlobalMemoryStatusEx(&st) ? (double)st.ullTotalPhys : 0.;
+#elif defined(_SC_PHYS_PAGES)
+    long pg=sysconf(_SC_PHYS_PAGES), ps=sysconf(_SC_PAGE_SIZE);
+    return (pg>0 && ps>0) ? (double)pg*(double)ps : 0.;
+#else
+    return 0.;
+#endif
+}
+
+/* An environment variable (tuning knobs, SEMISIM_*).  On Windows it is read
+   from the process environment itself: a core linked to another C runtime
+   than Python's would not see os.environ changes through getenv(). */
+static const char *env_get(const char *name){
+#ifdef _WIN32
+    static char buf[16][256]; static int slot=0;
+    char *b=buf[slot]; slot=(slot+1)%16;
+    unsigned long n=GetEnvironmentVariableA(name,b,(unsigned long)sizeof buf[0]);
+    return (n>0 && n<sizeof buf[0]) ? b : NULL;
+#else
+    return getenv(name);
+#endif
+}
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -115,9 +152,28 @@ typedef struct {
     /* metal contacts: effective Richardson constants A** (A/m^2 K^2) of
        electrons / holes (thermionic emission and barrier tunnelling)        */
     double rich_n,rich_p;
-    /* Lombardi surface mobility (cm units, Sentaurus form); lb_on = 0: off */
+    /* mobility anisotropy of a hexagonal crystal: mu along the c-axis /
+       mu across it, electrons and holes (0 = isotropic; the low-field
+       parameters above are the across-c values; the c-axis is Dev.caxis)  */
+    double ani_n, ani_p;
+    /* Lombardi surface mobility (cm units, Sentaurus form); lb_on: bit 0
+       electrons, bit 1 holes (0 = off).  lbE: the roughness term F^3/eta
+       (V^2/(cm s); 0 = none, as in Si) */
     int    lb_on;
-    double lbB_n,lbC_n,lbL_n,lbD_n, lbB_p,lbC_p,lbL_p,lbD_p;
+    double lbB_n,lbC_n,lbL_n,lbD_n, lbB_p,lbC_p,lbL_p,lbD_p, lbE_n,lbE_p;
+    /* Coulomb scattering of electrons on the interface charge, in the
+       Matthiessen sum of the Lombardi terms (Uhnevionak 2015 form, cm
+       units): mu_C = mu1 (T/300) {1 + [n/(n_tr(N_A) (N_C/N0)^e1)]^nu} /
+       ((N_C/N0)^e2 f(F)), f = 1 - exp(-(F/E0)^gam); lbc_on = 0: off */
+    int    lbc_on;
+    double lbc_mu1, lbc_nu, lbc_N0, lbc_e1, lbc_e2, lbc_E0, lbc_gam;
+    /* incomplete ionisation (models bit 9; Boltzmann statistics): donors on
+       up to two lattice sites (weights ion_w), level dE = dE0 - alpha N^(1/3)
+       below Ec (eV; alpha in eV m; clamped at 0), degeneracy g; acceptors one
+       level above Ev.  N_D+ = N_D sum_s w_s / (1 + g_D n/N_c e^(dE_s/kT)),
+       N_A- = N_A / (1 + g_A p/N_v e^(dE_A/kT)).  ion_on = 0: fully ionised */
+    int    ion_on;
+    double ion_w[2], ion_Ed[2], ion_ad[2], ion_gd, ion_Ea, ion_aa, ion_ga;
     /* impact ionisation (avalanche), Chynoweth law per carrier (0 n, 1 p):
          alpha(F) = g a exp(-(g b / F)^m),   F = field along the current,
        a (1/m) and b (V/m) below / above the field E0 (V/m), exponent m; the
@@ -247,6 +303,9 @@ typedef struct {
                                      current at the last accepted Gummel iterate (A) */
     double cont_atol_f;                     /* factor on CONT_ATOL (lowered when a metal-contact current stalls) */
     int    nthreads;
+    int    caxis;                 /* the c-axis of hexagonal materials (mobility
+                                     anisotropy): 0 x, 1 y (default: the wafer
+                                     normal of a vertical device), 2 z, -1 off */
     int    models;                /* bit0 BGN, bit1 tau(N), bit2 v-sat, bit3 MLDA
                                      quantum confinement, bit4 Lombardi surface
                                      mobility, bit5 gate tunnelling, bit6/7
@@ -289,6 +348,19 @@ typedef struct {
     TrapSp tsp[TSP_MAX]; int n_tsp;
     int *trq_k, *trq_s; double *trq_N; int n_trq, cap_trq;
     int *tr_rp, *tr_s; double *tr_N, *tr_cn, *tr_cp; int n_tr;
+    /* Coulomb scattering on interface charge (models bit 4, materials with
+       lbc_on): interface entries - semiconductor nodes at an insulator or
+       under a face gate: node, interface area (m^2), fixed charge there
+       (elementary charges, magnitudes summed) and N_C (m^-2: fixed plus
+       trapped, updated with the mobility); qi: per node the nearest entry
+       within COUL_REACH (-1: none) */
+    int lbc, n_if; size_t *if_k; double *if_A, *if_Qf, *if_NC; int *qi;
+    /* incomplete ionisation (models bit 9, a material with ion_on): per node
+       N_c/g_D e^(-dE/kT) of the two donor sites and N_v/g_A e^(-dE_A/kT)
+       (m^-3; 0 = fully ionised), and the majority density of the node when
+       neutral (m^-3: the doping scale of the solver's heuristics); NULL:
+       every dopant ionised */
+    double *ion;
 } Dev;
 
 static Dev gdev;
@@ -326,6 +398,25 @@ static inline void trap_eval(const Dev *d, size_t k, double n, double p,
             *drho-= Nt*df;
         }
     }
+}
+/* charged trap states of node k (m^-3, all signs counted): occupied
+   acceptors plus empty donors - the scattering centres of the trapped charge */
+static double trap_abs(const Dev *d, size_t k, double n, double p){
+    if(!d->tr_rp) return 0.;
+    int q0=d->tr_rp[k], q1=d->tr_rp[k+1]; if(q0>=q1) return 0.;
+    const Mat *m=&d->mats[d->mat_idx[k]]; double VT=m->VT, ni=nikf(d,k), ni2=ni*ni, sum=0.;
+    for(int q=q0;q<q1;q++){
+        const TrapSp *s=&d->tsp[d->tr_s[q]];
+        if(!s->type) continue;
+        double n1,p1;
+        if(s->ref==0){ n1=m->Nc*exp(-s->E/VT); p1=ni2/n1; }
+        else if(s->ref==1){ p1=m->Nv*exp(-s->E/VT); n1=ni2/p1; }
+        else { n1=ni*exp(s->E/VT); p1=ni*exp(-s->E/VT); }
+        double cn=d->tr_cn[q], cp=d->tr_cp[q], Nt=d->tr_N[q];
+        double f=(cn*n+cp*p1)/(cn*(n+n1)+cp*(p+p1)+1e-300);
+        sum += s->type<0 ? Nt*f : Nt*(1.-f);
+    }
+    return sum;
 }
 
 /* ------------------------------------------------------------ materials */
@@ -369,7 +460,7 @@ static void mat_init(Mat *m, int id, double T){
            barrier tunnelling masses 0.26 / 0.39 (Chang-Sze, Yu) */
         m->rich_n=1.12e6; m->rich_p=3.2e5; m->mt_e=0.26; m->mt_h=0.39;
         /* Lombardi (1988) as parameterised in Sentaurus: B/F + C N^l / F^(1/3); delta/F^2 */
-        m->lb_on=1;
+        m->lb_on=3;
         m->lbB_n=4.75e7; m->lbC_n=580.;  m->lbL_n=0.125;  m->lbD_n=5.82e14;
         m->lbB_p=9.925e6; m->lbC_p=2947.; m->lbL_p=0.0317; m->lbD_p=2.0546e14;
         /* impact ionisation: van Overstraeten & de Man 1970 - electrons
@@ -437,6 +528,35 @@ static void mat_init(Mat *m, int id, double T){
         m->ii_on=1; m->ii_E0[0]=m->ii_E0[1]=1e30; m->ii_m[0]=m->ii_m[1]=1.;
         m->ii_a[0][0]=m->ii_a[0][1]=1.76e10; m->ii_b[0][0]=m->ii_b[0][1]=3.30e9;
         m->ii_a[1][0]=m->ii_a[1][1]=3.41e10; m->ii_b[1][0]=m->ii_b[1][1]=2.50e9;
+        /* inversion-channel mobility at oxide interfaces (Lombardi bit,
+           electrons only - no hole parameters): surface phonons B 1e6 cm/s,
+           C 3.23e6 K cm/s (V/cm)^-2/3 (1.077e4 with T/300), exponent 0.0284;
+           roughness delta 1.7e13 cm^2/Vs, eta 1.7e29 V^2/(cm s) - Uhnevionak,
+           PhD thesis FAU Erlangen 2015, Tables 6-7 (IEEE TED 62, 2562, 2015),
+           the set of its 34 nm oxide (N_A 5e17) device: with it a long-
+           channel NMOS reaches the measured 30-40 cm^2/Vs peak and 10-20 at
+           1 MV/cm (validate.py section 21); the thesis's 25.5 nm set (delta
+           1.6e14, eta 1.6e30, lightly doped Hall samples) leaves it at 100+.
+           Coulomb scattering on the interface charge: the same thesis's form
+           (Eqs. 26-28) with n_trans of its Table 5 and Sentaurus-style
+           values (mu1 40 cm^2/Vs, nu 1.5, N0 1e11 cm^-2, e1 1, e2 0.5, E0
+           2e5 V/cm, gam 2) - checked, not fitted, against measured channel
+           mobilities (section 21) */
+        m->lb_on=1;
+        m->lbB_n=1e6; m->lbC_n=1.077e4; m->lbL_n=0.0284; m->lbD_n=1.7e13; m->lbE_n=1.7e29;
+        m->lbc_on=1; m->lbc_mu1=40.; m->lbc_nu=1.5; m->lbc_N0=1e11; m->lbc_e1=1.; m->lbc_e2=0.5;
+        m->lbc_E0=2e5; m->lbc_gam=2.;
+        /* incomplete ionisation: nitrogen on hexagonal and cubic sites (1:1),
+           70.9 and 123.7 meV, alpha 3.38e-8 and 4.65e-8 eV cm (Kagamihara et
+           al.), g_D 2; aluminium 225 meV, alpha 3.2e-8 eV cm, g_A 4 (the
+           centre of the values compiled by Burin et al., arXiv:2410.06798) */
+        m->ion_on=1; m->ion_w[0]=m->ion_w[1]=0.5;
+        m->ion_Ed[0]=0.0709; m->ion_ad[0]=3.38e-10; m->ion_Ed[1]=0.1237; m->ion_ad[1]=4.65e-10; m->ion_gd=2.;
+        m->ion_Ea=0.225; m->ion_aa=3.2e-10; m->ion_ga=4.;
+        /* c-axis anisotropy (Burin et al., TCAD parameters for 4H-SiC: a
+           review, arXiv:2410.06798): mu_perp/mu_par = 0.83 +- 0.07 for
+           electrons (faster along c), 1.15 +- 0.04 for holes */
+        m->ani_n=1./0.83; m->ani_p=1./1.15;
         break;
     case 5: /* GaN */
         m->Eg=3.507-9.09e-4*T*T/(T+830.); m->chi=4.1; m->eps_r=8.9;
@@ -626,6 +746,44 @@ static inline double pK(const Dev *d, size_t k, double psi, double qp){
    D = dpsi/VT + d(ln Nc_eff), holes D = dpsi/VT - d(ln Nv_eff) */
 static inline double dlnc(const Dev *d, size_t a, size_t b){ return lncK(d,b)-lncK(d,a); }
 static inline double dlnv(const Dev *d, size_t a, size_t b){ return lnvK(d,b)-lnvK(d,a); }
+/* Incomplete ionisation: the ionised donor and acceptor densities of node k
+   at carrier densities n, p (m^-3), and their derivatives with respect to
+   psi at fixed quasi-Fermi potentials (dn/dpsi = n/VT, dp/dpsi = -p/VT):
+   dNp <= 0, dNm >= 0, so both deepen the Poisson diagonal.  The level
+   follows the local band edge (band-gap narrowing, image-force lowering). */
+#define ION_W 4                            /* doubles per node in Dev.ion */
+static inline int ion_node(const Dev *d, size_t k){
+    return d->ion && ((d->ion[ION_W*k]>0. && d->Nd[k]>0.) || (d->ion[ION_W*k+2]>0. && d->Na[k]>0.));
+}
+static inline void ion_eval(const Dev *d, size_t k, double n, double p,
+                            double *Np, double *dNp, double *Nm, double *dNm){
+    double Nd=d->Nd[k], Na=d->Na[k];
+    *Np=Nd; *Nm=Na; *dNp=*dNm=0.;
+    if(!d->ion) return;
+    const double *x=d->ion+ION_W*k; const Mat *m=MK(d,k); double VT=m->VT;
+    if(Nd>0. && x[0]>0.){
+        double e=d->bgn[k]+d->qcn[k], ne= e!=0. ? n*exp(-e) : n;
+        double a=ne/x[0], f=m->ion_w[0]/(1.+a), df=-m->ion_w[0]*a/((1.+a)*(1.+a));
+        if(m->ion_w[1]>0. && x[1]>0.){
+            double b=ne/x[1]; f+=m->ion_w[1]/(1.+b); df-=m->ion_w[1]*b/((1.+b)*(1.+b));
+        }
+        *Np=Nd*f; *dNp=Nd*df/VT;
+    }
+    if(Na>0. && x[2]>0.){
+        double e=d->bgn[k]+d->qcp[k], pe= e!=0. ? p*exp(-e) : p;
+        double c=pe/x[2];
+        *Nm=Na/(1.+c); *dNm=Na*c/((1.+c)*(1.+c)*VT);
+    }
+}
+/* The doping scale of the solver's heuristics (quasi-neutral majority
+   tests, the neutral-region predictor): |Nd - Na|, or with incomplete
+   ionisation the node's majority density when neutral - a fixed property
+   of the node, not of the iterate (a test against the ionised doping of
+   the current densities lets half-depleted nodes pass as neutral) */
+static inline double dnet_ion(const Dev *d, size_t k){
+    if(!ion_node(d,k)) return fabs(d->Nd[k]-d->Na[k]);
+    return d->ion[ION_W*k+3];
+}
 static inline double tauf(const Dev *d, size_t k){
     const Mat *m=MK(d,k);
     if(!(d->models&2) || !(m->tau_Nref>0.)) return 1.;
@@ -757,6 +915,7 @@ static void gfree(Dev *d){
     d->unstr=0; d->nE=d->nUE=0;
 }
 
+static void coul_free(Dev *d);
 static void free_dev(Dev *d){
     mg_free(d);
     aa_free(d);
@@ -769,6 +928,8 @@ static void free_dev(Dev *d){
     tun_free(d);
     te_free(d);
     traps_free(d,1);
+    coul_free(d);
+    free(d->ion); d->ion=NULL;
     for(int q=0;q<6;q++){ free(d->fmu[q]); d->fmu[q]=NULL; }
     d->xs=d->ys=d->zs=d->Lx=d->Ly=d->Lz=NULL;
     d->mat_idx=d->con_mask=d->gate_mask=NULL; d->kind=NULL;
@@ -799,15 +960,12 @@ static int alloc_dev(Dev *d, int Nx, int Ny, int Nz){
     /* Anderson depth: AA_MAX unless physical RAM is short (the history is an
        accelerator only: 24 B/node per level) */
     int want=AA_MAX;
-#ifdef _SC_PHYS_PAGES
-    { long pg=sysconf(_SC_PHYS_PAGES), ps=sysconf(_SC_PAGE_SIZE);
-      if(pg>0 && ps>0){
-          double ram=(double)pg*(double)ps;
+    { double ram=phys_ram_bytes();
+      if(ram>0.){
           double base=(double)N*(N_NODE_D*8.+6.*sizeof(mu_t)+13.+16.+48.);
           int fit=(int)floor((0.75*ram-base)/((double)N*24.));
           if(fit<want) want=fit;
       } }
-#endif
     if(!aa_alloc(d,N,want)){ free_dev(d); return 0; }
     return 1;
 }
@@ -871,15 +1029,12 @@ static int alloc_dev_graph(Dev *d, int N, int E, const int *rp, const int *cj, c
     for(int k=0;k<N;k++){ d->qd[k]=1.; for(int q=0;q<6;q++) d->gwall[6*k+q]=1.; }
     if(!gmg_alloc(d)){ free_dev(d); return 0; }
     int want=AA_MAX;
-#ifdef _SC_PHYS_PAGES
-    { long pg=sysconf(_SC_PHYS_PAGES), ps=sysconf(_SC_PAGE_SIZE);
-      if(pg>0 && ps>0){
-          double ram=(double)pg*(double)ps;
+    { double ram=phys_ram_bytes();
+      if(ram>0.){
           double base=(double)N*(N_NODE_D*8.+13.+16.+48.+120.)+(double)E*40.;
           int fit=(int)floor((0.75*ram-base)/((double)N*24.));
           if(fit<want) want=fit;
       } }
-#endif
     if(!aa_alloc(d,(size_t)N,want)){ free_dev(d); return 0; }
     return 1;
 }
@@ -1314,6 +1469,172 @@ static int traps_build(Dev *d){
     return 1;
 }
 
+/* Per-node ionisation constants (models bit 9 and a material with ion_on):
+   N_c/g_D e^(-dE_s/kT) for the two donor sites, N_v/g_A e^(-dE_A/kT); the
+   level depths fall with the node's own dopant density, dE = dE0 - alpha
+   N^(1/3), clamped at 0.  Everything else stays fully ionised. */
+static double neutral_psi(const Dev *d, size_t k, double V);
+static int ion_build(Dev *d){
+    free(d->ion); d->ion=NULL;
+    if(!(d->models&512)) return 1;
+    int any=0;
+    for(int q=0;q<d->n_mats;q++) if(d->mats[q].ion_on && !d->mats[q].insulator) any=1;
+    if(!any) return 1;
+    size_t N=NN(d);
+    d->ion=calloc(ION_W*N,sizeof(double)); if(!d->ion) return 0;
+    #pragma omp parallel for schedule(static) if(N>PAR_MIN)
+    for(size_t k=0;k<N;k++){
+        if(d->kind[k]!=K_SEMI) continue;
+        const Mat *m=MK(d,k); if(!m->ion_on) continue;
+        double *x=d->ion+ION_W*k, VT=m->VT;
+        if(d->Nd[k]>0.){
+            double c=cbrt(d->Nd[k]);
+            for(int s_=0;s_<2;s_++){
+                double E=fmax(m->ion_Ed[s_]-m->ion_ad[s_]*c,0.);
+                x[s_]=m->Nc/m->ion_gd*exp(-E/VT);
+            }
+        }
+        if(d->Na[k]>0.){
+            double E=fmax(m->ion_Ea-m->ion_aa*cbrt(d->Na[k]),0.);
+            x[2]=m->Nv/m->ion_ga*exp(-E/VT);
+        }
+    }
+    /* the neutral majority density (needs the constants above) */
+    #pragma omp parallel for schedule(static) if(N>PAR_MIN)
+    for(size_t k=0;k<N;k++){
+        if(!ion_node(d,k)) continue;
+        double psi=neutral_psi(d,k,0.), n=nK(d,k,psi,0.), p=pK(d,k,psi,0.);
+        d->ion[ION_W*k+3]=fabs(n-p);
+    }
+    return 1;
+}
+
+/* ------------------------------------- Coulomb scattering on interface charge */
+#define COUL_REACH 150e-9                 /* D = exp(-15) beyond: the term is gone */
+#define NBR_MAX 64
+static void coul_free(Dev *d){
+    free(d->if_k); free(d->if_A); free(d->if_Qf); free(d->if_NC); free(d->qi);
+    d->if_k=NULL; d->if_A=d->if_Qf=d->if_NC=NULL; d->qi=NULL; d->n_if=0; d->lbc=0;
+}
+static inline void node_xyz(const Dev *d, size_t k, double p[3]){
+    if(d->unstr){ p[0]=d->gpos[3*k]; p[1]=d->gpos[3*k+1]; p[2]=d->gpos[3*k+2]; return; }
+    int i,j,l; unidx(d,k,&i,&j,&l); p[0]=d->xs[i]; p[1]=d->ys[j]; p[2]=d->zs[l];
+}
+static inline double node_vol(const Dev *d, size_t k){
+    int i,j,l; unidx(d,k,&i,&j,&l); return volume(d,i,j,l);
+}
+static inline double dist2(const double *a, const double *b){
+    return (a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1])+(a[2]-b[2])*(a[2]-b[2]);
+}
+/* neighbours of node k on either mesh (node, dual face area), at most NBR_MAX */
+static int nbr_list(const Dev *d, size_t k, size_t *kb, double *ar){
+    int c=0;
+    if(d->unstr){
+        for(int e=d->grp[k];e<d->grp[k+1] && c<NBR_MAX;e++){ kb[c]=(size_t)d->gcol[e]; ar[c]=d->ga[e]; c++; }
+        return c;
+    }
+    int i,j,l; unidx(d,k,&i,&j,&l);
+    for(int dir=0;dir<6;dir++){ double h; if(nbr(d,i,j,l,dir,kb+c,&h,ar+c)) c++; }
+    return c;
+}
+/* Interface entries and every node's nearest one (models bit 4 with a
+   Coulomb material).  An entry is a semiconductor node of such a material
+   next to an insulator node or under a face gate; its area is the dual-face
+   area towards the insulator plus the gate area; its fixed charge the
+   magnitudes of the node's own fixed charge, the fixed charge of the oxide
+   nodes next to it (each shared among its semiconductor neighbours by area)
+   and the face gate's oxide charge.  The nearest entry of every node within
+   COUL_REACH: a label-correcting breadth-first search through the
+   semiconductor (Euclidean distance to the labels' nodes). */
+static int coul_build(Dev *d){
+    coul_free(d);
+    if(!(d->models&16)) return 1;
+    int any=0;
+    for(int q=0;q<d->n_mats;q++) if(d->mats[q].lbc_on && (d->mats[q].lb_on&1)) any=1;
+    if(!any) return 1;
+    size_t N=NN(d), kb[NBR_MAX]; double ar[NBR_MAX];
+    d->qi=malloc(N*sizeof(int)); if(!d->qi) return 0;
+    int cnt=0;
+    for(size_t k=0;k<N;k++){
+        d->qi[k]=-1;
+        if(d->kind[k]!=K_SEMI || d->con_mask[k] || !MK(d,k)->lbc_on) continue;
+        int is = d->gate_mask[k]!=0;
+        if(!is){ int c=nbr_list(d,k,kb,ar); for(int q=0;q<c;q++) if(d->kind[kb[q]]==K_INS){ is=1; break; } }
+        if(is) d->qi[k]=cnt++;
+    }
+    if(!cnt){ coul_free(d); return 1; }
+    d->n_if=cnt;
+    d->if_k=malloc((size_t)cnt*sizeof(size_t)); d->if_A=calloc((size_t)cnt,8);
+    d->if_Qf=calloc((size_t)cnt,8); d->if_NC=calloc((size_t)cnt,8);
+    if(!d->if_k||!d->if_A||!d->if_Qf||!d->if_NC){ coul_free(d); return 0; }
+    for(size_t k=0;k<N;k++) if(d->qi[k]>=0) d->if_k[d->qi[k]]=k;
+    for(int e=0;e<cnt;e++){
+        size_t k=d->if_k[e]; int c=nbr_list(d,k,kb,ar);
+        double A=0., Qf=fabs(d->Nf[k])*node_vol(d,k);
+        for(int q=0;q<c;q++){
+            size_t ko=kb[q];
+            if(d->kind[ko]!=K_INS) continue;
+            A+=ar[q];
+            if(d->Nf[ko]!=0.){
+                size_t kb2[NBR_MAX]; double ar2[NBR_MAX], As=0.; int c2=nbr_list(d,ko,kb2,ar2);
+                for(int q2=0;q2<c2;q2++) if(d->kind[kb2[q2]]==K_SEMI) As+=ar2[q2];
+                if(As>0.) Qf+=fabs(d->Nf[ko])*node_vol(d,ko)*ar[q]/As;
+            }
+        }
+        d->if_A[e]=A; d->if_Qf[e]=Qf;
+    }
+    for(int r=0;r<d->n_rob;r++){
+        int e=d->qi[d->rob_k[r]]; if(e<0) continue;
+        d->if_A[e]+=d->rob_A[r];
+        d->if_Qf[e]+=fabs(d->cons[d->rob_c[r]].qox)/Q*d->rob_A[r];
+    }
+    /* breadth-first search from the entries with an area */
+    size_t *qu=malloc(N*sizeof(size_t)); char *inq=calloc(N,1);
+    if(!qu||!inq){ free(qu); free(inq); coul_free(d); return 0; }
+    size_t head=0, tail=0, used=0;
+    for(int e=0;e<cnt;e++){
+        size_t k=d->if_k[e];
+        if(d->if_A[e]>0.){ qu[tail]=k; tail=(tail+1)%N; used++; inq[k]=1; }
+        else d->qi[k]=-1;
+    }
+    const double R2=COUL_REACH*COUL_REACH;
+    while(used){
+        size_t u=qu[head]; head=(head+1)%N; used--; inq[u]=0;
+        int lab=d->qi[u]; if(lab<0) continue;
+        double pl[3]; node_xyz(d,d->if_k[lab],pl);
+        int c=nbr_list(d,u,kb,ar);
+        for(int q=0;q<c;q++){
+            size_t v=kb[q];
+            if(d->kind[v]!=K_SEMI || !MK(d,v)->lbc_on) continue;
+            double pv[3]; node_xyz(d,v,pv);
+            double r2=dist2(pv,pl);
+            if(r2>R2) continue;
+            int cur=d->qi[v];
+            if(cur==lab) continue;
+            if(cur>=0){ double pc[3]; node_xyz(d,d->if_k[cur],pc); if(r2>=dist2(pv,pc)) continue; }
+            d->qi[v]=lab;
+            if(!inq[v]){ qu[tail]=v; tail=(tail+1)%N; used++; inq[v]=1; }
+        }
+    }
+    free(qu); free(inq);
+    d->lbc=1;
+    if(d->verbose) fprintf(stderr,"semisim: %d interface nodes for Coulomb scattering\n",cnt);
+    return 1;
+}
+/* N_C of every entry at the reference quasi-Fermi potentials: fixed charge
+   plus the charged trap states of the node, per interface area */
+static void coul_update(Dev *d, const double *qn_, const double *qp_){
+    #pragma omp parallel for schedule(static) if(d->n_if>4096)
+    for(int e=0;e<d->n_if;e++){
+        size_t k=d->if_k[e]; double A=d->if_A[e];
+        if(!(A>0.)){ d->if_NC[e]=0.; continue; }
+        double Qt=0.;
+        if(d->tr_rp && d->tr_rp[k]<d->tr_rp[k+1])
+            Qt=trap_abs(d,k,nK(d,k,d->phi[k],qn_[k]),pK(d,k,d->phi[k],qp_[k]))*node_vol(d,k);
+        d->if_NC[e]=(d->if_Qf[e]+Qt)/A;
+    }
+}
+
 static int prepare(Dev *d){
     if(!d->allocated||d->n_mats<1) return 0;
     size_t N=NN(d);
@@ -1447,6 +1768,8 @@ static int prepare(Dev *d){
     }
     if(d->verbose && d->n_te) fprintf(stderr,"semisim: %d metal-contact nodes, %d column nodes\n",d->n_te,d->n_tc);
     if(!traps_build(d)) return 0;
+    if(!coul_build(d)) return 0;
+    if(!ion_build(d)) return 0;
     d->dirty=0;
     return 1;
 }
@@ -1460,12 +1783,17 @@ static double neutral_psi(const Dev *d, size_t k, double V){
     const Mat *m=&d->mats[d->mat_idx[k]];
     double D=d->Nd[k]-d->Na[k], VT=m->VT;
     double psi=V+VT*(asinh(D/(2.*niK(d,k)))-0.5*(lncK(d,k)-lnvK(d,k)));
-    if(!(d->tr_rp && d->tr_rp[k]<d->tr_rp[k+1])) return psi;
+    int io=ion_node(d,k);
+    if(!(d->tr_rp && d->tr_rp[k]<d->tr_rp[k+1]) && !io) return psi;
     double lo=psi-m->Eg-1., hi=psi+m->Eg+1.;
     for(int it=0;it<200;it++){
         double n=nK(d,k,psi,V), p=pK(d,k,psi,V), r,dr,a,b,c;
         trap_eval(d,k,n,p,&a,&b,&c,&r,&dr);
         double g=p-n+D+d->Nf[k]+r, dg=-(n+p)/VT+dr;
+        if(io){                                   /* incompletely ionised dopants */
+            double Np,dNp,Nm,dNm; ion_eval(d,k,n,p,&Np,&dNp,&Nm,&dNm);
+            g=p-n+Np-Nm+d->Nf[k]+r; dg=-(n+p)/VT+dr+dNp-dNm;
+        }
         if(g>0.) lo=psi; else hi=psi;
         double nx = dg<0. ? psi-g/dg : 0.5*(lo+hi);
         if(!(nx>lo && nx<hi)) nx=0.5*(lo+hi);
@@ -2146,8 +2474,8 @@ static int g_coarse_pattern(Lev *f, Lev *c){
 
 static int gmg_alloc(Dev *d){
     mg_free(d);
-    { const char *e=getenv("SEMISIM_GPASS"); if(e) GMG_PASSES=atoi(e);
-      const char *b=getenv("SEMISIM_GBETA"); if(b) GMG_BETA=atof(b); }
+    { const char *e=env_get("SEMISIM_GPASS"); if(e) GMG_PASSES=atoi(e);
+      const char *b=env_get("SEMISIM_GBETA"); if(b) GMG_BETA=atof(b); }
     Lev *f=&d->lev[0];
     f->Nx=(int)NN(d); f->Ny=f->Nz=1; f->N=NN(d);
     f->rp=d->grp; f->cj=d->gcol; f->rv=d->grev; f->nnz=d->nE; f->va=d->gval; f->dg=d->A.c;
@@ -2427,8 +2755,14 @@ static double poisson_eval(Dev *d, const double *phi, const double *Vapp,
         if(d->kind[k]==K_SEMI){
             const Mat *m=&d->mats[d->mat_idx[k]];
             double n=nK(d,k,pk,d->phi_n[k]), p=pK(d,k,pk,d->phi_p[k]);
-            f +=vol*Q*(p-n+d->Nd[k]-d->Na[k]+d->Nf[k]);
-            dg+=vol*Q*(n+p)/m->VT;
+            if(ion_node(d,k)){                    /* incompletely ionised dopants */
+                double Np,dNp,Nm,dNm; ion_eval(d,k,n,p,&Np,&dNp,&Nm,&dNm);
+                f +=vol*Q*(p-n+Np-Nm+d->Nf[k]);
+                dg+=vol*Q*((n+p)/m->VT-dNp+dNm);
+            } else {
+                f +=vol*Q*(p-n+d->Nd[k]-d->Na[k]+d->Nf[k]);
+                dg+=vol*Q*(n+p)/m->VT;
+            }
             if(d->tr_rp && d->tr_rp[k]<d->tr_rp[k+1]){       /* charge in deep traps */
                 double r,a,b,rho,drho; trap_eval(d,k,n,p,&r,&a,&b,&rho,&drho);
                 f+=vol*Q*rho; dg-=vol*Q*drho;
@@ -2585,18 +2919,50 @@ static inline double fnorm2(const Dev *d, int i, int j, int l, int ax){
     double g1=grad_semi(d,i,j,l,(ax+1)%3), g2=grad_semi(d,i,j,l,(ax+2)%3);
     return g1*g1+g2*g2;
 }
-static inline double lombardi(const Mat *m, double mub, double Fv, double Nt, double Dw, int hole){
+/* invC: 1/mu of further surface terms (Coulomb), (cm^2/Vs)^-1, weighted by
+   D with the others */
+static inline double lombardi(const Mat *m, double mub, double Fv, double Nt, double Dw, int hole,
+                              double invC){
     double F=Fv*1e-2; if(F<1.) F=1.;                       /* V/cm */
     double N=Nt*1e-6; if(N<1.) N=1.;                       /* cm^-3 */
     double Bc=hole?m->lbB_p:m->lbB_n, Cc=hole?m->lbC_p:m->lbC_n;
-    double Lc=hole?m->lbL_p:m->lbL_n, Dc=hole?m->lbD_p:m->lbD_n;
+    double Lc=hole?m->lbL_p:m->lbL_n, Dc=hole?m->lbD_p:m->lbD_n, Ec=hole?m->lbE_p:m->lbE_n;
     double muac=Bc/F+Cc*pow(N,Lc)/(cbrt(F)*(m->T/300.));
-    double musr=Dc/(F*F);
-    return 1./(1./mub+Dw*1e4*(1./muac+1./musr));           /* cm^2/Vs -> m^2/Vs */
+    double musr= Ec>0. ? 1./(F*F/Dc+F*F*F/Ec) : Dc/(F*F);
+    return 1./(1./mub+Dw*1e4*(1./muac+1./musr+invC));      /* cm^2/Vs -> m^2/Vs */
+}
+/* n_trans (cm^-3) of the Coulomb term against the acceptor doping N_A
+   (cm^-3): Uhnevionak 2015, Table 5 (4H-SiC MOSFETs: 2.8e16, 8e16, 2.5e17,
+   1.55e18 at 1e15, 1e16, 5e16, 5e17), log-log interpolation, clamped */
+static double ntrans_sic(double NA){
+    static const double a[4]={1e15,1e16,5e16,5e17}, t[4]={2.8e16,8e16,2.5e17,1.55e18};
+    if(!(NA>a[0])) return t[0];
+    if(NA>=a[3]) return t[3];
+    int q=0; while(NA>a[q+1]) q++;
+    return t[q]*pow(t[q+1]/t[q],log(NA/a[q])/log(a[q+1]/a[q]));
+}
+/* 1/mu_C, (cm^2/Vs)^-1, of electrons at density n (m^-3) in a normal field
+   Fv (V/m) near an interface holding NC charges per m^2, acceptor doping
+   NA (m^-3); 0 without interface charge or normal field */
+static inline double coul_inv(const Mat *m, double Fv, double n, double NC, double NA){
+    double F=Fv*1e-2, r=NC*1e-4/m->lbc_N0;
+    if(!(r>0.) || !(F>0.)) return 0.;
+    double f=1.-exp(-pow(F/m->lbc_E0,m->lbc_gam));
+    if(!(f>0.)) return 0.;
+    double s=pow(n*1e-6/(ntrans_sic(NA*1e-6)*pow(r,m->lbc_e1)),m->lbc_nu);
+    return pow(r,m->lbc_e2)*f/(m->lbc_mu1*(m->T/300.)*(1.+s));
+}
+/* N_C seen by the edge k-kp: the interface charge of the nearest interface
+   of either node (-1 = none within reach) */
+static inline double coul_NC(const Dev *d, size_t k, size_t kp){
+    int a=d->qi[k], b=d->qi[kp];
+    if(a>=0 && b>=0) return 0.5*(d->if_NC[a]+d->if_NC[b]);
+    return a>=0 ? d->if_NC[a] : (b>=0 ? d->if_NC[b] : 0.);
 }
 static void upd_mob_ref(Dev *d, const double *qn_, const double *qp_){
     const int Nx=d->Nx,Ny=d->Ny,Nz=d->Nz;
     const int sat = (d->models&4)!=0, lb = (d->models&16)!=0;
+    if(lb && d->lbc) coul_update(d,qn_,qp_);
     #pragma omp parallel for collapse(2) schedule(static) if(NN(d)>PAR_MIN)
     for(int l=0;l<Nz;l++) for(int j=0;j<Ny;j++) for(int i=0;i<Nx;i++){
         size_t k=IDX(i,j,l,Nx,Ny);
@@ -2607,13 +2973,22 @@ static void upd_mob_ref(Dev *d, const double *qn_, const double *qp_){
             }
             const Mat *m=MK(d,k);
             double mn=0.5*(d->mu_n[k]+d->mu_n[kp]), mp=0.5*(d->mu_p[k]+d->mu_p[kp]);
+            if(ax==d->caxis){                      /* along the c-axis: mu_par */
+                if(m->ani_n>0.) mn*=m->ani_n;
+                if(m->ani_p>0.) mp*=m->ani_p;
+            }
             if(lb && m->lb_on){
                 double Dw=exp(-0.5*(d->qd[k]+d->qd[kp])/LB_LCRIT);
                 if(Dw>1e-8){
                     int ip=i+(ax==0), jp=j+(ax==1), lp=l+(ax==2);
                     double F=sqrt(0.5*(fnorm2(d,i,j,l,ax)+fnorm2(d,ip,jp,lp,ax)));
-                    double Nt=0.5*(d->Nd[k]+d->Na[k]+d->Nd[kp]+d->Na[kp]);
-                    mn=lombardi(m,mn,F,Nt,Dw,0); mp=lombardi(m,mp,F,Nt,Dw,1);
+                    double Nt=0.5*(d->Nd[k]+d->Na[k]+d->Nd[kp]+d->Na[kp]), ic=0.;
+                    if(d->lbc && m->lbc_on){          /* Coulomb, n from the reference */
+                        double nn=0.5*(nK(d,k,d->phi[k],qn_[k])+nK(d,kp,d->phi[kp],qn_[kp]));
+                        ic=coul_inv(m,F,nn,coul_NC(d,k,kp),0.5*(d->Na[k]+d->Na[kp]));
+                    }
+                    if(m->lb_on&1) mn=lombardi(m,mn,F,Nt,Dw,0,ic);
+                    if(m->lb_on&2) mp=lombardi(m,mp,F,Nt,Dw,1,0.);
                 }
             }
             /* velocity saturation, tapered off in the barrier region of a
@@ -2655,7 +3030,8 @@ static void upd_mob(Dev *d){
     }
     upd_mob_ref(d,d->phi_n,d->phi_p);
 }
-/* display mobility: mean of the adjacent edge mobilities (call after solve) */
+/* display mobility: mean of the adjacent edge mobilities (call after solve);
+   in a hexagonal crystal the value across the c-axis (the material data) */
 static void mob_display(Dev *d){
     if(d->unstr){ mob_display_g(d); return; }
     const int Nx=d->Nx,Ny=d->Ny,Nz=d->Nz;
@@ -2668,7 +3044,13 @@ static void mob_display(Dev *d){
             size_t kb; double h,ar;
             if(!nbr(d,i,j,l,dir,&kb,&h,&ar) || d->kind[kb]!=K_SEMI) continue;
             size_t kl= k<kb?k:kb; int ax=dir/2;
-            sn+=d->fmu[ax][kl]; sp+=d->fmu[3+ax][kl]; c++;
+            double fn=d->fmu[ax][kl], fp=d->fmu[3+ax][kl];
+            if(ax==d->caxis){                         /* shown across the c-axis */
+                const Mat *m=MK(d,kl);
+                if(m->ani_n>0.) fn/=m->ani_n;
+                if(m->ani_p>0.) fp/=m->ani_p;
+            }
+            sn+=fn; sp+=fp; c++;
         }
         if(c){ d->wk[0][k]=sn/c; d->wk[1][k]=sp/c; }
         else { d->wk[0][k]=d->mu_n[k]; d->wk[1][k]=d->mu_p[k]; }
@@ -2780,10 +3162,12 @@ static int float_fix(Dev *d, int hole){
     int *lab=(int*)d->wk[0]; size_t *q=(size_t*)d->wk[1];
     const double *oth = hole ? d->n : d->p;
     double *u=d->sol, *s=d->sc;
-    /* majority AND quasi-neutral: c >= other, c >= |Nd-Na|/2 and well above
-       n_i - depleted spots, where 'majority' flips on noise, never qualify */
+    /* majority AND quasi-neutral: c >= other, c >= |Nd-Na|/2 (before and
+       after this solve) and well above n_i - depleted spots, where
+       'majority' flips on noise, and nodes at a depletion edge that the
+       iterate swings across never qualify */
     #define MAJ(k) (d->kind[k]==K_SEMI && !d->con_mask[k] && s[k]*u[k]>=oth[k] \
-                    && s[k]*u[k]>=0.5*fabs(d->Nd[k]-d->Na[k]) && s[k]*u[k]>10.*niK(d,k))
+                    && s[k]*u[k]>=0.5*dnet_ion(d,k) && s[k]>=0.5*dnet_ion(d,k) && s[k]*u[k]>10.*niK(d,k))
     for(size_t k=0;k<N;k++) lab[k]=0;
     int nfix=0, blk=0;
     for(size_t k0=0;k0<N;k0++){
@@ -2834,8 +3218,9 @@ static int float_fix(Dev *d, int hole){
             double lam=exp(sl);
             for(size_t t=0;t<tail;t++) u[q[t]]*=lam;
             nfix++;
-            if(d->verbose>2) fprintf(stderr,"    float_fix(%c) block of %zu nodes: shift %.3e V\n",hole?'p':'n',tail,
-                                     (hole?-1.:1.)*d->mats[d->mat_idx[q[0]]].VT*sl);
+            if(d->verbose>2){ int i0,j0,l0; unidx(d,q[0],&i0,&j0,&l0);
+                fprintf(stderr,"    float_fix(%c) block of %zu nodes at (%d,%d,%d): shift %.3e V\n",hole?'p':'n',tail,
+                        i0,j0,l0,(hole?-1.:1.)*d->mats[d->mat_idx[q[0]]].VT*sl); }
         }
     }
     #undef MAJ
@@ -3468,7 +3853,7 @@ static int gummel(Dev *d, const double *Va, int maxit, double gtol, int *iters, 
         #pragma omp parallel for schedule(static) if(N>PAR_MIN)
         for(size_t k=0;k<N;k++){                 /* neutral-region predictor */
             if(d->kind[k]!=K_SEMI || d->con_mask[k]) continue;
-            double n=d->n[k],p=d->p[k],D=fabs(d->Nd[k]-d->Na[k]);
+            double n=d->n[k],p=d->p[k],D=dnet_ion(d,k);
             double den=fmax(n+p,D); if(!(den>0.)) continue;
             d->phi[k]+=(n*dqn[k]+p*dqp[k])/den;
         }
@@ -3813,8 +4198,14 @@ static void poisson_core_g(Dev *d, const double *phi, int build, double *F){
         if(d->kind[k]==K_SEMI){
             const Mat *m=&d->mats[d->mat_idx[k]];
             double n=nK(d,k,pk,d->phi_n[k]), p=pK(d,k,pk,d->phi_p[k]);
-            f +=vol*Q*(p-n+d->Nd[k]-d->Na[k]+d->Nf[k]);
-            dg+=vol*Q*(n+p)/m->VT;
+            if(ion_node(d,k)){                    /* incompletely ionised dopants */
+                double Np,dNp,Nm,dNm; ion_eval(d,k,n,p,&Np,&dNp,&Nm,&dNm);
+                f +=vol*Q*(p-n+Np-Nm+d->Nf[k]);
+                dg+=vol*Q*((n+p)/m->VT-dNp+dNm);
+            } else {
+                f +=vol*Q*(p-n+d->Nd[k]-d->Na[k]+d->Nf[k]);
+                dg+=vol*Q*(n+p)/m->VT;
+            }
             if(d->tr_rp && d->tr_rp[k]<d->tr_rp[k+1]){       /* charge in deep traps */
                 double r,a,b,rho,drho; trap_eval(d,k,n,p,&r,&a,&b,&rho,&drho);
                 f+=vol*Q*rho; dg-=vol*Q*drho;
@@ -3838,9 +4229,19 @@ static inline void face_flux_g(const Dev *d, size_t ka, size_t kb, int ue, doubl
 
 /* edge mobilities (Lombardi: the field normal to the edge from the node
    gradients, |grad psi|^2 - (grad psi . t)^2) */
+/* Mobility anisotropy of a hexagonal crystal on the prism mesh: the tensor
+   projected on edge k-kp, mu_edge/mu_perp = 1 + (a-1) t_c^2 with a = mu_par/
+   mu_perp and t_c the edge's direction cosine with the c-axis (Dev.caxis). */
+static inline double ani_edge_g(const Dev *d, size_t k, size_t kp, double a){
+    if(d->caxis<0 || !(a>0.) || a==1.) return 1.;
+    double dv[3], L2=0.;
+    for(int q=0;q<3;q++){ dv[q]=d->gpos[3*kp+q]-d->gpos[3*k+q]; L2+=dv[q]*dv[q]; }
+    return L2>0. ? 1.+(a-1.)*dv[d->caxis]*dv[d->caxis]/L2 : 1.;
+}
 static void upd_mob_ref_g(Dev *d, const double *qn_, const double *qp_){
     size_t N=NN(d);
     const int sat=(d->models&4)!=0, lb=(d->models&16)!=0;
+    if(lb && d->lbc) coul_update(d,qn_,qp_);
     if(lb){
         #pragma omp parallel for schedule(static) if(N>PAR_MIN)
         for(size_t k=0;k<N;k++){
@@ -3856,6 +4257,7 @@ static void upd_mob_ref_g(Dev *d, const double *qn_, const double *qp_){
             if(d->kind[k]!=K_SEMI || d->kind[kp]!=K_SEMI){ d->gmu[0][ue]=d->gmu[1][ue]=0.; continue; }
             const Mat *m=MK(d,k); double h=d->gh[e];
             double mn=0.5*(d->mu_n[k]+d->mu_n[kp]), mp=0.5*(d->mu_p[k]+d->mu_p[kp]);
+            mn*=ani_edge_g(d,k,kp,m->ani_n); mp*=ani_edge_g(d,k,kp,m->ani_p);
             if(lb && m->lb_on){
                 double Dw=exp(-0.5*(d->qd[k]+d->qd[kp])/LB_LCRIT);
                 if(Dw>1e-8){
@@ -3865,8 +4267,13 @@ static void upd_mob_ref_g(Dev *d, const double *qn_, const double *qp_){
                     double Fa=ga_[0]*ga_[0]+ga_[1]*ga_[1]+ga_[2]*ga_[2]-pa*pa;
                     double Fb=gb[0]*gb[0]+gb[1]*gb[1]+gb[2]*gb[2]-pb*pb;
                     double F=sqrt(fmax(0.5*(Fa+Fb),0.));
-                    double Nt=0.5*(d->Nd[k]+d->Na[k]+d->Nd[kp]+d->Na[kp]);
-                    mn=lombardi(m,mn,F,Nt,Dw,0); mp=lombardi(m,mp,F,Nt,Dw,1);
+                    double Nt=0.5*(d->Nd[k]+d->Na[k]+d->Nd[kp]+d->Na[kp]), ic=0.;
+                    if(d->lbc && m->lbc_on){
+                        double nn=0.5*(nK(d,k,d->phi[k],qn_[k])+nK(d,kp,d->phi[kp],qn_[kp]));
+                        ic=coul_inv(m,F,nn,coul_NC(d,k,kp),0.5*(d->Na[k]+d->Na[kp]));
+                    }
+                    if(m->lb_on&1) mn=lombardi(m,mn,F,Nt,Dw,0,ic);
+                    if(m->lb_on&2) mp=lombardi(m,mp,F,Nt,Dw,1,0.);
                 }
             }
             double wv=0.;                            /* see upd_mob_ref */
@@ -3892,8 +4299,11 @@ static void mob_display_g(Dev *d){
         if(d->kind[k]!=K_SEMI) continue;
         double sn=0.,sp=0.; int c=0;
         for(int e=d->grp[k];e<d->grp[k+1];e++){
-            if(d->kind[d->gcol[e]]!=K_SEMI) continue;
-            sn+=d->gmu[0][d->gue[e]]; sp+=d->gmu[1][d->gue[e]]; c++;
+            size_t kb=d->gcol[e];
+            if(d->kind[kb]!=K_SEMI) continue;
+            const Mat *m=MK(d, k<kb?k:kb);          /* shown across the c-axis */
+            sn+=d->gmu[0][d->gue[e]]/ani_edge_g(d,k,kb,m->ani_n);
+            sp+=d->gmu[1][d->gue[e]]/ani_edge_g(d,k,kb,m->ani_p); c++;
         }
         if(c){ d->wk[0][k]=sn/c; d->wk[1][k]=sp/c; }
         else { d->wk[0][k]=d->mu_n[k]; d->wk[1][k]=d->mu_p[k]; }
@@ -3947,7 +4357,7 @@ static int float_fix_g(Dev *d, int hole){
     const double *oth = hole ? d->n : d->p;
     double *u=d->sol, *s=d->sc;
     #define MAJ(k) (d->kind[k]==K_SEMI && !d->con_mask[k] && s[k]*u[k]>=oth[k] \
-                    && s[k]*u[k]>=0.5*fabs(d->Nd[k]-d->Na[k]) && s[k]*u[k]>10.*niK(d,k))
+                    && s[k]*u[k]>=0.5*dnet_ion(d,k) && s[k]>=0.5*dnet_ion(d,k) && s[k]*u[k]>10.*niK(d,k))
     for(size_t k=0;k<N;k++) lab[k]=0;
     int nfix=0, blk=0;
     for(size_t k0=0;k0<N;k0++){
@@ -4165,9 +4575,9 @@ void api3_init(void){
     gdev.tol_p=1e-9; gdev.tol_c=1e-6; gdev.omega_p=gdev.omega_c=1.;
     gdev.pcg_its=gdev.bicg_its=gdev.newton_its=gdev.gummel_its=0;
     gdev.t_pois=gdev.t_cont=gdev.t_mob=gdev.t_cur=gdev.t_aa=gdev.t_mg=0.;
-    { const char *e=getenv("SEMISIM_PCGRTOL"); gdev.pcg_rtol = e? atof(e) : 1e-3;
-      const char *f=getenv("SEMISIM_NTOLF");   gdev.ntol_fac = f? atof(f) : 0.1;
-      const char *g=getenv("SEMISIM_BRTOL");   gdev.bicg_rtol = g? atof(g) : 1e-4; }
+    { const char *e=env_get("SEMISIM_PCGRTOL"); gdev.pcg_rtol = e? atof(e) : 1e-3;
+      const char *f=env_get("SEMISIM_NTOLF");   gdev.ntol_fac = f? atof(f) : 0.1;
+      const char *g=env_get("SEMISIM_BRTOL");   gdev.bicg_rtol = g? atof(g) : 1e-4; }
     gdev.cont_atol_f=1.;
     int nt=1;
 #ifdef _OPENMP
@@ -4175,14 +4585,15 @@ void api3_init(void){
 #endif
     gdev.nthreads=nt;
     gdev.models=7;                /* BGN + tau(N) + velocity saturation */
-    const char *v=getenv("SEMISIM_VERBOSE"); gdev.verbose = v ? atoi(v) : 0;
-    const char *a=getenv("SEMISIM_MGA"); if(a) MG_ALPHA=atof(a);
-    { const char *m=getenv("SEMISIM_AAM"); if(m){ int q=atoi(m); AA_DEPTH = q<0?0:(q>AA_MAX?AA_MAX:q); } }
-    { const char *m=getenv("SEMISIM_PRED"); if(m) PRED_ON = atoi(m)!=0; }
-    { const char *m=getenv("SEMISIM_GROW"); if(m){ double g=atof(m); if(g>=1. && g<=4.) GROW_SLOW=g; } }
-    { const char *m=getenv("SEMISIM_CATOL"); if(m) CONT_ATOL=atof(m); }
-    { const char *m=getenv("SEMISIM_QFM"); if(m) QF_MARGIN=atof(m); }
-    { const char *m=getenv("SEMISIM_TECOLVS"); if(m) TE_COLVS=atoi(m); }
+    gdev.caxis=1;
+    const char *v=env_get("SEMISIM_VERBOSE"); gdev.verbose = v ? atoi(v) : 0;
+    const char *a=env_get("SEMISIM_MGA"); if(a) MG_ALPHA=atof(a);
+    { const char *m=env_get("SEMISIM_AAM"); if(m){ int q=atoi(m); AA_DEPTH = q<0?0:(q>AA_MAX?AA_MAX:q); } }
+    { const char *m=env_get("SEMISIM_PRED"); if(m) PRED_ON = atoi(m)!=0; }
+    { const char *m=env_get("SEMISIM_GROW"); if(m){ double g=atof(m); if(g>=1. && g<=4.) GROW_SLOW=g; } }
+    { const char *m=env_get("SEMISIM_CATOL"); if(m) CONT_ATOL=atof(m); }
+    { const char *m=env_get("SEMISIM_QFM"); if(m) QF_MARGIN=atof(m); }
+    { const char *m=env_get("SEMISIM_TECOLVS"); if(m) TE_COLVS=atoi(m); }
 }
 
 void api3_set_threads(int n){
@@ -4244,6 +4655,10 @@ int api3_n_trap_entries(void){ return gdev.n_tr; }
    bit2 field-dependent mobility (velocity saturation), bit3 quantum
    confinement (MLDA), bit4 Lombardi surface mobility, bit5 gate tunnelling */
 void api3_set_models(int flags){ gdev.models=flags; gdev.have_solution=0; }
+/* The c-axis of hexagonal materials (4H-SiC mobility anisotropy): 0 x,
+   1 y (default), 2 z, -1 isotropic. */
+void api3_set_caxis(int ax){ gdev.caxis = (ax>=0 && ax<=2) ? ax : -1; gdev.have_solution=0; }
+int  api3_get_caxis(void){ return gdev.caxis; }
 
 int api3_add_material(int id, double T){
     if(gdev.n_mats>=NM_MAX) return -1;
@@ -4385,7 +4800,7 @@ int api3_set_mesh_graph(int N,int E,const int *rp,const int *cj,const double *h,
        continuity solves stopped at 1e-4 leave enough error to stall the
        Gummel map, 1e-6 converges it in fewer iterations than the tensor mesh
        needs (SEMISIM_BRTOL still overrides). */
-    if(ok && !getenv("SEMISIM_BRTOL")) gdev.bicg_rtol=1e-6;
+    if(ok && !env_get("SEMISIM_BRTOL")) gdev.bicg_rtol=1e-6;
     return ok;
 }
 int api3_is_graph(void){ return gdev.unstr; }
@@ -4457,9 +4872,28 @@ double api3_mlda_factor(int mi,double a,double b,int hole){
 }
 /* Lombardi edge mobility (m^2/Vs) of material mi for bulk mobility mub,
    normal field F (V/m), total doping Nt (m^-3), distance factor Dw */
+/* The Coulomb term of material mi: 1/mu_C in (cm^2/Vs)^-1 at the normal
+   field F (V/m), electron density n (m^-3), interface charge NC (m^-2) and
+   acceptor doping NA (m^-3); NaN for a material without it. */
+double api3_coulomb_inv(int mi,double F,double n,double NC,double NA){
+    if(mi<0||mi>=gdev.n_mats||!gdev.mats[mi].lbc_on) return NAN;
+    return coul_inv(&gdev.mats[mi],F,n,NC,NA);
+}
+/* Surface-mobility parameters of material mi (electrons; cm units):
+   roughness delta and eta, Coulomb mu1 - a value <= 0 keeps the current one.
+   Returns 0 for a bad index. */
+int api3_set_surface_mobility(int mi,double delta,double eta,double mu1){
+    if(mi<0||mi>=gdev.n_mats) return 0;
+    Mat *m=&gdev.mats[mi];
+    if(delta>0.) m->lbD_n=delta;
+    if(eta>0.) m->lbE_n=eta;
+    if(mu1>0.) m->lbc_mu1=mu1;
+    mark_changed(&gdev); gdev.have_solution=0;
+    return 1;
+}
 double api3_lombardi(int mi,double mub,double F,double Nt,double Dw,int hole){
     if(mi<0||mi>=gdev.n_mats) return mub;
-    return lombardi(&gdev.mats[mi],mub,F,Nt,Dw,hole);
+    return lombardi(&gdev.mats[mi],mub,F,Nt,Dw,hole,0.);
 }
 void api3_set_contact_V(int cid,double V){ if(cid>=0&&cid<gdev.n_cons) gdev.cons[cid].V=V; }
 int    api3_get_ncon(void){ return gdev.n_cons; }
@@ -4576,7 +5010,7 @@ double api3_get_xs(int i) { return (gdev.allocated && gdev.xs && i>=0 && i<gdev.
 double api3_get_ys(int j) { return (gdev.allocated && gdev.ys && j>=0 && j<gdev.Ny) ? gdev.ys[j] : NAN; }
 double api3_get_zs(int l) { return (gdev.allocated && gdev.zs && l>=0 && l<gdev.Nz) ? gdev.zs[l] : NAN; }
 double api3_get_Cref(void){ return gdev.Cref; }
-long   api3_get_stat(int w){
+long long api3_get_stat(int w){
     switch(w){ case 0: return gdev.pcg_its; case 1: return gdev.bicg_its;
                case 2: return gdev.newton_its; case 3: return gdev.gummel_its; }
     return 0;
@@ -4673,14 +5107,23 @@ static double node_val(const Dev *d, int which, size_t k){
         if(d->kind[k]!=K_SEMI || !d->gii) return 0.;
         double v; if(d->unstr) v=d->gvol[k]; else { int i,j,l; unidx(d,k,&i,&j,&l); v=volume(d,i,j,l); }
         return v>0. ? d->gii[k]/v : 0.; }
+    case 34:                                                       /* N_C seen by the node (m^-2) */
+        if(d->kind[k]!=K_SEMI) return NAN;
+        return (d->lbc && d->qi[k]>=0) ? d->if_NC[d->qi[k]] : 0.;
+    case 35: {                                                     /* ionised net doping (m^-3) */
+        if(d->kind[k]!=K_SEMI) return 0.;
+        double Np,dNp,Nm,dNm; ion_eval(d,k,d->n[k],d->p[k],&Np,&dNp,&Nm,&dNm);
+        return Np-Nm; }
     }
     return 0.;
 }
-/* which = 0..33: phi,n,p,Ec,Ev,Efn,Efp,Jx,Jy,Jz,mun,mup,R,kind,Nnet,phin,phip,Nf,
+/* which = 0..35: phi,n,p,Ec,Ev,Efn,Efp,Jx,Jy,Jz,mun,mup,R,kind,Nnet,phin,phip,Nf,
    contact, dEg_bgn, Jn_x,Jn_y,Jn_z, Jp_x,Jp_y,Jp_z, ni_eff, J_tunnel,
    Lambda_n, Lambda_p (quantum potentials, eV), interface distance, trapped
-   charge (elementary charges/m^3, signed), total trap density (m^-3) and
-   impact-ionisation generation (m^-3 s^-1) */
+   charge (elementary charges/m^3, signed), total trap density (m^-3),
+   impact-ionisation generation (m^-3 s^-1), the interface charge N_C of
+   the Coulomb mobility (m^-2) and the ionised net doping N_D+ - N_A- (m^-3;
+   = Nnet without incomplete ionisation) */
 void api3_bulk_copy(int which,double *out){
     Dev *d=&gdev; if(!d->allocated) return;
     size_t N=NN(d);

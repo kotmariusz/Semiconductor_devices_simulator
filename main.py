@@ -5,6 +5,41 @@ dense nodes at junctions, interfaces and gates, coarse elsewhere."""
 
 import sys,os,ctypes,threading,time,traceback,platform,subprocess,math
 IS_MAC=sys.platform=="darwin"
+IS_WIN=sys.platform=="win32"
+def _user_dir():
+    """SemiSim's own folder for logs (and the core cache): %LOCALAPPDATA%\\SemiSim3D
+    on Windows, ~/.cache/semisim3d elsewhere."""
+    if IS_WIN:
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"),"AppData","Local"),
+                            "SemiSim3D")
+    return os.path.join(os.path.expanduser("~"),".cache","semisim3d")
+LOG_FILE=os.path.join(_user_dir(),"semisim.log")
+def _setup_streams():
+    """Console text never fails (a Windows console may use cp1250/cp1252 and
+    the program prints →, Ω, ⁻); a start without a console (pythonw, the
+    Start-menu shortcut) writes what would be printed to LOG_FILE, so a
+    crash leaves a trace."""
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE),exist_ok=True)
+            if os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE)>1_000_000:
+                os.replace(LOG_FILE,LOG_FILE+".old")
+            f=open(LOG_FILE,"a",encoding="utf-8",errors="replace",buffering=1)
+            f.write(f"\n--- SemiSim 3D started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            if sys.stdout is None: sys.stdout=f
+            if sys.stderr is None: sys.stderr=f
+        except Exception: pass
+    for st in (sys.stdout,sys.stderr):
+        try: st.reconfigure(encoding="utf-8",errors="replace")
+        except Exception: pass
+_setup_streams()
+if IS_WIN:
+    # before any window: crisp text on high-DPI screens, and the taskbar shows
+    # SemiSim's own icon instead of Python's
+    try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception: pass
+    try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SemiSim3D.App")
+    except Exception: pass
 def _is_wsl():
     """Windows Subsystem for Linux (its WSLg window system has quirks)."""
     if not sys.platform.startswith("linux"): return False
@@ -75,13 +110,18 @@ try:
 except ImportError:
     _fatal("Python's Tk interface (tkinter) is missing.\n"
            +("Install Python from python.org (it includes Tk), or:  brew install python-tk"
-             if IS_MAC else "Ubuntu / Debian / WSL:  sudo apt install python3-tk"))
+             if IS_MAC else
+             "Install Python from python.org with 'tcl/tk and IDLE' ticked (or: Settings → Apps →\n"
+             "Python → Modify, and tick it)." if IS_WIN else
+             "Ubuntu / Debian / WSL:  sudo apt install python3-tk"))
 try:
     import numpy as np
     import matplotlib
 except ImportError as e:
-    _fatal(f"A Python package is missing ({e}).\nInstall everything with:  bash install.sh\n"
-           "or:  python3 -m pip install -r requirements.txt")
+    _fatal(f"A Python package is missing ({e}).\n"
+           +("Install everything: double-click install.bat in the SemiSim folder,\n"
+             "or:  py -m pip install -r requirements.txt" if IS_WIN else
+             "Install everything with:  bash install.sh\nor:  python3 -m pip install -r requirements.txt"))
 if tk.TkVersion<8.6:
     _fatal(f"This Python uses Tcl/Tk {tk.TkVersion}, which is too old (macOS's built-in Python).\n"
            "Install Python 3 from python.org (or Homebrew) and run install.sh again.")
@@ -113,8 +153,21 @@ except ImportError as e:
 #  C LIBRARY
 # ══════════════════════════════════════════════════════════════
 import semibuild                          # builds the core on the first start (same folder)
-try: _lib,_SO=semibuild.load_core()
+_BUILD_NOTE=[]
+def _build_note(msg):
+    """A small window while the core is built on the first start - a start
+    without a console would otherwise look like nothing happens for a minute."""
+    try:
+        r=tk.Tk(); r.title("SemiSim 3D"); r.resizable(False,False)
+        tk.Label(r,text=msg,padx=26,pady=20,justify="left").pack()
+        r.update(); _BUILD_NOTE.append(r)
+    except Exception: pass
+try: _lib,_SO=semibuild.load_core(progress=_build_note)
 except semibuild.CoreError as e: _fatal(str(e))
+finally:
+    for _w in _BUILD_NOTE:
+        try: _w.destroy()
+        except Exception: pass
 
 def _f(fn,res,*args):
     f=getattr(_lib,fn); f.restype=res; f.argtypes=list(args); return f
@@ -132,6 +185,7 @@ api_addconx = _f("api3_add_contact_ex",I,I,I,I,I,I,I,I,I,D,D,D,D)
 api_clrcon  = _f("api3_clear_contacts",V)
 api_sheet   = _f("api3_add_sheet_charge",V,I,I,I,I,I,I,D)  # axis,idx,a0,a1,b0,b1,sigma(q/m^2)
 api_models  = _f("api3_set_models",V,I)                    # bit0 BGN, bit1 tau(N), bit2 v-sat
+api_caxis   = _f("api3_set_caxis",V,I)                     # c-axis of hexagonal crystals: 0 x, 1 y, 2 z, -1 off
 api_solve   = _f("api3_solve",I)
 api_resolve = _f("api3_resolve",I)
 api_setV    = _f("api3_set_contact_V",V,I,D)
@@ -140,7 +194,7 @@ api_conA    = _f("api3_get_contact_A",D,I)      # contact area (m^2)
 api_conIn   = _f("api3_get_contact_In",D,I)     # electron component (A)
 api_conF    = _f("api3_get_contact_Ifloor",D,I) # round-off resolution floor (A)
 api_conIraw = _f("api3_get_contact_Iraw",D,I)   # the contact's own flux (A), before the Kirchhoff choice
-api_stat    = _f("api3_get_stat",ctypes.c_long,I)
+api_stat    = _f("api3_get_stat",ctypes.c_longlong,I)
 api_Nx=_f("api3_get_Nx",I); api_Ny=_f("api3_get_Ny",I); api_Nz=_f("api3_get_Nz",I)
 api_conv=_f("api3_get_conv",I); api_iter=_f("api3_get_iter",I); api_res=_f("api3_get_res",D)
 api_xs=_f("api3_get_xs",D,I); api_ys=_f("api3_get_ys",D,I); api_zs=_f("api3_get_zs",D,I)
@@ -507,7 +561,7 @@ def mfig(p,fs=(11,5.5)):
 # ══════════════════════════════════════════════════════════════
 #  DATA CLASSES
 # ══════════════════════════════════════════════════════════════
-DEVICE_FILE_VERSION=1
+DEVICE_FILE_VERSION=2          # 2: doping profiles ('implants'); written only when a device has them
 def check_device_json(d):
     """Check a device-file dict before anything of it is applied; raises
     ValueError naming the first bad field (a bad file must leave the editor
@@ -546,8 +600,24 @@ def check_device_json(d):
         num(c.get("bc"),f"{w} type (bc)",0,len(Con.BCNAME)-1,integer=True)
         num(c.get("V",0.),f"{w} voltage",-1e5,1e5)
     if len(d["cons"])>32: raise ValueError(f"{len(d['cons'])} contacts: the solver holds at most 32")
+    ims=d.get("implants") or []
+    if not isinstance(ims,list): raise ValueError("'implants' must be a list")
+    for i,im in enumerate(ims):
+        if not isinstance(im,dict): raise ValueError(f"doping profile {i+1}: not an object")
+        w=f"doping profile {i+1} ({im.get('label','')})"
+        if im.get("dtype") not in ("n","p"): raise ValueError(f"{w}: type must be n or p")
+        if im.get("face") not in Implant.FACES: raise ValueError(f"{w}: face must be one of {', '.join(Implant.FACES)}")
+        if im.get("kind","gauss") not in Implant.KINDS: raise ValueError(f"{w}: kind must be gauss or erfc")
+        num(im.get("peak"),f"{w} peak",0.,1e22)
+        num(im.get("Lv"),f"{w} Lv",0.,1e7,strict_lo=True)
+        num(im.get("Rp",0.),f"{w} Rp",0.,1e7); num(im.get("lat",0.),f"{w} lateral ratio",0.,10.)
+        for a,b in (("a0","a1"),("b0","b1")):
+            v0=num(im.get(a,0.),f"{w} {a}"); v1=num(im.get(b,0.),f"{w} {b}")
+            if not v1>v0: raise ValueError(f"{w}: {b} = {v1} must be larger than {a} = {v0}")
     so=d.get("solver") or {}
     if "T" in so: num(so["T"],"temperature (solver T)",20.,2000.)
+    if "caxis" in so and str(so["caxis"]).lower() not in CAXIS_ID:
+        raise ValueError(f"solver caxis = {so['caxis']!r}: expected one of x, y, z, off")
     pw=d.get("power")
     if pw is not None:                       # power-device settings (v0.2.2)
         if not isinstance(pw,dict): raise ValueError("'power' must be an object")
@@ -677,9 +747,138 @@ class Sheet:
         self.axis=axis; self.pos=pos; self.a0=a0; self.a1=a1; self.b0=b0; self.b1=b1
         self.sigma=sigma; self.label=label or f"sheet {sigma:+.2e} q/cm2 @{axis}={pos:.0f}nm"
 
-# ══════════════════════════════════════════════════════════════
-#  DEVICE TEMPLATES — with dense-point specs
-# ══════════════════════════════════════════════════════════════
+class Implant:
+    """Graded doping profile ADDED to the regions' doping - an implant or a
+    diffusion through a mask window on one face of the domain (semiconductor
+    nodes only; it does not own nodes or change their material).
+      dtype   'n' (donors) or 'p' (acceptors)
+      peak    peak concentration (cm^-3)
+      face    the face it enters through: y0 (the top, y = 0), y1, x0, x1, z0, z1
+      a0..a1, b0..b1   the mask window on that face (nm): ranges along the
+              face's two in-plane axes in x,y,z order (y0/y1: x, then z); a
+              window edge on or beyond the domain boundary is no edge
+      kind    'gauss': N = peak exp(-((d - Rp)/Lv)^2)  (implant: projected range
+                       Rp, straggle Lv; d = depth below the face)
+              'erfc':  N = peak erfc(d/Lv)            (diffusion from the surface)
+      Lv      vertical length (nm); Rp depth of the Gaussian's peak (nm)
+      lat     lateral spread under a mask edge as a fraction r of Lv: the
+              profile is multiplied by 1/2 [erf((s-a)/(r Lv)) + erf((b-s)/(r Lv))]
+              across a window [a, b] (the exact lateral diffusion through a
+              slit); 0 = a sharp mask (SiC implants: no diffusion)"""
+    FACES=("y0","y1","x0","x1","z0","z1")
+    KINDS=("gauss","erfc")
+    def __init__(self,dtype="p",peak=1e17,face="y0",a0=0.,a1=1e9,b0=0.,b1=1e9,kind="gauss",
+                 Lv=100.,Rp=0.,lat=0.8,label=""):
+        self.dtype="n" if dtype=="n" else "p"; self.peak=float(peak)
+        self.face=face if face in Implant.FACES else "y0"
+        self.a0=float(a0); self.a1=float(a1); self.b0=float(b0); self.b1=float(b1)
+        self.kind=kind if kind in Implant.KINDS else "gauss"
+        self.Lv=float(Lv); self.Rp=float(Rp); self.lat=float(lat)
+        self.label=label or f"{self.dtype} {self.kind} {self.peak:.0e} @{self.face}"
+    def axes(self):
+        """(normal axis, first in-plane axis, second in-plane axis) as 0..2."""
+        q="xyz".index(self.face[0]); o=[a for a in range(3) if a!=q]
+        return q,o[0],o[1]
+    def depth(self,P,L3):
+        q=self.axes()[0]
+        return P[:,q] if self.face[1]=="0" else L3[q]-P[:,q]
+    def conc(self,P,L3):
+        """Concentration (cm^-3) at the points P (n x 3, nm) of a domain L3 (nm)."""
+        P=np.asarray(P,float).reshape(-1,3); q,ia,ib=self.axes()
+        d=self.depth(P,L3); Lv=max(self.Lv,1e-6)
+        if self.kind=="erfc": v=self.peak*_ufunc(math.erfc,np.maximum(d,0.)/Lv)
+        else: v=self.peak*np.exp(-((d-self.Rp)/Lv)**2)
+        w=max(self.lat*Lv,1e-9)
+        for ax,lo,hi in ((ia,self.a0,self.a1),(ib,self.b0,self.b1)):
+            if lo<=0. and hi>=L3[ax]: continue                   # no edge in the domain
+            s_=P[:,ax]
+            fl=_ufunc(math.erf,(s_-lo)/w) if lo>0. else 1.
+            fh=_ufunc(math.erf,(hi-s_)/w) if hi<L3[ax] else 1.
+            v=v*0.5*(fl+fh)
+        return v
+    def window(self,L3):
+        """The mask window clipped to the domain: ((a0, a1), (b0, b1)) nm."""
+        q,ia,ib=self.axes()
+        return ((max(self.a0,0.),min(self.a1,L3[ia])),(max(self.b0,0.),min(self.b1,L3[ib])))
+    def dose(self):
+        """Implanted dose per area (cm^-2) of the vertical profile (wide window)."""
+        Lc=self.Lv*1e-7
+        if self.kind=="erfc": return self.peak*Lc/math.sqrt(math.pi)
+        return self.peak*Lc*0.5*math.sqrt(math.pi)*(1.+math.erf(self.Rp/max(self.Lv,1e-6)))
+
+def _ufunc(f,x):
+    """A scalar math function over an array, evaluated once per distinct value
+    (mesh coordinates repeat: a tensor mesh has only Nx distinct x values)."""
+    x=np.asarray(x,float)
+    u,inv=np.unique(x,return_inverse=True)
+    return np.array([f(v) for v in u])[inv].reshape(x.shape)
+
+def implant_conc(implants, P, L3):
+    """(donors, acceptors) of the implants at points P (n x 3, nm), cm^-3."""
+    P=np.asarray(P,float).reshape(-1,3); nd=np.zeros(len(P)); na=np.zeros(len(P))
+    for im in implants or []:
+        if not (im.peak>0.): continue
+        if im.dtype=="n": nd+=im.conc(P,L3)
+        else: na+=im.conc(P,L3)
+    return nd,na
+
+def _region_net(regs, P):
+    """Net doping (cm^-3, n > 0) of the regions at points P (n x 3, nm) - the
+    last region holding a point wins (boxes and outlines) - and a mask of the
+    points in a semiconductor."""
+    P=np.asarray(P,float).reshape(-1,3); net=np.zeros(len(P)); semi=np.zeros(len(P),bool)
+    for r in regs:
+        m=((P[:,0]>=r.x0)&(P[:,0]<=r.x1)&(P[:,1]>=r.y0)&(P[:,1]<=r.y1)&(P[:,2]>=r.z0)&(P[:,2]<=r.z1))
+        if getattr(r,"shape",None) is not None and m.any():
+            m&=SM._shape_mask(r.shape,P[:,0],P[:,1],P[:,2],1e-6)
+        if not m.any(): continue
+        ins=r.mat in INSULATORS
+        val=0. if (ins or r.doping<=1e11) else (r.doping if r.dtype=="n" else -r.doping)
+        net[m]=val; semi[m]=not ins
+    return net,semi
+
+def implant_lines(t):
+    """Mesh lines (nm, per axis x, y, z) where the implants' net doping changes
+    sign against the regions: along each profile's normal through the middle
+    of its window, and across each mask edge just under the face (where a
+    DMOS channel runs) and at the Gaussian's peak depth - so the graded mesh
+    resolves the junctions the profiles make."""
+    out=([],[],[])
+    ims=[im for im in (t.get("implants") or []) if im.peak>0.]
+    if not ims: return out
+    L3=(t["Lx"],t["Ly"],t["Lz"]); regs=t["regs"]
+    def net(P):
+        P=np.asarray(P,float).reshape(-1,3)
+        n0,semi=_region_net(regs,P); nd,na=implant_conc(ims,P,L3)
+        v=n0+nd-na; v[~semi]=np.nan
+        return v
+    def roots(axis, P0, n=1601):
+        """Sign changes of the net doping along the line through P0 parallel to axis."""
+        s_=np.linspace(0.,L3[axis],n); P=np.repeat(np.asarray(P0,float)[None,:],n,0); P[:,axis]=s_
+        v=net(P); found=[]
+        for k in range(n-1):
+            a,b=v[k],v[k+1]
+            if not (np.isfinite(a) and np.isfinite(b)) or a==0. or b==0. or (a>0.)==(b>0.): continue
+            lo,hi,fa=s_[k],s_[k+1],a
+            for _ in range(48):
+                mid=0.5*(lo+hi); Q=np.asarray(P0,float).copy(); Q[axis]=mid; fm=net(Q)[0]
+                if not np.isfinite(fm): break
+                if (fm>0.)==(fa>0.): lo,fa=mid,fm
+                else: hi=mid
+            found.append(0.5*(lo+hi))
+        return found
+    for im in ims:
+        q,ia,ib=im.axes(); (a0,a1),(b0,b1)=im.window(L3)
+        c=[0.,0.,0.]; c[ia]=0.5*(a0+a1); c[ib]=0.5*(b0+b1)
+        out[q].extend(roots(q,c))
+        for depth in {0.5,im.Rp} if im.kind=="gauss" and im.Rp>1. else {0.5}:
+            dpos=depth if im.face[1]=="0" else L3[q]-depth
+            for ax,(lo,hi) in ((ia,(im.a0,im.a1)),(ib,(im.b0,im.b1))):
+                if lo<=0. and hi>=L3[ax]: continue
+                P0=list(c); P0[q]=dpos
+                out[ax].extend(roots(ax,P0))
+    return tuple(sorted(set(round(v,6) for v in o)) for o in out)
+
 # Each template returns a dict with:
 #   Lx,Ly,Lz, Nx,Ny,Nz, regs, cons, ivc, ivS, ivE, ivN, desc
 #   dense_x, dense_y, dense_z: lists of nm positions for grid refinement
@@ -1050,8 +1249,13 @@ def T_trench_sic_mos():
     layer (8e16) keeps the gap between p-body and shield open - without it
     the body/shield built-in depletion (~3 V in SiC) pinches the channel exit.
     Default: on-state (V_GS = 15 V, V_DS = 2 V); sweep = output curve.
-    Note: the SiC/SiO2 channel mobility (~20-40 cm^2/Vs in real devices) is
-    NOT degraded here - bulk mobility is used, so on-current is optimistic."""
+    The channel runs along the trench sidewall with the surface model of the
+    Solver page (Lombardi with Coulomb scattering on the trapped charge of
+    NO-annealed band-tail interface traps, D_edge 1.5e13): ~30 cm^2/Vs, as on
+    the Si face - real (11-20) sidewalls conduct ~2x better, not modelled.
+    The output sweep takes a few minutes: towards saturation (V_DS ~4-5 V)
+    the trapped interface charge and the field-dependent channel mobility
+    make the solver take small steps."""
     Lx,Ly,Lz=4000.,12000.,400.; Nx,Ny,Nz=60,90,4
     tw=400.; tx0,tx1=Lx/2-tw,Lx/2+tw; td=1500.; tox=60.
     body_d=1200.; src_d=250.; sub_top=11000.; src_w=800.; tap_w=600.
@@ -1082,6 +1286,9 @@ def T_trench_sic_mos():
                 dense_x=[tap_w,tx0-src_w,tx0,tx0+tox,tx1-tox,tx1,tx1+src_w,Lx-tap_w],
                 dense_y=[0.,src_d,body_d,td-tox,td,td+300,td+700,sub_top],
                 dense_z=[],
+                models=M_DEFAULT|M_LB,
+                defects=[SD.Defect("Interface traps 4H-SiC/SiO2: band tail",dit=1.5e13,
+                                   label="NO-annealed interface (band tail)")],
                 desc="4H-SiC trench MOSFET 1.2kV - oxide-lined trench, buried gate, p+ shield")
 def T_trench_si_mos():
     """Si trench MOSFET, 30 V class (DC-DC converter switch).
@@ -1991,6 +2198,48 @@ def T_rw_mosfet_irlz44n():
                 dense_x=[],dense_y=[],dense_z=[],
                 desc="Si logic-level power MOSFET 55V (IRLZ44N-like) planar VDMOS cell")
 
+def T_rw_mosfet_irlz44n_diffused():
+    """The IRLZ44N-like VDMOS cell with diffused, self-aligned p-body and n+
+    source (Regions page: doping profiles) instead of boxes.  Both are
+    implanted through the same mask edge - the gate poly edge - and driven
+    in: the p-body (Gaussian, 8e17 at the surface, Lv 570 nm: junction
+    ~1.22 um deep) spreads 0.8 Lv sideways, the shallow n+ source (1e20,
+    Lv 120 nm: ~0.3 um) much less, and the channel is the difference of the
+    two lateral diffusions at the surface (~0.55 um).  Its doping falls from
+    ~2e17 at the source to the epi's level at the JFET window: the threshold
+    is set by the source end, V_GS(th) ~1.3 V at 250 uA per die (datasheet
+    1.0-2.0 V; the box version's uniform 2e17 gives ~2 V), and R_on,sp at
+    V_GS 10 V is ~0.85 mOhm cm2 against the box version's 1.16 - its channel
+    is lightly doped where it meets the drift region, as in real DMOS.  The
+    epi, substrate, p+ taps, JFET window (1.2 um at the surface) and gate
+    oxide are those of the box version, which stays as its A/B twin."""
+    Lx,Ly,Lz = 4000., 8000., 400.; Nx,Ny,Nz = 44, 150, 4
+    sub_top, tap_w, tap_d = 6000., 300., 300.
+    xm = 650.                     # mask (poly) edge: the p-body reaches 0.8*570*erfinv(0.98) = 750 nm further
+    regs=[
+        Reg("Si",0,0,0,Lx,Ly,Lz,                    "n",8e15, "n epi (55V)"),
+        Reg("Si",0,sub_top,0,Lx,Ly,Lz,              "n",5e19, "n+ substrate"),
+        Reg("Si",0,0,0,tap_w,tap_d,Lz,              "p",1e19, "p+ tap L"),
+        Reg("Si",Lx-tap_w,0,0,Lx,tap_d,Lz,          "p",1e19, "p+ tap R"),
+    ]
+    imps=[
+        Implant("p",8e17,"y0",0.,xm,0.,1e9,"gauss",570.,0.,0.8,"p-body L (diffused)"),
+        Implant("p",8e17,"y0",Lx-xm,Lx,0.,1e9,"gauss",570.,0.,0.8,"p-body R (diffused)"),
+        Implant("n",1e20,"y0",tap_w,xm,0.,1e9,"gauss",120.,0.,0.8,"n+ source L"),
+        Implant("n",1e20,"y0",Lx-xm,Lx-tap_w,0.,1e9,"gauss",120.,0.,0.8,"n+ source R"),
+    ]
+    cons=[
+        con_part(2, 0., 800./Lx,                 0.,1., 0, 0.,  "Source-L"),
+        con_part(2, 1.-800./Lx, 1.,              0.,1., 0, 0.,  "Source-R"),
+        con_part(2, 800./Lx, 1600./Lx,           0.,1., 2, 5., "Gate-L", 4.1, tox=40.),
+        con_part(2, 2400./Lx, 3200./Lx,          0.,1., 2, 5., "Gate-R", 4.1, tox=40.),
+        con_full(3, 0, 2., "Drain"),
+    ]
+    return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=Nx,Ny=Ny,Nz=Nz,regs=regs,cons=cons,implants=imps,
+                ivc=4,ivS=0.,ivE=10.,ivN=21,
+                dense_x=[],dense_y=[],dense_z=[],
+                desc="Si power MOSFET 55V (IRLZ44N-like), diffused p-body and n+ source (doping profiles)")
+
 def T_rw_superjunction_600v():
     """Si superjunction MOSFET, 600 V class (CoolMOS-like), half cell.
     x=0 is the centre of an n pillar, x=Lx the centre of a p pillar. The
@@ -2063,7 +2312,16 @@ def T_rw_sic_mosfet_900v():
     Drift 1.8e16 cm^-3 x 8.5 um -> BV_ideal ~ 930 V. Note how much thinner
     and more heavily doped the drift is than a Si device of the same rating:
     that is the 10x critical-field advantage of SiC.
-    Needs V_GS ~ 15-18 V because the SiC/oxide channel mobility is low."""
+    Needs V_GS ~ 15-18 V because the SiC/oxide channel mobility is low: the
+    surface model (Solver page: Lombardi, with Coulomb scattering on the
+    trapped interface charge) and NO-annealed band-tail interface traps
+    (D_edge 1.5e13) bring the channel to ~30 cm^2/Vs.  Die: the active area
+    (3.3 mm^2) puts R_DS(on) at the datasheet's 65 mOhm at 25 C and V_GS 15 V
+    with the 350 um substrate (0.70 mOhm cm^2) outside the cell; at 150 C it
+    comes out ~1.5x (datasheet 90 mOhm, x1.38) - the drift region's mobility
+    falls as T^-2.4, the channel's hardly changes.  The output sweep takes a
+    few minutes: towards saturation the trapped interface charge and the
+    field-dependent channel mobility make the solver take small steps."""
     Lx,Ly,Lz = 4000., 11500., 400.; Nx,Ny,Nz = 44, 130, 4
     body_d, src_d, sub_top = 800., 300., 9500.
     src_w, tap_w, jfet_hw  = 700., 300., 600.
@@ -2089,6 +2347,10 @@ def T_rw_sic_mosfet_900v():
     return dict(Lx=Lx,Ly=Ly,Lz=Lz,Nx=Nx,Ny=Ny,Nz=Nz,regs=regs,cons=cons,
                 ivc=4,ivS=0.,ivE=10.,ivN=21,
                 dense_x=[],dense_y=[],dense_z=[],
+                models=M_DEFAULT|M_LB,
+                defects=[SD.Defect("Interface traps 4H-SiC/SiO2: band tail",dit=1.5e13,
+                                   label="NO-annealed interface (band tail)")],
+                power=dict(area=3.3,rsp=0.70,rpkg=0.),
                 desc="4H-SiC planar MOSFET 900V/65mOhm (C3M0065090D-like)")
 
 def T_rw_sic_jbs_1200v():
@@ -2611,6 +2873,7 @@ TEMPLATES = {
     "RW: Si NPN power BJT 250V (MJ21194)": T_rw_bjt_mj21194,
     "RW: Si lateral PNP LDO 1A (LM2940)":  T_rw_ldo_lateral_pnp,
     "RW: Si MOSFET 55V (IRLZ44N)":     T_rw_mosfet_irlz44n,
+    "RW: Si MOSFET 55V (IRLZ44N), diffused": T_rw_mosfet_irlz44n_diffused,
     "RW: Si superjunction 600V":       T_rw_superjunction_600v,
     "RW: Si IGBT 1200V (IKW40N120)":   T_rw_igbt_1200v,
     "RW: SiC MOSFET 900V (C3M)":       T_rw_sic_mosfet_900v,
@@ -2635,6 +2898,12 @@ TEMPLATES = {
 }
 # Template variants for the A/B compare (I-V tab): label -> template dict
 TEMPLATE_VARIANTS = {
+    "RW: Si MOSFET 55V (IRLZ44N)": [
+        ("box p-body and n+ source (as drawn)",lambda:T_rw_mosfet_irlz44n()),
+        ("diffused p-body and n+ source",      lambda:T_rw_mosfet_irlz44n_diffused())],
+    "RW: Si MOSFET 55V (IRLZ44N), diffused": [
+        ("diffused p-body and n+ source",      lambda:T_rw_mosfet_irlz44n_diffused()),
+        ("box p-body and n+ source (as drawn)",lambda:T_rw_mosfet_irlz44n())],
     "BJT effects: Kirk effect (f_T vs I_C)": [
         ("collector 1e16 (early Kirk)",lambda:_kirk_bjt(1e16)),
         ("collector 1e17 (late Kirk)", lambda:_kirk_bjt(1e17))],
@@ -2664,7 +2933,7 @@ TEMPLATE_GROUPS = [
     ("Gate dielectrics & tunnelling", ["Gate leakage: 1.2nm SiO2 NMOS","Gate leakage: HfO2 high-k NMOS",
         "Fowler-Nordheim: 8nm SiO2 MOS"]),
     ("Power switches", ["VDMOS","LDMOS","Si Trench MOS","SiC Trench MOS","IGBT",
-        "RW: Si MOSFET 55V (IRLZ44N)","RW: Si superjunction 600V",
+        "RW: Si MOSFET 55V (IRLZ44N)","RW: Si MOSFET 55V (IRLZ44N), diffused","RW: Si superjunction 600V",
         "RW: Si IGBT 1200V (IKW40N120)","RW: SiC MOSFET 900V (C3M)"]),
     ("Bipolar & thyristors", ["NPN BJT","PNP BJT","Lateral PNP (bipolar IC)","SOI lateral NPN",
         "GaAs HBT","RW: Si NPN BJT 45V (BC547)",
@@ -2746,9 +3015,10 @@ def make_grid(t, graded=True):
         # An axis without junctions stays uniform (no spurious centre refinement).
         ax,ay,az=detect_junctions(t["regs"],Lx,Ly,Lz)
         fx,fy,fz=SD.refine_planes(t.get("defects") or [],(Lx,Ly,Lz))
-        dx=sorted(set(list(t.get("dense_x",[]))+ax+fx))
-        dy=sorted(set(list(t.get("dense_y",[]))+ay+fy))
-        dz=sorted(set(list(t.get("dense_z",[]))+az+fz))
+        ix,iy,iz=implant_lines(t)                 # junctions of graded doping profiles
+        dx=sorted(set(list(t.get("dense_x",[]))+ax+fx+list(ix)))
+        dy=sorted(set(list(t.get("dense_y",[]))+ay+fy+list(iy)))
+        dz=sorted(set(list(t.get("dense_z",[]))+az+fz+list(iz)))
         xs=graded_grid(Lx,Nx,dx) if dx else uniform_grid(Lx,Nx)
         ys=graded_grid(Ly,Ny,dy) if dy else uniform_grid(Ly,Ny)
         zs=graded_grid(Lz,Nz,dz) if dz else uniform_grid(Lz,Nz)
@@ -2904,6 +3174,13 @@ def _node_arrays(regs, own, mids):
             elif r.dtype=="p": Na[sel]=r.doping*1e6
     return mat,Nd,Na
 
+def _add_implants(t, P, names, Nd, Na):
+    """Add the doping profiles t['implants'] at the node positions P (n x 3,
+    nm) to Nd, Na (m^-3, in place) - semiconductor nodes only."""
+    nd,na=implant_conc(t["implants"],P,(t["Lx"],t["Ly"],t["Lz"]))
+    semi=~np.isin(np.asarray(names,dtype=object),np.array(sorted(INSULATORS),dtype=object))
+    Nd+=np.where(semi,nd*1e6,0.); Na+=np.where(semi,na*1e6,0.)
+
 def _ip(a): return np.ascontiguousarray(a,dtype=np.int32).ctypes.data_as(IP)
 def _dp(a): return np.ascontiguousarray(a,dtype=np.float64).ctypes.data_as(DP)
 
@@ -3030,12 +3307,15 @@ def setup_device(t, solver=(2000,1000,500,1e-8,1e-6,1.,1.), models=7, T=300., gr
         raise MemoryError(
             f"Could not allocate {Nx}x{Ny}x{Nz} = {N_total:,} nodes "
             f"(~{N_total*BYTES_PER_NODE/1024**3:.1f} GB).\nTry a coarser grid.")
-    api_models(models)
+    api_models(models); api_caxis(CAXIS_ID[caxis_of(t)])
     dd=None
-    if any(getattr(r,"shape",None) is not None for r in t["regs"]) or t.get("defects"):
-        # shaped regions or defects: node by node (a staircase of the outline)
+    if any(getattr(r,"shape",None) is not None for r in t["regs"]) or t.get("defects") or t.get("implants"):
+        # shaped regions, defects or doping profiles: node by node
         own=owner_grid(t["regs"],xs,ys,zs)
         mat,Nd,Na=_node_arrays(t["regs"],own,mids)
+        if t.get("implants"):
+            Z,Y,X=np.meshgrid(np.asarray(zs)*1e9,np.asarray(ys)*1e9,np.asarray(xs)*1e9,indexing="ij")
+            _add_implants(t,np.c_[X.ravel(),Y.ravel(),Z.ravel()],_node_names(t["regs"],own),Nd,Na)
         if t.get("defects"):
             view=SD.MeshView(_node_names(t["regs"],own),tensor=(xs,ys,zs))
             dd=_apply_defects(t,view,mat,Nd,Na,mids,T,_face_gates_tensor(t,xs,ys,zs))
@@ -3095,9 +3375,10 @@ def _setup_tri(t, solver, models, T, volt):
     N,E,rp,cj,h,ar,vol,pos=pm.graph()
     if not api_graph(N,E,_ip(rp),_ip(cj),_dp(h),_dp(ar),_dp(vol),_dp(pos)):
         raise MemoryError(f"Could not set up the prism mesh ({N:,} nodes, {E:,} edges).")
-    api_models(models)
+    api_models(models); api_caxis(CAXIS_ID[caxis_of(t)])
     own=pm.node_regions()
     mat,Nd,Na=_node_arrays(t["regs"],own,mids)
+    if t.get("implants"): _add_implants(t,np.asarray(pos).reshape(-1,3)*1e9,_node_names(t["regs"],own),Nd,Na)
     dd=None
     if t.get("defects"):
         gf=[pm.contact_nodes(c) for c in t["cons"] if c.bc==2 and c.face<=5]
@@ -3137,7 +3418,7 @@ _PULL_Q=[("phi",0,1.),("n",1,1e-6),("p",2,1e-6),("Ec",3,1.),("Ev",4,1.),
          ("mn",10,1e4),("mp",11,1e4),("R",12,1e-6),("kind",13,1.),("Nnet",14,1e-6),
          ("Jg",27,1e-4),("Lqn",28,1.),("Lqp",29,1.),
          ("Qtrap",31,1e-6),("Ntrap",32,1e-6),
-         ("Gii",33,1e-6)]  # J in A/cm2, quantum potentials in eV, traps in cm^-3, avalanche generation in cm^-3 s^-1
+         ("Gii",33,1e-6),("Nion",35,1e-6)]  # J in A/cm2, quantum potentials in eV, traps in cm^-3, avalanche generation in cm^-3 s^-1
 def pull():
     if _PRISM is not None and api_isgraph():
         d=_pull_prism(_PRISM)
@@ -3192,7 +3473,7 @@ def _pull_prism(pm):
         if key=="kind": d[key]=pm.to_display(kind,"dom"); continue
         v=get(idx,sc); raw[key]=v
         if key in ("n","p"): d[key]=pm.to_display(np.maximum(v,1e-300),"log",mask=semi)
-        elif key in ("Nnet",): d[key]=pm.to_display(v,"dom")
+        elif key in ("Nnet","Nion"): d[key]=pm.to_display(v,"dom")
         elif key in ("Ec","Ev"): d[key]=pm.to_display(v,"lin",mat=mat)
         elif key=="phi": d[key]=pm.to_display(v,"lin")
         else: d[key]=pm.to_display(v,"lin",mask=semi)
@@ -3237,11 +3518,20 @@ def carrier_charge():
     q sum p dV) in C per simulated cell - NaN with a core that predates it."""
     b=(D*2)(float("nan"),float("nan")); api_csums(b)
     return b[0]*QE,b[1]*QE
-# model switches (api3_set_models): bit 0..5
+# model switches (api3_set_models): bit 0..9
 M_BGN,M_TAU,M_VSAT,M_QC,M_LB,M_TUN = 1,2,4,8,16,32
 M_TE,M_SBT = 64,128        # metal contacts: thermionic emission + image force; barrier tunnelling
 M_II = 256                 # impact ionisation (avalanche generation, Chynoweth law)
-M_DEFAULT = M_BGN|M_TAU|M_VSAT|M_TE|M_SBT
+M_INC = 512                # incomplete ionisation of dopants (materials with level data: 4H-SiC)
+M_DEFAULT = M_BGN|M_TAU|M_VSAT|M_TE|M_SBT|M_INC
+# the c-axis of hexagonal crystals (4H-SiC: anisotropic mobility); "y" = the
+# wafer normal of the templates' vertical devices
+CAXES = ("y","x","z","off")
+CAXIS_ID = {"x":0,"y":1,"z":2,"off":-1}
+def caxis_of(t):
+    """The c-axis of a device dict: 'x', 'y' (default), 'z' or 'off'."""
+    c=str(t.get("caxis") or "y").lower()
+    return c if c in CAXIS_ID else "y"
 
 def progress():
     """(t of the running ramp, Gummel it, residual, steps, phase, total its)"""
@@ -4278,11 +4568,12 @@ def device_signature(t,solver,models,T,graded):
     cons=[(c.face,c.i0p,c.i1p,c.j0p,c.j1p,c.k0p,c.k1p,c.bc,c.pm,c.tox,c.nox,repr(c.stack),_shape_key(c),
            getattr(c,"metal","")) for c in t["cons"]]
     shs=[(s.axis,s.pos,s.a0,s.a1,s.b0,s.b1,s.sigma) for s in t.get("sheets",[])]
+    shs+=[tuple(sorted(vars(im).items())) for im in (t.get("implants") or [])]
     return repr((t["Lx"],t["Ly"],t["Lz"],t["Nx"],t["Ny"],t["Nz"],regs,cons,shs,
                  sorted(t.get("dense_x",[])),sorted(t.get("dense_y",[])),sorted(t.get("dense_z",[])),
                  repr(t.get("nodes")),repr(t.get("clear")),repr(t.get("refine")),tuple(solver),models,T,graded,
                  t.get("mesh","rect"),t.get("prism"),t.get("extrude"),
-                 [d.key() for d in (t.get("defects") or [])],t.get("tau0"),
+                 [d.key() for d in (t.get("defects") or [])],t.get("tau0"),caxis_of(t),
                  repr(sorted((k,sorted(v)) for k,v in (t.get("amr") or {}).items()))))
 
 # ══════════════════════════════════════════════════════════════
@@ -4292,8 +4583,10 @@ import queue, json, copy, textwrap
 import tkinter.font as tkfont
 from matplotlib.ticker import FuncFormatter
 
-VERSION="0.2.4"
-SETTINGS_FILE=os.path.join(os.path.expanduser("~"),".semisim3d.json")
+VERSION="0.2.5"
+# the settings file: SEMISIM_SETTINGS (a file path) wins - the tests use it;
+# on Windows os.path.expanduser ignores HOME, so HOME cannot redirect it there
+SETTINGS_FILE=os.environ.get("SEMISIM_SETTINGS") or os.path.join(os.path.expanduser("~"),".semisim3d.json")
 # label-based buttons (FlatButton) and themed check boxes: macOS draws the
 # classic Tk ones natively, without the app's colours; SEMISIM_FLAT_BUTTONS=1
 # uses them elsewhere too (tests)
@@ -4488,13 +4781,13 @@ Typical workflow for a new design: load the closest template, change regions and
 """),
 ("Status and terms", """
 # Status and terms
-SemiSim 3D 0.2 is an early public version - a test version: it is still being tested, so read its results with care.
-- The physics is checked against textbook theory (`validate.py`, 240 checks), not yet against measurements of real devices.
+SemiSim 3D 0.2.5 is an early public version - a test version: it is still being tested, so read its results with care.
+- The physics is checked against textbook theory (`validate.py`, 276 checks), not yet against measurements of real devices.
 - Results can be wrong, and some effects are not modelled at all (see Limitations). Check anything important against measurements, the literature or an established simulator.
 - The `RW:` templates are modelled on the device class and ratings of real parts, not on their real dies; currents are per simulated cell.
-- macOS support and the WSL2 full-screen workaround are new and have been tried on few computers so far.
+- macOS support, native Windows support (new in 0.2.5) and the WSL2 full-screen workaround are new and have been tried on few computers so far.
 - The format of saved device files may change between versions.
-- Problems and suggestions: https://github.com/kotmariusz/Semiconductor_devices_simulator/issues - say what you did, attach the saved device (File → Save device) and the output of `python3 semibuild.py --check`.
+- Problems and suggestions: https://github.com/kotmariusz/Semiconductor_devices_simulator/issues - say what you did, attach the saved device (File → Save device) and the output of `python3 semibuild.py --check` (Windows: `py semibuild.py --check`, and the log file %LOCALAPPDATA%\\SemiSim3D\\semisim.log).
 ## Licence
 SemiSim 3D is released under the MIT License (the LICENSE file in the SemiSim 3D folder): free to use, copy, change and share, for any purpose, as long as the copyright and licence notice stay with it. There is no warranty of any kind: whoever uses it is responsible for how they use its results.
 Part numbers and company names in the `RW:` templates only identify the parts the templates are modelled on; they belong to their owners, who are not connected with this project.
@@ -4555,6 +4848,14 @@ Coordinates are in nm. x runs left to right. y is depth: y = 0 is the top surfac
 ## Regions
 A region is a box of one material with one doping type and concentration (cm⁻³). Regions are applied in table order, and a later region overwrites an earlier one where they overlap. So start with a background block and carve wells, sources and drains on top. Use ▲/▼ to reorder.
 Insulators (SiO2, Al2O3, HfO2, Si3N4) carry no carriers. They hold fixed potential gradients and shape gate fields; with gate tunnelling on, carriers can cross them into a gate electrode.
+## Doping profiles (Regions page)
+Graded doping - implants and diffusions - is added on top of the regions: a profile puts donors (n) or acceptors (p) into the semiconductor under a mask window on one face of the domain (y0 = the top surface), whatever the regions there are.
+- `gauss` (an implant): N = peak·exp(−((d − Rp)/Lv)²) at depth d below the face - Rp the projected range, Lv the straggle (a driven-in implant: Lv = 2√(Dt)).
+- `erfc` (a diffusion from a surface source): N = peak·erfc(d/Lv).
+- Under a mask edge the profile spreads sideways: across a window [a, b] it is multiplied by ½[erf((s − a)/(r·Lv)) + erf((b − s)/(r·Lv))], the exact lateral diffusion through a slit. r ≈ 0.7-0.85 for diffused Si; r = 0 is a sharp edge (implants into SiC do not diffuse). A window edge on or beyond the domain boundary is no edge.
+- The junction a profile makes with the regions (and the other profiles) is found along its normal and across its mask edges, and the graded mesh refines there. The Structure tab draws the junctions as dashed contours and the mask windows on their face; the 3D Slicer's net-doping map shows the result node by node.
+- A DMOS channel: implant the p-body and the n+ source through the same mask edge (the gate poly edge, self-aligned); the channel is the difference of their lateral diffusions, and its doping falls from the source towards the drift region - see 'RW: Si MOSFET 55V (IRLZ44N), diffused' and its A/B twin with box doping.
+- A device file with profiles is written as version 2; older versions of the program open it with a warning and without the profiles.
 ## Mesh
 Nx, Ny and Nz are the base node counts. With `Graded mesh` on, nodes cluster at every junction and material interface, and the mesher adds:
 - boundary layers (0.5 nm first cell) under oxide-gated faces and at insulator interfaces;
@@ -4712,7 +5013,7 @@ Pinned sweeps get the same parameters, listed below those of the last sweep; `Ta
 ## Gate oxide field
 The Results tab title shows the largest field in the insulators (a gate oxide) and where it is - a design limit of SiC trench MOSFETs (about 3-4 MV/cm).
 ## Interface traps of SiC MOSFETs
-Defects → 'Interface traps 4H-SiC/SiO2: band tail': acceptor states rising exponentially towards Ec (Potbhare et al.). They trap a large part of the channel electrons near threshold: V_th up, a stretched subthreshold swing, and a channel that improves as the temperature empties them.
+Defects → 'Interface traps 4H-SiC/SiO2: band tail': acceptor states rising exponentially towards Ec (Potbhare et al.). They trap a large part of the channel electrons near threshold: V_th up, a stretched subthreshold swing, and a channel that improves as the temperature empties them. With the surface model on (Solver page: Lombardi; on in the SiC MOSFET templates) the trapped charge also scatters the channel electrons (Coulomb scattering): ~30 cm²/Vs at the peak with the templates' NO-annealed density (D_edge 1.5e13), less with the preset's 5.7e13 of older oxides.
 """),
 ("Physics and numerics", """
 # Physics and numerics
@@ -4723,12 +5024,15 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - Fermi statistics are not used (Boltzmann).
 - Klaassen band-gap narrowing.
 - Doping-dependent mobility (Masetti in Si, Caughey-Thomas/Arora form elsewhere) with velocity saturation.
+- 4H-SiC mobility anisotropy: along the c-axis electrons move 1/0.83 = 1.20× faster than across it, holes 1/1.15 = 0.87× (Burin et al. 2024). The material data are the across-c values; the c-axis is set on the Solver page (default y, the wafer normal of the vertical templates: their drift regions conduct along c, their MOS channels across it). The mobility maps show the across-c value.
 - SRH with doping-dependent lifetimes, Auger and radiative recombination.
+- Incomplete ionisation of dopants (Solver page, on by default; 4H-SiC): N_D⁺ = N_D Σ w/(1 + g_D n/N_c e^(ΔE/kT)) over the hexagonal and cubic nitrogen sites (70.9 and 123.7 meV, 1:1), N_A⁻ = N_A/(1 + g_A p/N_v e^(ΔE_A/kT)) for aluminium (225 meV), each level ΔE = ΔE0 − α N^(1/3) (α 3.4e-8, 4.7e-8 and 3.2e-8 eV·cm), g_D = 2, g_A = 4. At 300 K about 6 % of 1e18 cm⁻³ Al is ionised (25 % at 450 K) and 95 % of 1e16 N: p-type SiC is far less conductive than its doping, and more so the colder it is. Depletion ionises every dopant, so blocking fields do not change. The map 'ionised doping' (3D Slicer) shows N_D⁺ − N_A⁻; mobility, lifetimes and band-gap narrowing keep the chemical doping. Other materials stay fully ionised.
 - Deep levels of defects: SRH through any level with its own capture cross sections, plus the charge it traps (see Defects).
 - Oxide gates with fixed charge, interface sheet charges (GaN polarisation) and buried metal electrodes.
 ## Nanoscale MOS models (Solver page; MOS templates switch them on)
 - Quantum confinement, MLDA (modified local-density approximation): at every semiconductor/insulator interface the density of states is cut by the factor 1 − exp(−(z/λ)²), λ = ħ/√(2 m kT), per valley: Si electrons in the Δ2 (m = 0.916, λ = 1.27 nm, 1/3 of the states) and Δ4 valleys (m = 0.19, λ = 2.79 nm, 2/3), holes heavy/light. The inversion layer moves ~1 nm off the oxide: V_th rises by 40-100 mV and the gate capacitance drops. The Bands tab draws Ec + Λn and Ev − Λp (the quantum potentials).
 - Lombardi surface mobility (Si): 1/µ = 1/µ_bulk + D/µ_ac + D/µ_sr with the field normal to the current, D = exp(−d/10 nm). Reproduces the universal mobility curve (~400 cm²/Vs at 0.5 MV/cm, ~250 at 1 MV/cm for electrons).
+- The same switch for 4H-SiC electrons (inversion channels at SiO2): surface phonons and roughness with the parameters of Uhnevionak (thesis, Erlangen 2015; the set of its 34 nm-oxide device) plus Coulomb scattering on the interface charge, 1/µ = 1/µ_bulk + D (1/µ_ac + 1/µ_sr + 1/µ_C), µ_C = µ1 (T/300) [1 + (n/(n_trans (N_C/N0)))^1.5] / ((N_C/N0)^0.5 f(E⊥)), f = 1 − exp(−(E⊥/2e5 V/cm)²), µ1 = 40 cm²/Vs, N0 = 1e11 cm⁻², n_trans from the body doping (2.8e16…1.55e18 cm⁻³ for N_A = 1e15…5e17). N_C, the interface charge per area, is what sits at the nearest SiC/oxide interface: the oxide charge of a face gate, fixed charge on the oxide nodes or at the surface, and the charge trapped in interface states (Defects page: 'Interface traps 4H-SiC/SiO2: band tail'), updated as they fill. Screened by the channel electrons, it fades at high gate drive. A long-channel NMOS with NO-annealed band-tail traps (D_edge 1.5e13) peaks at µ_FE ≈ 34 cm²/Vs and gives ~12 at 1 MV/cm (measured 30-40 and 10-20); with N_A = 5e17 its current rises with temperature above threshold. Holes keep their bulk mobility (no parameters).
 - Gate tunnelling: Tsu-Esaki current with WKB transmission through the gate stack for electrons (conduction band) and holes (valence band), both directions (semiconductor → gate and gate → semiconductor). Direct tunnelling and Fowler-Nordheim are the same formula. Barriers from the electron affinities: SiO2 3.1 eV (tunnelling mass 0.42), HfO2 1.5 eV (0.18), Al2O3 2.7 eV (0.35), Si3N4 2.0 eV (0.5). The supply of an inversion or accumulation layer comes from its pressure on the interface, so the result does not depend on the mesh or on MLDA. The gate current appears in the Results table and the I-V semi-log panel; the 3D Slicer shows log10|J gate| at the interface nodes.
 ## Impact ionisation (Solver page; off by default, on in the avalanche templates)
 - Electron-hole pairs are generated at G = (α_n|J_n| + α_p|J_p|)/q, with α = γ a exp(−(γ b/F)^m) (Chynoweth law), F the field along each carrier's current, and γ = tanh(ħω/2kT₀)/tanh(ħω/2kT) the optical-phonon temperature factor (ħω = 63 meV, T₀ = 300 K): breakdown voltages rise with temperature.
@@ -4760,7 +5064,7 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 ## Not modelled
 - impact ionisation is a local-field model (no dead space, no energy relaxation): very short high-field regions (below ~100 nm) break down at too low a voltage; the voltage-driven contacts make snapback and second breakdown out of reach; the runaway shows only when the leakage it multiplies is above the current resolution (in tiny cells with long lifetimes shorten τ0 on the Solver page - it raises the leakage, not BV); no coefficients for Ge, InP and the alloys;
 - band-to-band tunnelling: Zener behaviour and GIDL are absent; it also adds to avalanche breakdown above ~5e16 cm⁻³, and the silicon ionisation coefficients (van Overstraeten & de Man) are fitted for 1.75–6e5 V/cm only - an abrupt Si junction at 1e17 cm⁻³ breaks down at 14 V here against about 11 V measured;
-- incomplete ionisation of dopants: every donor and acceptor is ionised, so p-type 4H-SiC (Al) and p-GaN (Mg), where only a few per cent are ionised at 300 K, are far too conductive;
+- incomplete ionisation of dopants: 4H-SiC only (N, Al), with Boltzmann statistics and in steady state; no Mott transition, so heavily doped n+/p+ SiC stays partly ionised (the level depths fall with doping but not to a metal); p-GaN (Mg) and the other materials are fully ionised - p-GaN is far too conductive;
 - Fermi-Dirac statistics: carriers follow Boltzmann statistics, so degenerate layers (n++/p++ contacts, GaAs above ~4e17 cm⁻³, HEMT channels) are approximate;
 - negative differential mobility: GaAs and InP electrons saturate smoothly at v_sat (no transferred-electron velocity peak, no Gunn effect), so short GaAs/InP channels carry 2–3x too little current near the peak field;
 - temperature dependence: silicon's saturation velocity follows Canali et al.; the other materials keep their 300 K v_sat, and the SiC/GaN Auger and ionisation coefficients have no temperature dependence;
@@ -4772,9 +5076,9 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - ballistic transport, strain and remote-phonon scattering in high-k stacks: nanoscale on-currents are drift-diffusion estimates;
 - self-heating;
 - transients and AC: f_T is the quasi-static charge-control estimate, and the capacitances are quasi-static (low-frequency) values - no high-frequency MOS C-V with frozen inversion charge, no switching transient for the gate charge; with a channel on, the split of its charge between source and drain is approximate;
-- SiC MOSFET channels: the Lombardi surface mobility is silicon only, so a 4H-SiC inversion channel keeps its bulk mobility (hundreds of cm²/Vs, against the 20-40 measured, set by Coulomb scattering on the interface charge): its channel resistance comes out several times too low - the band-tail D_it preset adds the trapped charge, not the scattering;
-- anisotropic mobility: 4H-SiC conducts about 20 % better along its c-axis (vertical drift regions), not modelled;
-- doping profiles: every region is uniformly doped - the lateral doping gradient of a DMOS channel, which sets both V_th and the channel length, is approximated by boxes;
+- SiC MOSFET channels: the surface model (Lombardi switch) is checked against measured field-effect mobilities of NO-annealed Si-face devices, not fitted to a process - roughness and the Coulomb parameters vary from oxide to oxide (the thesis's 25.5 nm set gives 3x the mobility); the Coulomb term needs the interface charge to be in the device (band-tail traps, oxide charge) and sees it at the nearest interface only; hole channels and other faces ((11-20) trench sidewalls conduct ~2x better) have no own parameters;
+- anisotropic mobility: only the low-field mobility of 4H-SiC (velocity saturation and impact ionisation stay isotropic, GaN is isotropic), with the c-axis along x, y or z (no 4° off-cut);
+- doping profiles are analytic (Gaussian or erfc through a rectangular mask window on a domain face, added to the regions): no process simulation - no segregation at oxides, no oxidation-enhanced or concentration-dependent diffusion, no channelling tails - and one face per profile;
 - defects: traps are in steady state (no transient trapping, current collapse or hysteresis), without field-enhanced emission (Poole-Frenkel, trap-assisted tunnelling); a metal particle carries no current through itself (a particle spanning a junction does not short it), and dislocations are not conducting pipes;
 - general 3-D (tetrahedral) meshes: the triangular mesh is a 2-D triangulation extruded along one axis, so an outline must be normal to the prism axis (others fall back to a staircase), and geometry along the axis stays blocky;
 - gate tunnelling through a curved stack uses the planar WKB barrier along each normal path (the field is exact, the barrier shape ignores the film's curvature).
@@ -4797,7 +5101,8 @@ Drift-diffusion: Poisson's equation plus electron and hole continuity with Schar
 - File → Export plot: the visible tab as PNG, PDF or SVG.
 - `validate.py`: physics regression battery (python3 validate.py; --templates also solves every template).
 - `install.sh`: installs what is missing, builds the core and adds a launcher (Linux, WSL2, macOS).
-- `semibuild.py`: builds the C core (python3 semibuild.py; --portable for any CPU of this kind). main.py runs it by itself when the core is missing or out of date.
+- `install.bat` (double-click; runs `install_win.py`): the same on native Windows - a private Python environment in `.venv`, the core (ready-made from a release zip, or built with MinGW-w64 gcc), a self-test and Start-menu and Desktop shortcuts. No administrator rights.
+- `semibuild.py`: builds the C core (python3 semibuild.py; --portable for any CPU of this kind; --cross CC -o semiconductor_core.dll builds a Windows core with a MinGW-w64 cross-compiler). main.py runs it by itself when the core is missing or out of date.
 - `semimesh.py`: the triangular-prism mesher; `semidefects.py`: the defect library and its mapping onto a mesh. Both must sit next to main.py.
 """),
 ("Keyboard shortcuts", "# Keyboard shortcuts\n"+"\n".join(
@@ -5003,7 +5308,7 @@ class App(tk.Tk):
         self.geometry(geo if geo else f"{W}x{H}+{max(0,(sw-W)//2)}+{max(0,(sh-H)//4)}")
         self.minsize(760,500)
         # ── state ──
-        self.regs:list[Reg]=[]; self.cons:list[Con]=[]; self.sheets:list[Sheet]=[]
+        self.regs:list[Reg]=[]; self.cons:list[Con]=[]; self.sheets:list[Sheet]=[]; self.implants:list[Implant]=[]
         self.sol=None; self.ivd=None; self.busy=False; self.job=None
         self.tname=""; self.tmeta={}
         self.dense_x=[]; self.dense_y=[]; self.dense_z=[]
@@ -5034,7 +5339,9 @@ class App(tk.Tk):
         # metal contacts: thermionic emission (+ image force), barrier tunnelling
         self.m_te=tk.BooleanVar(value=True); self.m_sbt=tk.BooleanVar(value=True)
         self.m_ii=tk.BooleanVar(value=False)          # impact ionisation (avalanche)
+        self.m_inc=tk.BooleanVar(value=True)          # incomplete ionisation (4H-SiC N, Al)
         self.tau0=tk.StringVar(value="")              # background SRH lifetime (s); "" = material defaults
+        self.caxis=tk.StringVar(value="y")            # c-axis of hexagonal crystals (4H-SiC mobility)
         try: ncpu=len(os.sched_getaffinity(0))
         except Exception: ncpu=os.cpu_count() or 1
         self.ncpu=ncpu; self.threads=tk.IntVar(value=int(os.environ.get("OMP_NUM_THREADS",ncpu)))
@@ -5111,6 +5418,12 @@ class App(tk.Tk):
         self.rb_dp=tk.StringVar(value="1e16"); self.rb_lbl=tk.StringVar(value="")
         self.rb_x0=tk.DoubleVar(); self.rb_y0=tk.DoubleVar(); self.rb_z0=tk.DoubleVar()
         self.rb_x1=tk.DoubleVar(value=200.); self.rb_y1=tk.DoubleVar(value=200.); self.rb_z1=tk.DoubleVar(value=200.)
+        # doping-profile (implant) form
+        self.ib_dt=tk.StringVar(value="p"); self.ib_kind=tk.StringVar(value="gauss"); self.ib_face=tk.StringVar(value="y0")
+        self.ib_peak=tk.StringVar(value="1e17"); self.ib_Lv=tk.StringVar(value="300"); self.ib_Rp=tk.StringVar(value="0")
+        self.ib_lat=tk.StringVar(value="0.8"); self.ib_lbl=tk.StringVar(value="")
+        self.ib_a0=tk.StringVar(value="0"); self.ib_a1=tk.StringVar(value="1e9")
+        self.ib_b0=tk.StringVar(value="0"); self.ib_b1=tk.StringVar(value="1e9")
         # contact form
         self.cb_face=tk.StringVar(value="Y-Min"); self.cb_bc=tk.StringVar(value="Ohmic")
         self.cb_V=tk.DoubleVar(); self.cb_pm=tk.DoubleVar(value=4.05); self.cb_lbl=tk.StringVar()
@@ -5163,7 +5476,7 @@ class App(tk.Tk):
     # ─── settings file ─────────────────────────────────────────
     def _load_settings(self):
         try:
-            with open(SETTINGS_FILE) as f: d=json.load(f)
+            with open(SETTINGS_FILE,encoding="utf-8") as f: d=json.load(f)
             return d if isinstance(d,dict) else {}
         except Exception: return {}
     def _save_settings(self):
@@ -5182,7 +5495,7 @@ class App(tk.Tk):
                    cur_thr=self.cur_thr.get(),flowlines=bool(self.cur_lines.get()),nlines=self._nlines(),
                    jlog=bool(self.cur_log.get()),particles=self._nparticles(),aspeed=float(self.cur_spd.get()),
                    anim3d=bool(self.cur_anim3.get()))
-            with open(SETTINGS_FILE,"w") as f: json.dump(d,f)
+            with open(SETTINGS_FILE,"w",encoding="utf-8") as f: json.dump(d,f)
         except Exception: pass
     def _quit(self):
         if self.busy and self.job is not None: self.job.request_stop()
@@ -5832,6 +6145,38 @@ class App(tk.Tk):
         for c in range(4): bf.columnconfigure(c,weight=1)
         self._hint(fr2,"Select a row to load it into the form, edit, then Update. Coordinates in nm; "
                        "'i' = intrinsic. Insulators (SiO2, Al2O3) ignore the doping.")
+        fr3=self._sec(p,"Doping profiles (implants, diffusions) - added to the regions")
+        cols=("#","Label","Type","Kind","Peak cm⁻³","Face","Lv","Rp","r","Window (nm)")
+        tf,self.itree=self._tree(fr3,cols,[30,150,40,48,72,40,50,46,36,170],height=4)
+        tf.pack(fill=tk.BOTH,expand=True,padx=4,pady=4)
+        self.itree.bind("<<TreeviewSelect>>",lambda _:self._loadimp())
+        fm=tk.Frame(fr3,bg=C["panel"]); fm.pack(fill=tk.X,padx=4,pady=4)
+        self._L(fm,"Type",0,0); self._CB(fm,self.ib_dt,["n","p"],0,1,w=3)
+        self._L(fm,"Kind",0,2); self._CB(fm,self.ib_kind,list(Implant.KINDS),0,3,w=6)
+        self._L(fm,"Face",0,4); cb=self._CB(fm,self.ib_face,list(Implant.FACES),0,5,w=4)
+        cb.bind("<<ComboboxSelected>>",lambda _:self._imp_axes())
+        self._L(fm,"Peak (cm⁻³)",1,0); self._E(fm,self.ib_peak,1,1,9,columnspan=2)
+        self._L(fm,"Lv / Rp (nm)",1,3); self._E(fm,self.ib_Lv,1,4,6); self._E(fm,self.ib_Rp,1,5,6)
+        self._L(fm,"Lateral r",2,0); self._E(fm,self.ib_lat,2,1,6)
+        self.ia_lbl=self._L(fm,"x from / to",3,0); self._E(fm,self.ib_a0,3,1,8,columnspan=2); self._E(fm,self.ib_a1,3,3,8,columnspan=2)
+        self.ib_lbl2=self._L(fm,"z from / to",4,0); self._E(fm,self.ib_b0,4,1,8,columnspan=2); self._E(fm,self.ib_b1,4,3,8,columnspan=2)
+        self._L(fm,"Label",5,0); self._E(fm,self.ib_lbl,5,1,26,columnspan=5)
+        bf=tk.Frame(fr3,bg=C["panel"]); bf.pack(fill=tk.X,padx=4,pady=4)
+        items=[("+ Add",self._addimp,"#0a8f5a"),("✎ Update",self._editimp,C["accent"]),
+               ("⧉ Duplicate",self._dupimp,"#0e7490"),("✕ Delete",self._delimp,"#a3243b"),
+               ("Whole face",self._fullimp,"#4f46e5"),("Clear all",self._clrimp,"#444")]
+        for k,(t2,cmd,bg) in enumerate(items):
+            self._btn(bf,t2,cmd,bg=bg).grid(row=k//3,column=k%3,padx=2,pady=2,sticky="ew")
+        for c in range(3): bf.columnconfigure(c,weight=1)
+        self._hint(fr3,"A profile adds donors (n) or acceptors (p) to the semiconductor under a mask window "
+                       "on one face (y0 = the top surface): 'gauss' = an implant, peak·exp(−((d − Rp)/Lv)²) at "
+                       "depth d (Rp the projected range, Lv the straggle); 'erfc' = a diffusion from the surface, "
+                       "peak·erfc(d/Lv). Under a mask edge it spreads sideways over r·Lv (lateral diffusion, "
+                       "r ≈ 0.7-0.85 for Si); r = 0 is a sharp edge (SiC implants do not diffuse). The window is "
+                       "given in nm along the face's two axes; an edge at or beyond the domain boundary is no edge. "
+                       "The mesh refines at the junctions the profiles make; the net-doping map on the 3D Slicer tab "
+                       "shows the result. A DMOS channel is the difference of a p-body and an n+ source diffusion "
+                       "under one mask edge.")
 
     def _page_contacts(self,p):
         fr=self._sec(p,"Contacts")
@@ -6277,17 +6622,20 @@ class App(tk.Tk):
         fr=self._sec(p,"Physics")
         fm=tk.Frame(fr,bg=C["panel"]); fm.pack(fill=tk.X,padx=4,pady=4)
         self._L(fm,"Temperature (K)",0,0); self._E(fm,self.T,0,1,8)
-        self._L(fm,"Background SRH τ0 (s)",10,0); self._E(fm,self.tau0,10,1,8)
-        self._L(fm,"empty = material",10,2)
+        self._L(fm,"Background SRH τ0 (s)",11,0); self._E(fm,self.tau0,11,1,8)
+        self._L(fm,"empty = material",11,2)
+        self._L(fm,"4H-SiC c-axis",12,0); self._CB(fm,self.caxis,list(CAXES),12,1,w=5)
+        self._L(fm,"along it: μn +20 %, μp −13 %",12,2)
         for k,(txt,var) in enumerate([("Band-gap narrowing (Klaassen)",self.m_bgn),
                                       ("SRH lifetime τ(N)",self.m_tau),
                                       ("Velocity saturation",self.m_vsat),
                                       ("Quantum confinement at oxide interfaces (MLDA)",self.m_qc),
-                                      ("Surface mobility (Lombardi, Si)",self.m_lb),
+                                      ("Surface mobility (Lombardi; SiC: + Coulomb on interface charge)",self.m_lb),
                                       ("Gate tunnelling (direct + Fowler-Nordheim)",self.m_tun),
                                       ("Metal contacts: thermionic emission + image-force lowering",self.m_te),
                                       ("Tunnelling through Schottky barriers (field emission)",self.m_sbt),
-                                      ("Impact ionisation (avalanche breakdown)",self.m_ii)]):
+                                      ("Impact ionisation (avalanche breakdown)",self.m_ii),
+                                      ("Incomplete ionisation of dopants (4H-SiC: N, Al)",self.m_inc)]):
             ttk.Checkbutton(fm,text=txt,variable=var).grid(row=1+k,column=0,columnspan=3,sticky="w",padx=4,pady=1)
         self._hint(fr,"MLDA, Lombardi and gate tunnelling matter for thin-oxide MOS devices: MLDA pushes the "
                       "inversion layer ~1 nm off the oxide (V_th up, gate capacitance down), Lombardi lowers "
@@ -6310,6 +6658,16 @@ class App(tk.Tk):
                       "divides it by 1 + N/Nref). 1e-3 = float-zone-quality silicon, 'none' = no background SRH at "
                       "all, so only the deep levels of the Defects page recombine - the clean way to study what "
                       "a defect does.")
+        self._hint(fr,"Incomplete ionisation: in 4H-SiC the dopant levels are deep (N 71/124 meV on its two "
+                      "lattice sites, Al 225 meV), so only part of the dopants give up their carriers - at 300 K "
+                      "~6 % of 1e18 cm⁻³ aluminium. Depleted regions are fully ionised. Off: every dopant ionised, "
+                      "as before v0.2.5. Silicon and the other materials are always fully ionised.")
+        self._hint(fr,"4H-SiC c-axis: the hexagonal crystal conducts electrons about 20 % better along its "
+                      "c-axis than across it, holes about 13 % worse (Burin et al. 2024). The low-field mobility "
+                      "of the material data is the in-plane value; edges along the c-axis get μ∥ (on the "
+                      "triangular-prism mesh: the tensor projected on each edge). y = the wafer normal of the "
+                      "vertical templates (the drift region conducts along c, the MOS channel across it); "
+                      "off = isotropic, as before v0.2.5. Velocity saturation stays isotropic.")
         fr=self._sec(p,"Iterations & tolerances")
         fm=tk.Frame(fr,bg=C["panel"]); fm.pack(fill=tk.X,padx=4,pady=4)
         rows=[("Gummel iterations per bias step",self.max_g),("Gummel tolerance (V)",self.tol_p),
@@ -6477,7 +6835,7 @@ class App(tk.Tk):
         cf=self._strip(self.ts)
         self._radio_axes(cf,self.sl_axis,self._upd_slice,"Slice normal")
         tk.Label(cf,text="Quantity",bg=C["panel"],fg=C["sub"],font=self.F["ui"]).pack(side=tk.LEFT,padx=(12,2))
-        qtys=["phi","log10(n)","log10(p)","Ec","Ev","Efn","Efp","log10|J|","mobility µn","log10|R|","net doping",
+        qtys=["phi","log10(n)","log10(p)","Ec","Ev","Efn","Efp","log10|J|","mobility µn","log10|R|","net doping","ionised doping",
               "log10|J gate|","Λn quantum","trap density","trapped charge","log10 G avalanche"]
         cb=ttk.Combobox(cf,textvariable=self.sl_qty,values=qtys,state="readonly",width=13,font=self.F["ui"])
         cb.pack(side=tk.LEFT,padx=2); cb.bind("<<ComboboxSelected>>",lambda _:self._upd_slice())
@@ -6797,22 +7155,27 @@ class App(tk.Tk):
         self.Nx.set(t["Nx"]); self.Ny.set(t["Ny"]); self.Nz.set(t["Nz"])
         self.use_graded.set(True)
         self.regs=t["regs"]; self.cons=t["cons"]; self.sheets=t.get("sheets",[])
+        self.implants=[copy.deepcopy(im) for im in (t.get("implants") or [])]
         self.defects=[SD.Defect.from_dict(d.to_dict()) for d in (t.get("defects") or [])]
         self.amr_nodes={}; self._amr_label()
         self.dense_x=list(t.get("dense_x",[])); self.dense_y=list(t.get("dense_y",[])); self.dense_z=list(t.get("dense_z",[]))
         self.ivS.set(t["ivS"]); self.ivE.set(t["ivE"]); self.ivN.set(t["ivN"])
         self.bv_thr.set(t.get("bv_thr",0.))
         self.tau0.set("" if t.get("tau0") is None else ("none" if t["tau0"]==0 else f"{t['tau0']:g}"))
+        self.caxis.set(caxis_of(t))
+        pw=t.get("power") or {}                       # die scaling (Sweep page): the template's, else none
+        self.pw_area.set(float(pw.get("area",0.) or 0.)); self.pw_rsp.set(float(pw.get("rsp",0.) or 0.))
+        self.pw_rpkg.set(float(pw.get("rpkg",0.) or 0.))
         mdl=int(t.get("models",M_DEFAULT))
         for v,b in ((self.m_bgn,M_BGN),(self.m_tau,M_TAU),(self.m_vsat,M_VSAT),(self.m_qc,M_QC),
                     (self.m_lb,M_LB),(self.m_tun,M_TUN),(self.m_te,M_TE),(self.m_sbt,M_SBT),
-                    (self.m_ii,M_II)): v.set(bool(mdl&b))
+                    (self.m_ii,M_II),(self.m_inc,M_INC)): v.set(bool(mdl&b))
         groups=con_groups(self.cons)
         tgt=t.get("ivnet")
         if not tgt:
             ivc=t.get("ivc",0); tgt=next((k for k,idx in groups if ivc in idx),groups[0][0] if groups else "")
         self._refresh_groups(tgt=tgt,flt=t.get("ivfloat") or "(none)",out=t.get("ivout") or "auto")
-        self._rfr(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._def_centre(); self._def_sc_whole()
+        self._rfr(redraw=False); self._rfi(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._def_centre(); self._def_sc_whole()
         pk=t.get("prof")                  # Current tab: show the current under this contact
         if pk and group_of(self.cons,pk):
             disp=group_label(self.cons,pk,group_of(self.cons,pk))
@@ -6865,13 +7228,13 @@ class App(tk.Tk):
         cp=copy.deepcopy if deep else (lambda x:x)
         return dict(Lx=float(self.Lx.get()),Ly=float(self.Ly.get()),Lz=float(self.Lz.get()),
                     Nx=int(self.Nx.get()),Ny=int(self.Ny.get()),Nz=int(self.Nz.get()),
-                    regs=cp(self.regs),cons=cp(self.cons),sheets=cp(self.sheets),
+                    regs=cp(self.regs),cons=cp(self.cons),sheets=cp(self.sheets),implants=cp(self.implants),
                     defects=[SD.Defect.from_dict(d.to_dict()) for d in self.defects] if deep else self.defects,
                     dense_x=list(self.dense_x),dense_y=list(self.dense_y),dense_z=list(self.dense_z),
                     nodes=cp(self.tmeta.get("nodes")),clear=cp(self.tmeta.get("clear")),
                     refine=cp(self.tmeta.get("refine")),
                     mesh=self.mesh_type.get(),prism=None if self.prism_ax.get()=="auto" else self.prism_ax.get(),
-                    extrude=self.tmeta.get("extrude"),tau0=self._tau0(strict=False),
+                    extrude=self.tmeta.get("extrude"),tau0=self._tau0(strict=False),caxis=self.caxis.get(),
                     amr=copy.deepcopy(self.amr_nodes) if self.amr_nodes else None)
     def _amr_clear(self):
         if self.busy: return
@@ -7066,6 +7429,73 @@ class App(tk.Tk):
     def _clrreg(self):
         if self.regs and messagebox.askyesno("Regions","Delete all regions?"): self.regs.clear(); self._rfr()
 
+    # ─── DOPING-PROFILE CRUD ───────────────────────────────────
+    def _imp_axes(self):
+        f=self.ib_face.get(); q="xyz".index(f[0]) if f and f[0] in "xyz" else 1
+        o=[a for a in "xyz" if a!="xyz"[q]]
+        if hasattr(self,"ia_lbl"):
+            self.ia_lbl.config(text=f"{o[0]} from / to"); self.ib_lbl2.config(text=f"{o[1]} from / to")
+    def _rfi(self,redraw=True):
+        if not hasattr(self,"itree"): return
+        sel=self.itree.selection(); idx=self.itree.index(sel[0]) if sel else None
+        for it in self.itree.get_children(): self.itree.delete(it)
+        try: L3=(float(self.Lx.get()),float(self.Ly.get()),float(self.Lz.get()))
+        except Exception: L3=(1e9,1e9,1e9)
+        for k,im in enumerate(self.implants):
+            q,ia,ib=im.axes(); (a0,a1),(b0,b1)=im.window(L3)
+            win=f"{'xyz'[ia]} {a0:g}–{a1:g}, {'xyz'[ib]} {b0:g}–{b1:g}"
+            self.itree.insert("","end",values=(k,im.label,im.dtype.upper(),im.kind,f"{im.peak:.2e}",im.face,
+                                               f"{im.Lv:g}",f"{im.Rp:g}" if im.kind=="gauss" else "-",f"{im.lat:g}",win))
+        if idx is not None and idx<len(self.implants): self._select(self.itree,idx,load=False)
+        if redraw: self._geometry_changed()
+    def _imp_from_form(self):
+        try:
+            vals=[float(v.get()) for v in (self.ib_peak,self.ib_Lv,self.ib_Rp,self.ib_lat,
+                                           self.ib_a0,self.ib_a1,self.ib_b0,self.ib_b1)]
+        except Exception:
+            messagebox.showerror("Doping profile","Peak, lengths and window must be numbers."); return None
+        peak,Lv,Rp,lat,a0,a1,b0,b1=vals
+        if not (peak>0. and Lv>0. and Rp>=0. and lat>=0.):
+            messagebox.showerror("Doping profile","Peak and Lv must be positive, Rp and r not negative."); return None
+        if not (a1>a0 and b1>b0):
+            messagebox.showerror("Doping profile","Each window end must exceed its start."); return None
+        dt=self.ib_dt.get(); kind=self.ib_kind.get()
+        lbl=self.ib_lbl.get().strip() or f"{dt} {kind} {peak:.0e} @{self.ib_face.get()}"
+        return Implant(dt,peak,self.ib_face.get(),a0,a1,b0,b1,kind,Lv,Rp,lat,lbl)
+    def _addimp(self):
+        im=self._imp_from_form()
+        if im: self.implants.append(im); self._rfi(); self._select(self.itree,len(self.implants)-1,False)
+    def _editimp(self):
+        i=self._sel_idx(self.itree)
+        if i is None: messagebox.showinfo("Doping profile","Select a profile in the table first."); return
+        im=self._imp_from_form()
+        if im: self.implants[i]=im; self._rfi()
+    def _dupimp(self):
+        i=self._sel_idx(self.itree)
+        if i is None: return
+        im=copy.deepcopy(self.implants[i]); im.label+=" copy"; self.implants.insert(i+1,im)
+        self._rfi(); self._select(self.itree,i+1,False)
+    def _loadimp(self):
+        if getattr(self,"_noload",False): return
+        i=self._sel_idx(self.itree)
+        if i is None or i>=len(self.implants): return
+        im=self.implants[i]
+        self.ib_dt.set(im.dtype); self.ib_kind.set(im.kind); self.ib_face.set(im.face)
+        for v,x in ((self.ib_peak,f"{im.peak:.4g}"),(self.ib_Lv,f"{im.Lv:g}"),(self.ib_Rp,f"{im.Rp:g}"),
+                    (self.ib_lat,f"{im.lat:g}"),(self.ib_a0,f"{im.a0:g}"),(self.ib_a1,f"{im.a1:g}"),
+                    (self.ib_b0,f"{im.b0:g}"),(self.ib_b1,f"{im.b1:g}"),(self.ib_lbl,im.label)): v.set(x)
+        self._imp_axes()
+    def _delimp(self):
+        i=self._sel_idx(self.itree)
+        if i is not None: del self.implants[i]; self._rfi()
+    def _fullimp(self):
+        q="xyz".index(self.ib_face.get()[0]); o=[a for a in range(3) if a!=q]
+        L=(self.Lx.get(),self.Ly.get(),self.Lz.get())
+        self.ib_a0.set("0"); self.ib_a1.set(f"{L[o[0]]:g}"); self.ib_b0.set("0"); self.ib_b1.set(f"{L[o[1]]:g}")
+    def _clrimp(self):
+        if self.implants and messagebox.askyesno("Doping profiles","Delete all doping profiles?"):
+            self.implants.clear(); self._rfi()
+
     # ─── CONTACT CRUD ──────────────────────────────────────────
     def _full_face(self):
         for v,x in ((self.cb_i0,0.),(self.cb_i1,100.),(self.cb_j0,0.),(self.cb_j1,100.),(self.cb_k0,0.),(self.cb_k1,100.)): v.set(x)
@@ -7197,7 +7627,7 @@ class App(tk.Tk):
                 (M_VSAT if self.m_vsat.get() else 0)|(M_QC if self.m_qc.get() else 0)|
                 (M_LB if self.m_lb.get() else 0)|(M_TUN if self.m_tun.get() else 0)|
                 (M_TE if self.m_te.get() else 0)|(M_SBT if self.m_sbt.get() else 0)|
-                (M_II if self.m_ii.get() else 0))
+                (M_II if self.m_ii.get() else 0)|(M_INC if self.m_inc.get() else 0))
     def _forget(self):
         self._c_sig=None; self._c_ok=False; self._log("Solution forgotten - next run starts from equilibrium")
 
@@ -7673,7 +8103,7 @@ class App(tk.Tk):
 
     # ─── A/B COMPARE ───────────────────────────────────────────
     MODEL_NAMES={M_BGN:"BGN",M_TAU:"τ(N)",M_VSAT:"v_sat",M_QC:"MLDA",M_LB:"Lombardi",M_TUN:"tunnelling",
-                 M_TE:"TE",M_SBT:"barrier tunnelling",M_II:"avalanche"}
+                 M_TE:"TE",M_SBT:"barrier tunnelling",M_II:"avalanche",M_INC:"incomplete ionisation"}
     def _ab_win(self):
         top=self._ab_top
         if top is not None and top.winfo_exists():
@@ -8009,6 +8439,8 @@ class App(tk.Tk):
             if N!=sh.axis and rg[N][0]-tol<=pos<=rg[N][1]+tol:
                 a2.plot(rg[H],rg[Vv],color="#f0abfc",lw=2,ls="--",zorder=5)
                 hand.append(Line2D([0],[0],color="#f0abfc",lw=2,ls="--",label=f"σ {sh.sigma:+.1e} q/cm²"))
+        if self.implants:
+            self._draw_implants_2d(a2,H,Vv,N,pos,L3,tol,hand)
         if self.defects and (self.lay_def.get() or not self.lay_sec.get()):
             self._draw_defects_2d(a2,self.defects,H,Vv,N,pos,L3)
             hand.extend(self._defect_legend(self.defects))
@@ -8046,6 +8478,13 @@ class App(tk.Tk):
             a3.set_facecolor(C["bg"])
             self._draw_struct3(a3,self.regs,self.cons,L3)
             if self.lay_def.get(): self._draw_defects_3d(a3,self.defects,L3)
+            for im in self.implants:                      # mask windows of the doping profiles
+                q,ia,ib=im.axes(); (a0,a1),(b0,b1)=im.window(L3); fp=0. if im.face[1]=="0" else L3[q]
+                pts=[]
+                for u,v in ((a0,b0),(a1,b0),(a1,b1),(a0,b1),(a0,b0)):
+                    P=[0.,0.,0.]; P[q]=fp; P[ia]=u; P[ib]=v; pts.append((P[0],P[2],-P[1]))
+                X_,Y_,Z_=zip(*pts)
+                a3.plot(X_,Y_,Z_,color="#38bdf8" if im.dtype=="n" else "#facc15",lw=1.6,ls="--",zorder=6)
             q={"z":[(0,0,pos),(Lx,0,pos),(Lx,Ly,pos),(0,Ly,pos)],
                "x":[(pos,0,0),(pos,Ly,0),(pos,Ly,Lz),(pos,0,Lz)],
                "y":[(0,pos,0),(Lx,pos,0),(Lx,pos,Lz),(0,pos,Lz)]}[N]
@@ -8074,6 +8513,30 @@ class App(tk.Tk):
     def _con_alpha(self,c):
         ca=max(0.,min(1.,float(self.lay_ca.get())))
         return 0.45*ca/0.85 if (c.face==6 and getattr(c,"shape",None) is not None) else ca
+    def _draw_implants_2d(self,a2,H,Vv,N,pos,L3,tol,hand):
+        """The doping profiles in a section: the junctions they make (net
+        doping = 0 with the regions) and their mask windows on the face."""
+        from matplotlib.lines import Line2D
+        ih,iv,inn="xyz".index(H),"xyz".index(Vv),"xyz".index(N)
+        hs=np.linspace(0.,L3[ih],181); vs=np.linspace(0.,L3[iv],181)
+        HH,VV=np.meshgrid(hs,vs)
+        P=np.zeros((HH.size,3)); P[:,ih]=HH.ravel(); P[:,iv]=VV.ravel(); P[:,inn]=pos
+        n0,semi=_region_net(self.regs,P); nd,na=implant_conc(self.implants,P,L3)
+        net=np.where(semi,n0+nd-na,np.nan).reshape(HH.shape)
+        if np.isfinite(net).any() and np.nanmax(net)>0. and np.nanmin(net)<0.:
+            a2.contour(HH,VV,net,levels=[0.],colors="#facc15",linewidths=1.3,linestyles="--",zorder=5)
+            hand.append(Line2D([0],[0],color="#facc15",lw=1.3,ls="--",label="junctions (regions + doping profiles)"))
+        shown=False
+        for im in self.implants:
+            q,ia,ib=im.axes(); (a0,a1),(b0,b1)=im.window(L3); fq="xyz"[q]
+            fp=0. if im.face[1]=="0" else L3[q]
+            rg={fq:(fp,fp),"xyz"[ia]:(a0,a1),"xyz"[ib]:(b0,b1)}
+            if N!=fq and rg[N][0]-tol<=pos<=rg[N][1]+tol:
+                a2.plot(rg[H],rg[Vv],color="#38bdf8" if im.dtype=="n" else "#facc15",lw=3,ls=":",zorder=6)
+                shown=True
+        if shown:
+            hand.append(Line2D([0],[0],color="#38bdf8",lw=3,ls=":",label="mask window: n profile"))
+            hand.append(Line2D([0],[0],color="#facc15",lw=3,ls=":",label="mask window: p profile"))
     def _draw_struct3(self,a3,regs,cons,L3,overlay=None,editor=True):
         """Regions and contacts in a 3-D axes (plot coordinates x, z, -y) as the
         Layers window shows them: hidden parts left out, each part's own
@@ -9158,6 +9621,10 @@ class App(tk.Tk):
             if qty=="mobility µn": return s["mn"],"YlOrRd","µn (cm²/Vs)"
             if qty=="net doping":
                 Nn=s["Nnet"]; return np.where(semi,np.sign(Nn)*np.log10(1.+np.abs(Nn)),np.nan),"RdBu_r","±log₁₀|Nd−Na| (n > 0)"
+            if qty=="ionised doping":
+                Nn=s.get("Nion",s["Nnet"])
+                return (np.where(semi,np.sign(Nn)*np.log10(1.+np.abs(Nn)),np.nan),"RdBu_r",
+                        "±log₁₀|Nd⁺−Na⁻| (n > 0)"+("" if self.sol.get("models",0)&M_INC else " - incomplete ionisation off"))
             if qty=="log10|J gate|":
                 Jg=np.abs(s.get("Jg",np.zeros_like(s["phi"])))
                 return (np.where(semi&(Jg>0),np.log10(Jg+1e-300),np.nan),"inferno",
@@ -10102,17 +10569,18 @@ class App(tk.Tk):
         if not p: return
         try:
             d=self._device_json()
-            with open(p,"w") as f: json.dump(d,f,indent=1)
+            with open(p,"w",encoding="utf-8") as f: json.dump(d,f,indent=1)
             self.sv.set(f"Device saved → {p}"); self._log(f"Device saved to {p}")
         except Exception:
             messagebox.showerror("Save device",traceback.format_exc())
     def _device_json(self):
         """The editor's device as the device-file dict (what Save writes)."""
-        return dict(format="semisim3d-device",version=1,name=self.tname,
+        return dict(format="semisim3d-device",version=2 if self.implants else 1,name=self.tname,
                    Lx=self.Lx.get(),Ly=self.Ly.get(),Lz=self.Lz.get(),Nx=self.Nx.get(),Ny=self.Ny.get(),Nz=self.Nz.get(),
                    graded=self.use_graded.get(),dense_x=self.dense_x,dense_y=self.dense_y,dense_z=self.dense_z,
                    meta=self.tmeta,regs=[obj_dict(r) for r in self.regs],cons=[obj_dict(c) for c in self.cons],
                    sheets=[obj_dict(s) for s in self.sheets],defects=[d.to_dict() for d in self.defects],
+                   **({"implants":[obj_dict(im) for im in self.implants]} if self.implants else {}),
                    mesh=dict(type=self.mesh_type.get(),prism_axis=self.prism_ax.get(),amr=self.amr_nodes or {}),
                    sweep=dict(tgt=self._gmap.get(self.iv_tgt.get()),flt=self._gmap.get(self.iv_flt.get()),
                               out=self._gmap.get(self.iv_out.get()),Vs=self.ivS.get(),Ve=self.ivE.get(),
@@ -10123,13 +10591,14 @@ class App(tk.Tk):
                                tau=self.m_tau.get(),vsat=self.m_vsat.get(),qc=self.m_qc.get(),
                                lombardi=self.m_lb.get(),tunnel=self.m_tun.get(),
                                metal_te=self.m_te.get(),metal_tunnel=self.m_sbt.get(),
-                               avalanche=self.m_ii.get(),tau0=self.tau0.get()))
+                               avalanche=self.m_ii.get(),ionisation=self.m_inc.get(),
+                               tau0=self.tau0.get(),caxis=self.caxis.get()))
     def _open_device(self):
         if self.busy: return
         p=filedialog.askopenfilename(filetypes=[("SemiSim device","*.json"),("All files","*")])
         if not p: return
         try:
-            with open(p) as f: d=json.load(f)
+            with open(p,encoding="utf-8") as f: d=json.load(f)
             if not isinstance(d,dict) or d.get("format")!="semisim3d-device": raise ValueError("not a SemiSim 3D device file")
             warn=check_device_json(d)
             regs=[Reg(**r) for r in d["regs"]]; cons=[Con(**c) for c in d["cons"]]
@@ -10159,6 +10628,7 @@ class App(tk.Tk):
         self._amr_label()
         self.dense_x,self.dense_y,self.dense_z=d.get("dense_x",[]),d.get("dense_y",[]),d.get("dense_z",[])
         self.regs,self.cons,self.sheets,self.defects=regs,cons,sheets,defects
+        self.implants=[Implant(**x) for x in (d.get("implants") or [])]
         sw=d.get("sweep",{})
         self.ivS.set(sw.get("Vs",0.)); self.ivE.set(sw.get("Ve",1.)); self.ivN.set(sw.get("N",11)); self.bv_thr.set(sw.get("bv",0.))
         self.iv_cap.set(bool(sw.get("cap",False)))
@@ -10169,12 +10639,14 @@ class App(tk.Tk):
         for v,k in ((self.T,"T"),(self.max_p,"max_p"),(self.max_c,"max_c"),(self.max_g,"max_g"),
                     (self.tol_p,"tol_p"),(self.tol_c,"tol_c"),(self.m_bgn,"bgn"),(self.m_tau,"tau"),(self.m_vsat,"vsat"),
                     (self.m_qc,"qc"),(self.m_lb,"lombardi"),(self.m_tun,"tunnel"),
-                    (self.m_te,"metal_te"),(self.m_sbt,"metal_tunnel"),(self.m_ii,"avalanche")):
+                    (self.m_te,"metal_te"),(self.m_sbt,"metal_tunnel"),(self.m_ii,"avalanche"),
+                    (self.m_inc,"ionisation")):
             v.set(so[k] if k in so else (False if k in ("qc","lombardi","tunnel","avalanche") else
-                                         True if k in ("metal_te","metal_tunnel") else v.get()))
+                                         True if k in ("metal_te","metal_tunnel","ionisation") else v.get()))
         self.tau0.set(str(so.get("tau0","") or ""))
+        self.caxis.set(caxis_of(so))
         self._refresh_groups(tgt=sw.get("tgt"),flt=sw.get("flt") or "(none)",out=sw.get("out") or "auto")
-        self._rfr(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._show_sheets()
+        self._rfr(redraw=False); self._rfi(redraw=False); self._rfc(redraw=False); self._rfd(redraw=False); self._show_sheets()
         self._def_centre(); self._def_sc_whole()
         self.t_name.config(text=self.tname); self.t_cat.config(text=label or f"from {os.path.basename(p)}")
         self.t_doc.configure(state="normal"); self.t_doc.delete("1.0","end")
@@ -10338,7 +10810,4 @@ class App(tk.Tk):
 
 
 if __name__=="__main__":
-    if sys.platform.startswith("win"):
-        try: ctypes.windll.shcore.SetProcessDpiAwareness(1)      # crisp text on high-DPI screens
-        except Exception: pass
     App().mainloop()

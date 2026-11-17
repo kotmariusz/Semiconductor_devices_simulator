@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.2.5 (2026-11-17) - native Windows; SiC channel, ionisation and anisotropy; doping profiles
+
+- Native Windows: `install.bat` (runs `install_win.py`) checks Python, makes a
+  private environment, keeps the ready-made solver core of a release zip or
+  builds one with a MinGW-w64 gcc (UCRT; statically linked, so it needs only
+  Windows' own DLLs), runs a self-test and puts SemiSim 3D in the Start menu
+  and on the Desktop. The program runs under `pythonw` without a console
+  (messages go to `%LOCALAPPDATA%\SemiSim3D\semisim.log`), is DPI-aware and
+  reads its environment knobs through the Windows API. `semibuild.py`
+  rejects compilers that cannot build a usable core (MSYS/Cygwin, 32-bit,
+  ARM, MSVC) with a hint, hashes the source independently of line endings,
+  and can cross-build the Windows core on Linux (`--cross`). GitHub Actions
+  test Ubuntu, macOS and Windows and attach a Windows zip with the core to a
+  release on every `v*` tag; `tests/test_platform.py` checks the build rules
+  of all three systems. The installer also works from an IDE's console
+  (Spyder): it shows the output of the programs it starts, does not pass on
+  the IDE's Python variables or `SEMISIM_SO`, and makes `.venv` anew when it
+  is run with another Python than the one `.venv` was made from.
+- 4H-SiC MOSFET channels: the surface-mobility switch (Lombardi) now works for
+  4H-SiC electrons - surface phonons and roughness with the parameters of
+  Uhnevionak (2015) plus Coulomb scattering on the interface charge: the
+  oxide and fixed charge and the charge trapped in interface states at the
+  nearest SiC/oxide interface, updated as the traps fill, screened by the
+  channel electrons. A long-channel NMOS with NO-annealed band-tail traps
+  peaks at a field-effect mobility of ~34 cm²/Vs and gives ~12 at 1 MV/cm
+  (measured 30-40 and 10-20), and its current rises with temperature above
+  threshold at N_A = 5e17. The SiC MOSFET templates use it with NO-annealed
+  band-tail traps (D_edge 1.5e13); the 900 V template also has a die scaling
+  (3.3 mm², 350 µm substrate): 65 mΩ at 25 °C, ~1.5x at 150 °C (datasheet
+  1.38x). Templates can now carry the Sweep page's die values. The SiC
+  MOSFET output sweeps now take several minutes (small steps towards
+  saturation).
+- 4H-SiC c-axis anisotropy: electrons move 1.20x faster along the c-axis,
+  holes 0.87x (Burin et al. 2024); the c-axis is a Solver-page option
+  (default y, the wafer normal), saved with the device. Vertical drift
+  regions have ~17 % less resistance; mobility maps show the in-plane value.
+- Incomplete ionisation (Solver page, on by default; 4H-SiC): nitrogen on its
+  hexagonal and cubic sites and aluminium with doping-dependent level depths
+  (Burin et al.'s compilation). At 300 K ~6 % of 1e18 cm⁻³ Al is ionised (25 %
+  at 450 K), so p-type SiC is far less conductive than its doping; depletion
+  ionises every dopant, so blocking fields do not change. The 3D Slicer has
+  an 'ionised doping' map. Other materials stay fully ionised.
+- Doping profiles (Regions page): implants and diffusions added to the
+  regions - Gaussian (range, straggle) or erfc through a mask window on a
+  face, spreading sideways under the mask edges. The mesh refines at the
+  junctions they make; the Structure tab draws the junctions and the mask
+  windows. New template 'RW: Si MOSFET 55V (IRLZ44N), diffused' (self-aligned
+  p-body and n+ source, channel ~0.55 µm, V_GS(th) ~1.3 V at 250 µA per die,
+  datasheet 1.0-2.0 V), an A/B twin of the box version. Device files with
+  profiles are version 2.
+- Solver: a floating region must be quasi-neutral before and after a
+  continuity solve (nodes that a depletion edge swings across are no longer
+  rescaled as floating blocks), and with incomplete ionisation the solver's
+  quasi-neutral tests use the neutral majority density - SiC diodes reach
+  1.2-1.4 kV from equilibrium in one ramp.
+- Validation: sections 20-23 (anisotropy, SiC channel mobility, incomplete
+  ionisation, doping profiles): 276 checks (220 without the templates).
+
 ## 0.2.4 (2026-11-15) - defects in the 3-D current view, steady GIFs
 
 - Current tab: the 3-D view shows the defects of the solved device (voids

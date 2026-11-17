@@ -12,8 +12,10 @@ __pycache__/
 .venv/
 venv/
 
-# launchers made by install.sh
+# launchers made by install.sh / install_win.py, Windows build output
 SemiSim3D.command
+SemiSim3D*.bat
+dist/
 
 # editors / OS
 .DS_Store

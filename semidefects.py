@@ -158,8 +158,10 @@ _p("Interface traps 4H-SiC/SiO2: band tail", "Interfaces", "interface",
    "044515, 2006; IEEE Trans. Electron Devices 55, 2029, 2008), D_edge ~5.7e13 cm⁻²eV⁻¹ (the D_it field "
    "holds D_edge), E_t = 67 meV at 25 °C. Filled near threshold, they hold a large part of the channel "
    "charge: V_th rises, the subthreshold swing stretches, and the channel conducts better as the "
-   "temperature empties them. These are values of older oxides; NO-annealed interfaces are ~5-10x lower "
-   "near Ec - lower D_it. For the midgap floor (~2.4e11) add 'Interface traps Si/SiO2 (D_it)'.",
+   "temperature empties them. With the surface model on (Solver page) their charge also scatters the "
+   "channel electrons (Coulomb). These are values of older oxides; NO-annealed interfaces are ~4-10x lower "
+   "near Ec (the SiC MOSFET templates use 1.5e13). For the midgap floor (~2.4e11) add 'Interface traps "
+   "Si/SiO2 (D_it)'.",
    dit=5.7e13, dit_sigma=1e-15, tail=0.067, shape="everywhere", host="4H-SiC")
 _p("Oxide fixed charge (Qf)", "Interfaces", "interface",
    "Fixed charge at semiconductor/insulator interfaces inside the shape (q/cm², + or −): shifts the "
