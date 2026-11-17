@@ -5,8 +5,8 @@ and Windows, without a display and in seconds.
   - the source hash ignores line endings (a Windows checkout has CRLF);
   - the Windows rules, checked on any system with the platform injected:
     file name, flags, which compilers are accepted, the hint, the cache folder;
-  - with a MinGW-w64 cross-compiler installed: a Windows core is built and
-    needs nothing but Windows' own DLLs;
+  - with a MinGW-w64 cross-compiler installed (Linux, WSL, macOS): a Windows
+    core is built and needs nothing but Windows' own DLLs;
   - the core loads, and an environment knob set from Python reaches it
     (on Windows that needs the core's own env_get, not getenv);
   - on Windows itself: `semibuild.py --check` names the C runtime.
@@ -74,8 +74,14 @@ rep = B.dll_report(B.SRC)            # not a DLL: nothing found, no crash
 check("dll_report on a non-DLL", rep["crt"] is None and rep["bad"] == [])
 
 print("3. Windows cross build")
-cross = next((c for c in ("x86_64-w64-mingw32-gcc-posix", "x86_64-w64-mingw32-gcc") if shutil.which(c)), None)
-if cross is None:
+# On Windows itself the build of section 4 is the real test; a cross build there
+# would pick whichever x86_64-w64-mingw32-gcc comes first on PATH (on GitHub's
+# runner one that cannot build the core), not the compiler semibuild uses.
+cross = None if B.IS_WIN else next((c for c in ("x86_64-w64-mingw32-gcc-posix", "x86_64-w64-mingw32-gcc")
+                                    if shutil.which(c)), None)
+if B.IS_WIN:
+    print("   (skipped on Windows: the core of section 4 is built and loaded here)")
+elif cross is None:
     print("   (no MinGW-w64 cross-compiler here - skipped; Ubuntu: sudo apt install gcc-mingw-w64-x86-64-posix)")
 else:
     out = os.path.join(tmp, "dist", "semiconductor_core.dll")
@@ -91,7 +97,12 @@ else:
               s2.get("prebuilt") is True and s2.get("system") == "Windows" and s2.get("src") == B.src_hash(), "")
         check("... and the stamp carries the C runtime", s2.get("crt") == r["crt"])
     except B.CoreError as e:
-        check("cross build", False, str(e))
+        check("cross build", False, f"{shutil.which(cross)}: {e}")
+        try:                                  # the end of build.log, as the temp folder is removed
+            with open(os.path.join(os.path.dirname(out), "build.log"), encoding="utf-8", errors="replace") as f:
+                print("".join("      | " + ln for ln in f.readlines()[-25:]), end="")
+        except OSError:
+            pass
 
 print("4. the core on this computer")
 os.environ["SEMISIM_AAM"] = "3"          # a knob read by api3_init: Anderson depth

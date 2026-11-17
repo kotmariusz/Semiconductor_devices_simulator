@@ -386,9 +386,10 @@ def _replace(src, dst):
 # ───────────────────────────────────────────────────────── build
 def build(native=True, out=None, verbose=True):
     """Compile semiconductor_3d.c.  Returns the stamp dict, or None."""
-    out = out or lib_path()
+    out = os.path.abspath(out or lib_path())
     if not os.path.isfile(SRC):
         raise CoreError(f"{SRC} is missing")
+    os.makedirs(os.path.dirname(out), exist_ok=True)      # -o into a new folder (the release zip's dist\core)
     why = python_arch_problem()
     if why:
         raise CoreError(f"No solver core can be built: {why}.")
